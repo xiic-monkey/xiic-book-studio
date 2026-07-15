@@ -820,7 +820,6 @@ export function App() {
     setSelectedChapterId(chapter.id);
     setSelectedStage(stage ?? currentBody?.stage ?? "draft");
     setSelectedArtifactId(stage ? null : currentBody?.id ?? null);
-    setChapterDraft(chapter.title);
   }
 
   async function handleSaveWritingSkill(input: SaveWritingSkill) {

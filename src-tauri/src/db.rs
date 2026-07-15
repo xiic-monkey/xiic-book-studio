@@ -1953,6 +1953,30 @@ mod tests {
     }
 
     #[test]
+    fn creates_next_chapter_with_generated_title_when_title_is_empty() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "自动章节标题".to_string(),
+                genre: "玄幻".to_string(),
+                target_words: 100000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+
+        let chapter = state
+            .create_chapter(NewChapter {
+                project_id: project.id,
+                title: Some("   ".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(chapter.chapter_no, 2);
+        assert_eq!(chapter.title, "第 2 章");
+    }
+
+    #[test]
     fn updates_streaming_workflow_run_in_place() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
