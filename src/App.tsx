@@ -1,13 +1,16 @@
 import {
   AlertCircle,
   BarChart3,
+  Box,
   BookOpen,
+  CalendarDays,
   Check,
   Copy,
   ChevronLeft,
   ChevronRight,
   Edit3,
   Download,
+  Eye,
   FileText,
   Loader2,
   Rows3,
@@ -21,19 +24,27 @@ import {
   Settings,
   Sparkles,
   Trash2,
+  Users,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, PointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { api } from "./api";
+import { ArtifactDiffPanel } from "./components/ArtifactDiffPanel";
+import { ContinuityLibraryPanel } from "./components/ContinuityLibraryPanel";
+import type { EntityTimelineEntry, StoryIndexStatus } from "./components/ContinuityLibraryPanel";
+import { KnowledgeSectionCard, parseKnowledgeSections } from "./components/KnowledgeSectionCard";
 import type {
+  AdoptionProposal,
   AiSettings,
   Artifact,
+  CanonIssue,
   ChapterGateReport,
   ChapterSplitPlan,
   Chapter,
   Foreshadowing,
   KnowledgeCard,
+  LedgerContinuityReport,
   NewProject,
   Project,
   ProjectUpdate,
@@ -46,17 +57,26 @@ import type {
   SaveKnowledgeCardInput,
   Stage,
   StoryContextSnippet,
+  StoryArchitectMode,
+  StoryEntity,
+  StoryEvent,
+  StoryEventParticipant,
+  StoryFact,
+  StoryIndexSource,
+  StorySearchStatus,
   WorkflowRun,
-  WritingSkill
+  WritingSkill,
+  ContextPreview,
 } from "./types";
 import { NewProjectModal } from "./components/NewProjectModal";
 import { ProjectEditorModal } from "./components/ProjectEditorModal";
 import { SettingsView } from "./components/SettingsView";
+import { AdoptionDrawer } from "./components/AdoptionDrawer";
 
 const foundationStages: Array<{ id: Stage; label: string; scope: "book" }> = [
-  { id: "setting", label: "设定", scope: "book" },
-  { id: "outline", label: "大纲", scope: "book" },
-  { id: "characters", label: "角色", scope: "book" },
+  { id: "setting", label: "世界与规则", scope: "book" },
+  { id: "outline", label: "阶段大纲", scope: "book" },
+  { id: "characters", label: "角色卡", scope: "book" },
 ];
 
 const productionStages: Array<{ id: Stage; label: string; scope: "chapter" }> = [
@@ -68,6 +88,32 @@ const productionStages: Array<{ id: Stage; label: string; scope: "chapter" }> = 
 const stages = [...foundationStages, ...productionStages];
 
 const bodyStages: Stage[] = ["revision", "draft"];
+
+const architectModeByStage: Record<"setting" | "outline" | "characters", StoryArchitectMode> = {
+  setting: "refine_canon",
+  outline: "plan_current_arc",
+  characters: "design_characters",
+};
+
+const architectModeLabel: Record<StoryArchitectMode, string> = {
+  initialize: "初始化创作基准",
+  refine_canon: "补充设定",
+  plan_current_arc: "细化当前阶段",
+  extend_next_arc: "扩展下一阶段",
+  design_characters: "补充角色",
+};
+
+function artifactStageForArchitectMode(mode: StoryArchitectMode): LibrarySection {
+  if (mode === "initialize" || mode === "refine_canon") return "setting";
+  if (mode === "plan_current_arc" || mode === "extend_next_arc") return "outline";
+  return "characters";
+}
+
+function resolveArchitectMode(value: string): StoryArchitectMode {
+  return ["initialize", "refine_canon", "plan_current_arc", "extend_next_arc", "design_characters"].includes(value)
+    ? value as StoryArchitectMode
+    : "refine_canon";
+}
 
 const defaultProject: NewProject = {
   title: "未命名小说",
@@ -88,10 +134,9 @@ type ViewMode = "main" | "settings";
 type MainSurface = "official" | "workbench" | "library";
 type ContentSurface = "official" | "workbench";
 type LibrarySection = "setting" | "outline" | "characters";
-type LibraryFocus = LibrarySection | "foreshadowing";
-type SettingsCategory = "ai" | "skills" | "editor" | "data" | "appearance";
+type LibraryFocus = LibrarySection | "items" | "events" | "foreshadowing";
+type SettingsCategory = "ai" | "agents" | "skills" | "editor" | "data" | "appearance";
 type AgentRunMode = "smart" | "fresh";
-
 const SIDEBAR_WIDTH_STORAGE_KEY = "book-studio.sidebar-width";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "book-studio.sidebar-collapsed";
 const SIDEBAR_DEFAULT_WIDTH = 280;
@@ -122,145 +167,18 @@ function resolveChapterBody(detail: ProjectDetail | null, chapter: Chapter | nul
   return chapterBodies[0] ?? null;
 }
 
-type UnifiedDiffLine = {
-  kind: "same" | "added" | "removed";
-  text: string;
-  baseLine: number | null;
-  currentLine: number | null;
-};
-
-function buildUnifiedDiff(baseContent: string, currentContent: string): UnifiedDiffLine[] {
-  const base = baseContent.split("\n");
-  const current = currentContent.split("\n");
-
-  // A chapter normally has far fewer than 1,200 paragraph lines. Beyond that,
-  // preserve responsiveness and show the changed middle as a replacement block.
-  if (base.length > 1200 || current.length > 1200) {
-    return [
-      ...base.map((text, index) => ({ kind: "removed" as const, text, baseLine: index + 1, currentLine: null })),
-      ...current.map((text, index) => ({ kind: "added" as const, text, baseLine: null, currentLine: index + 1 })),
-    ];
-  }
-
-  const width = current.length + 1;
-  const table = new Uint16Array((base.length + 1) * width);
-  for (let baseIndex = base.length - 1; baseIndex >= 0; baseIndex -= 1) {
-    for (let currentIndex = current.length - 1; currentIndex >= 0; currentIndex -= 1) {
-      const cell = baseIndex * width + currentIndex;
-      table[cell] = base[baseIndex] === current[currentIndex]
-        ? table[(baseIndex + 1) * width + currentIndex + 1] + 1
-        : Math.max(table[(baseIndex + 1) * width + currentIndex], table[baseIndex * width + currentIndex + 1]);
-    }
-  }
-
-  const lines: UnifiedDiffLine[] = [];
-  let baseIndex = 0;
-  let currentIndex = 0;
-  while (baseIndex < base.length || currentIndex < current.length) {
-    if (baseIndex < base.length && currentIndex < current.length && base[baseIndex] === current[currentIndex]) {
-      lines.push({ kind: "same", text: base[baseIndex], baseLine: baseIndex + 1, currentLine: currentIndex + 1 });
-      baseIndex += 1;
-      currentIndex += 1;
-    } else if (
-      currentIndex < current.length
-      && (baseIndex === base.length || table[baseIndex * width + currentIndex + 1] >= table[(baseIndex + 1) * width + currentIndex])
-    ) {
-      lines.push({ kind: "added", text: current[currentIndex], baseLine: null, currentLine: currentIndex + 1 });
-      currentIndex += 1;
-    } else {
-      lines.push({ kind: "removed", text: base[baseIndex], baseLine: baseIndex + 1, currentLine: null });
-      baseIndex += 1;
-    }
-  }
-
-  return lines;
-}
-
-function selectDiffContext(lines: UnifiedDiffLine[], context = 2) {
-  const changedIndexes = lines
-    .map((line, index) => (line.kind === "same" ? -1 : index))
-    .filter((index) => index >= 0);
-  if (changedIndexes.length === 0) return [];
-
-  return lines.filter((line, index) => changedIndexes.some((changedIndex) => Math.abs(changedIndex - index) <= context));
-}
-
-type KnowledgeSection = {
-  title: string;
-  content: string[];
-};
-
-function cleanKnowledgeText(value: string) {
-  return value
-    .replace(/\*\*/g, "")
-    .replace(/`/g, "")
-    .trim();
-}
-
-function parseKnowledgeSections(content: string): KnowledgeSection[] {
-  const sections: KnowledgeSection[] = [];
-  let current: KnowledgeSection | null = null;
-
-  for (const rawLine of content.split("\n")) {
-    const line = rawLine.trim();
-    const heading = line.match(/^##+\s+(.+)$/);
-    if (heading) {
-      if (current) sections.push(current);
-      current = { title: cleanKnowledgeText(heading[1]), content: [] };
-      continue;
-    }
-    if (!current) continue;
-    if (line && line !== "---") current.content.push(line);
-  }
-
-  if (current) sections.push(current);
-  return sections.length > 0 ? sections : [{ title: "资料内容", content: content.split("\n").filter(Boolean) }];
-}
-
-function KnowledgeSectionCard({ section }: { section: KnowledgeSection }) {
-  const lines = section.content.filter((line) => !/^\|?[-:]+/.test(line.replaceAll("|", "")));
-  return (
-    <details className="knowledge-card" open={lines.length <= 4}>
-      <summary>
-        <strong>{section.title}</strong>
-        <span>{lines.length} 条资料</span>
-      </summary>
-      <div className="knowledge-card-body">
-        {lines.map((line, index) => {
-          const detail = line.match(/^\*\*(.+?)\*\*[：:](.+)$/);
-          if (detail) {
-            return (
-              <div className="knowledge-detail" key={`${detail[1]}-${index}`}>
-                <strong>{cleanKnowledgeText(detail[1])}</strong>
-                <span>{cleanKnowledgeText(detail[2])}</span>
-              </div>
-            );
-          }
-          if (line.startsWith("- ")) {
-            return <p className="knowledge-bullet" key={`${line}-${index}`}>{cleanKnowledgeText(line.slice(2))}</p>;
-          }
-          if (line.startsWith("|")) {
-            const cells = line.split("|").map(cleanKnowledgeText).filter(Boolean);
-            return <p className="knowledge-table-row" key={`${line}-${index}`}>{cells.join(" · ")}</p>;
-          }
-          return <p className="knowledge-paragraph" key={`${line}-${index}`}>{cleanKnowledgeText(line)}</p>;
-        })}
-      </div>
-    </details>
-  );
-}
-
 export function App() {
-  const runtimeMode = api.getRuntimeMode();
   const [projects, setProjects] = useState<Project[]>([]);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
   const [selectedChapterId, setSelectedChapterId] = useState<number | null>(null);
   const [selectedStage, setSelectedStage] = useState<Stage>("setting");
   const [selectedArtifactId, setSelectedArtifactId] = useState<number | null>(null);
+  const [explicitArchitectSourceId, setExplicitArchitectSourceId] = useState<number | null>(null);
   const [newProject, setNewProject] = useState<NewProject>(defaultProject);
   const [projectDraft, setProjectDraft] = useState<ProjectUpdate | null>(null);
   const [settings, setSettings] = useState<AiSettings>(defaultSettings);
+  const [storySearchStatus, setStorySearchStatus] = useState<StorySearchStatus | null>(null);
   const [writingSkills, setWritingSkills] = useState<WritingSkill[]>([]);
   const [apiKey, setApiKey] = useState("");
   const [instruction, setInstruction] = useState("");
@@ -272,6 +190,7 @@ export function App() {
   const [reviewIssues, setReviewIssues] = useState<ReviewIssue[]>([]);
   const [qualityReport, setQualityReport] = useState<QualityReport | null>(null);
   const [continuityReport, setContinuityReport] = useState<ContinuityReport | null>(null);
+  const [ledgerContinuityReport, setLedgerContinuityReport] = useState<LedgerContinuityReport | null>(null);
   const [chapterGateReport, setChapterGateReport] = useState<ChapterGateReport | null>(null);
   const [chapterSplitPlan, setChapterSplitPlan] = useState<ChapterSplitPlan | null>(null);
   const [streamingRun, setStreamingRun] = useState<WorkflowRun | null>(null);
@@ -282,12 +201,16 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [contextQuery, setContextQuery] = useState("");
   const [contextSnippets, setContextSnippets] = useState<StoryContextSnippet[]>([]);
+  const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
+  const [storyBibleNote, setStoryBibleNote] = useState("");
+  const [showAdoptionDrawer, setShowAdoptionDrawer] = useState(false);
 
   const [viewMode, setViewMode] = useState<ViewMode>("main");
   const [mainSurface, setMainSurface] = useState<MainSurface>("official");
   const [libraryOriginSurface, setLibraryOriginSurface] = useState<ContentSurface>("official");
   const [librarySection, setLibrarySection] = useState<LibrarySection>("setting");
   const [libraryFocus, setLibraryFocus] = useState<LibraryFocus>("setting");
+  const [selectedLibraryEntityId, setSelectedLibraryEntityId] = useState<number | null>(null);
   const [showKnowledgeComposer, setShowKnowledgeComposer] = useState(false);
   const [knowledgeTitle, setKnowledgeTitle] = useState("");
   const [knowledgeContent, setKnowledgeContent] = useState("");
@@ -301,6 +224,7 @@ export function App() {
   const [editingForeshadowingId, setEditingForeshadowingId] = useState<number | null>(null);
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
   const [showProjectEditor, setShowProjectEditor] = useState(false);
+  const [projectPendingDeletion, setProjectPendingDeletion] = useState<Project | null>(null);
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>("ai");
   const [chapterDraft, setChapterDraft] = useState("");
   const [compareArtifactId, setCompareArtifactId] = useState<number | null>(null);
@@ -349,16 +273,20 @@ export function App() {
     };
   }, [chapterToolsOpen]);
 
-  function openLibrary(section?: LibrarySection) {
+  function openLibrary(focus?: LibraryFocus) {
     if (mainSurface !== "library") setLibraryOriginSurface(mainSurface);
+    const section = focus && foundationStages.some((stage) => stage.id === focus)
+      ? focus as LibrarySection
+      : null;
     if (section) {
       setLibraryFocus(section);
       setLibrarySection(section);
       setSelectedStage(section);
       setSelectedArtifactId(null);
     } else {
-      setLibraryFocus("foreshadowing");
+      setLibraryFocus(focus ?? "foreshadowing");
     }
+    setSelectedLibraryEntityId(null);
     resetKnowledgeComposer();
     setMainSurface("library");
   }
@@ -373,6 +301,10 @@ export function App() {
     activeProjectRequestRef.current = selectedProjectId;
     void refreshDetail(selectedProjectId);
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    setContextPreview(null);
+  }, [selectedProjectId, selectedChapterId, selectedStage, selectedArtifactId]);
 
   useEffect(() => {
     if (!notice || busy || error) return;
@@ -456,6 +388,135 @@ export function App() {
     [detail]
   );
 
+  const timelineEntityKind = libraryFocus === "characters"
+    ? "character"
+    : libraryFocus === "items"
+      ? null
+      : undefined;
+
+  const visibleTimelineEntities = useMemo(() => {
+    const entities = detail?.story_entities ?? [];
+    if (timelineEntityKind === "character") return entities.filter((entity) => entity.kind === "character");
+    if (libraryFocus === "items") return entities.filter((entity) => entity.kind === "item" || entity.kind === "resource");
+    return [];
+  }, [detail, libraryFocus, timelineEntityKind]);
+
+  useEffect(() => {
+    if (libraryFocus !== "characters" && libraryFocus !== "items") return;
+    if (visibleTimelineEntities.some((entity) => entity.id === selectedLibraryEntityId)) return;
+    setSelectedLibraryEntityId(visibleTimelineEntities[0]?.id ?? null);
+  }, [libraryFocus, selectedLibraryEntityId, visibleTimelineEntities]);
+
+  const selectedLibraryEntity = useMemo(
+    () => visibleTimelineEntities.find((entity) => entity.id === selectedLibraryEntityId) ?? null,
+    [visibleTimelineEntities, selectedLibraryEntityId]
+  );
+
+  const chapterNumbers = useMemo(
+    () => new Map((detail?.chapters ?? []).map((chapter) => [chapter.id, chapter.chapter_no])),
+    [detail]
+  );
+
+  const participantsByEvent = useMemo(() => {
+    const map = new Map<number, StoryEventParticipant[]>();
+    for (const participant of detail?.story_event_participants ?? []) {
+      const current = map.get(participant.event_id) ?? [];
+      current.push(participant);
+      map.set(participant.event_id, current);
+    }
+    return map;
+  }, [detail]);
+
+  const selectedEntityFacts = useMemo(() => {
+    if (!selectedLibraryEntity) return [];
+    return (detail?.story_facts ?? [])
+      .filter((fact) => fact.entity_id === selectedLibraryEntity.id)
+      .sort((left, right) => (chapterNumbers.get(left.narrative_chapter_id ?? 0) ?? 0) - (chapterNumbers.get(right.narrative_chapter_id ?? 0) ?? 0) || left.id - right.id);
+  }, [chapterNumbers, detail, selectedLibraryEntity]);
+
+  const selectedEntityEvents = useMemo(() => {
+    if (!selectedLibraryEntity) return [];
+    const factEventIds = new Set(selectedEntityFacts.map((fact) => fact.event_id).filter((id): id is number => id != null));
+    return (detail?.story_events ?? [])
+      .filter((event) => factEventIds.has(event.id) || (participantsByEvent.get(event.id) ?? []).some((participant) => participant.entity_id === selectedLibraryEntity.id))
+      .sort((left, right) => (chapterNumbers.get(left.narrative_chapter_id ?? 0) ?? 0) - (chapterNumbers.get(right.narrative_chapter_id ?? 0) ?? 0) || left.id - right.id);
+  }, [chapterNumbers, detail, participantsByEvent, selectedEntityFacts, selectedLibraryEntity]);
+
+  const selectedEntityCurrentFacts = useMemo(() => {
+    const latest = new Map<string, StoryFact>();
+    for (const fact of selectedEntityFacts) latest.set(fact.dimension, fact);
+    return [...latest.values()].sort((left, right) => left.dimension.localeCompare(right.dimension));
+  }, [selectedEntityFacts]);
+
+  const selectedEntityTimeline = useMemo(() => {
+    const events = selectedEntityEvents.map((event) => ({
+      type: "event" as const,
+      id: event.id,
+      chapterId: event.narrative_chapter_id ?? null,
+      event,
+    }));
+    const facts = selectedEntityFacts.map((fact) => ({
+      type: "fact" as const,
+      id: fact.id,
+      chapterId: fact.narrative_chapter_id ?? null,
+      fact,
+    }));
+    return [...events, ...facts].sort((left, right) => {
+      const chapterDelta = (chapterNumbers.get(left.chapterId ?? 0) ?? 0) - (chapterNumbers.get(right.chapterId ?? 0) ?? 0);
+      if (chapterDelta !== 0) return chapterDelta;
+      if (left.type !== right.type) return left.type === "event" ? -1 : 1;
+      return left.id - right.id;
+    });
+  }, [chapterNumbers, selectedEntityEvents, selectedEntityFacts]);
+
+  const storyIndexStatus = useMemo(() => {
+    const approvedChapters = (detail?.chapters ?? []).filter((chapter) => chapter.current_artifact_id != null);
+    const sourceByChapter = new Map<number, StoryIndexSource>();
+    for (const source of detail?.story_index_sources ?? []) {
+      sourceByChapter.set(source.chapter_id, source);
+    }
+    const currentSources = approvedChapters
+      .map((chapter) => ({ chapter, source: sourceByChapter.get(chapter.id) }))
+      .filter(({ chapter, source }) => source?.source_artifact_id === chapter.current_artifact_id);
+    const succeeded = currentSources.filter(({ source }) => source?.status === "success").length;
+    const failed = currentSources.filter(({ source }) => source?.status === "failed");
+    const running = (detail?.index_jobs ?? []).filter(
+      (job) => job.job_type === "story_chapter" && job.status === "running",
+    ).length;
+    return {
+      approved: approvedChapters.length,
+      succeeded,
+      pending: approvedChapters.length - succeeded - failed.length,
+      running,
+      failed,
+    };
+  }, [detail]);
+
+  const hasActiveIndexJobs = useMemo(
+    () => (detail?.index_jobs ?? []).some((job) => job.status === "pending" || job.status === "running"),
+    [detail],
+  );
+
+  useEffect(() => {
+    if (!selectedProjectId || !hasActiveIndexJobs) return;
+    let active = true;
+    const interval = window.setInterval(() => {
+      if (!active) return;
+      void loadProjectDetail(selectedProjectId).catch(() => {
+        // The next poll can recover from a transient detail request failure.
+      });
+    }, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [hasActiveIndexJobs, selectedProjectId]);
+
+  const activeStoryArc = useMemo(
+    () => detail?.story_arcs?.find((arc) => arc.status === "active") ?? null,
+    [detail]
+  );
+
   useEffect(() => {
     if (!detail || !selectedChapter) return;
 
@@ -493,9 +554,28 @@ export function App() {
     );
   }, [detail, selectedArtifact]);
 
+  const selectedArtifactProposals = useMemo(
+    () => detail?.adoption_proposals?.filter((proposal) => proposal.source_artifact_id === selectedArtifact?.id) ?? [],
+    [detail, selectedArtifact]
+  );
+
+  const selectedArtifactSupportsAdoption = Boolean(
+    selectedArtifactApproved
+      && selectedArtifact
+      && ["setting", "outline", "characters", "draft", "revision"].includes(selectedArtifact.stage)
+  );
+
   const selectedArtifactIsCurrentBody =
     Boolean(selectedChapter?.current_artifact_id && selectedArtifact) &&
     selectedChapter?.current_artifact_id === selectedArtifact?.id;
+
+  const selectedArtifactDeleteBlockReason = useMemo(() => {
+    if (!selectedArtifact) return "未选择版本";
+    if (selectedArtifact.chapter_id != null) {
+      return selectedArtifactIsCurrentBody ? "当前正式正文不能删除" : null;
+    }
+    return selectedArtifactApproved ? "当前已批准资料不能删除" : null;
+  }, [selectedArtifact, selectedArtifactApproved, selectedArtifactIsCurrentBody]);
 
   const gateArtifact = useMemo(() => {
     if (!detail || !chapterGateReport) return null;
@@ -518,6 +598,7 @@ export function App() {
   );
   const selectedBookArtifactCanIterate = Boolean(
     selectedArtifact &&
+      explicitArchitectSourceId === selectedArtifact.id &&
       (selectedStage === "setting" || selectedStage === "outline" || selectedStage === "characters") &&
       selectedArtifact.stage === selectedStage &&
       selectedArtifact.chapter_id == null
@@ -558,6 +639,9 @@ export function App() {
     if (!detail) return [];
     return detail.workflow_runs
       .filter((run) => {
+        if (run.stage === "context_search_plan") {
+          return run.chapter_id === selectedChapterId;
+        }
         const stageMeta = stages.find((stage) => stage.id === run.stage);
         if (!stageMeta) return false;
         if (stageMeta.scope === "book") return run.chapter_id == null;
@@ -576,13 +660,6 @@ export function App() {
     selectedArtifact?.stage === "revision" ||
     selectedArtifact?.stage === "review";
 
-  const diffLines = useMemo(() => {
-    if (!selectedArtifact || !compareArtifact || selectedArtifact.id === compareArtifact.id) return [];
-    return buildUnifiedDiff(compareArtifact.content, selectedArtifact.content);
-  }, [selectedArtifact, compareArtifact]);
-
-  const visibleDiffLines = useMemo(() => selectDiffContext(diffLines), [diffLines]);
-
   const sidebarShellStyle = useMemo(
     () => ({
       width: `${sidebarCollapsed ? SIDEBAR_COLLAPSED_WIDTH : sidebarWidth}px`,
@@ -595,7 +672,8 @@ export function App() {
     await runTask("加载项目", async () => {
       const list = await api.listProjects();
       setProjects(list);
-      if (!selectedProjectId && list[0]) openProject(list[0].id);
+      // A late initial response must not overwrite a project selected by the user.
+      if (!activeProjectRequestRef.current && list[0]) openProject(list[0].id);
     });
   }
 
@@ -655,12 +733,16 @@ export function App() {
 
   async function refreshDetail(projectId = selectedProjectId) {
     if (!projectId) return;
-    const requestProjectId = projectId;
     await runTask("刷新项目", async () => {
-      const next = await api.getProject(requestProjectId);
-      if (activeProjectRequestRef.current !== requestProjectId) return;
-      applyProjectDetail(next);
+      await loadProjectDetail(projectId);
     });
+  }
+
+  async function loadProjectDetail(projectId: number) {
+    const next = await api.getProject(projectId);
+    if (activeProjectRequestRef.current !== projectId) return false;
+    applyProjectDetail(next);
+    return true;
   }
 
   function applyProjectDetail(next: ProjectDetail) {
@@ -669,21 +751,43 @@ export function App() {
     setStreamingRun(next.workflow_runs.find((run) => run.status === "streaming") ?? null);
   }
 
+  async function refreshStorySearchStatus(projectId = selectedProjectId) {
+    if (!projectId) {
+      setStorySearchStatus(null);
+      return null;
+    }
+    const status = await api.getStorySearchStatus(projectId);
+    if (activeProjectRequestRef.current === projectId) {
+      setStorySearchStatus(status);
+    }
+    return status;
+  }
+
   function beginStreamingPoll(projectId: number) {
     let active = true;
-    const poll = async () => {
-      try {
-        const next = await api.getProject(projectId);
-        if (active && activeProjectRequestRef.current === projectId) applyProjectDetail(next);
-      } catch {
-        // The command result still reports the actionable error; polling should stay quiet.
-      }
+    let inFlight: Promise<void> | null = null;
+    const poll = (finalRefresh = false) => {
+      if (!active && !finalRefresh) return Promise.resolve();
+      if (inFlight) return inFlight;
+      inFlight = (async () => {
+        try {
+          await loadProjectDetail(projectId);
+        } catch {
+          // The command result still reports the actionable error; polling should stay quiet.
+        } finally {
+          inFlight = null;
+        }
+      })();
+      return inFlight;
     };
     void poll();
     const interval = window.setInterval(() => void poll(), 600);
-    return () => {
+    return async () => {
       active = false;
       window.clearInterval(interval);
+      // The HTTP command can complete just after the last interval tick. Always
+      // await one final detail read before leaving the streaming state behind.
+      await poll(true);
     };
   }
 
@@ -742,15 +846,13 @@ export function App() {
   }
 
   async function deleteProject(project: Project) {
-    const confirmed = window.confirm(`确定删除《${project.title}》吗？\n该书籍的章节、产物和记录也会一起删除。`);
-    if (!confirmed) return;
-
     await runTask("删除书籍", async () => {
       const nextProjects = projects.filter((item) => item.id !== project.id);
       const fallbackProjectId = nextProjects[0]?.id ?? null;
 
       await api.deleteProject(project.id);
       setProjects(nextProjects);
+      setProjectPendingDeletion(null);
 
       if (selectedProjectId === project.id) {
         openProject(fallbackProjectId);
@@ -820,6 +922,40 @@ export function App() {
     setSelectedChapterId(chapter.id);
     setSelectedStage(stage ?? currentBody?.stage ?? "draft");
     setSelectedArtifactId(stage ? null : currentBody?.id ?? null);
+  }
+
+  function openTimelineChapter(chapterId?: number | null) {
+    const chapter = detail?.chapters.find((item) => item.id === chapterId);
+    if (!chapter) return;
+    const body = resolveChapterBody(detail, chapter);
+    setSelectedChapterId(chapter.id);
+    setSelectedStage(body?.stage ?? "draft");
+    setSelectedArtifactId(body?.id ?? null);
+    setMainSurface("official");
+  }
+
+  async function rebuildLibraryIndex() {
+    if (!detail) return;
+    await runTask("更新资料索引", async () => {
+      const jobs = await api.retryIndexJobs({ project_id: detail.project.id });
+      await loadProjectDetail(detail.project.id);
+      const queued = jobs.filter((job) => job.status === "pending").length;
+      setNotice(queued > 0 ? `资料索引已加入后台队列：${queued} 个任务` : "没有需要更新的索引任务");
+    });
+  }
+
+  async function rebuildStorySearchIndex() {
+    if (!detail) return;
+    await runTask("重建本地检索", async () => {
+      const status = await api.rebuildStorySearchIndex({ project_id: detail.project.id });
+      setStorySearchStatus(status);
+      await refreshDetail(detail.project.id);
+      setNotice(
+        status.embedding_count > 0
+          ? `本地混合检索已重建：${status.document_count} 个片段`
+          : `全文检索已重建：${status.document_count} 个片段`
+      );
+    });
   }
 
   async function handleSaveWritingSkill(input: SaveWritingSkill) {
@@ -983,7 +1119,6 @@ export function App() {
         id: selectedChapter.id,
         title,
         status: selectedChapter.status,
-        current_artifact_id: selectedChapter.current_artifact_id ?? null,
       });
       setSelectedChapterId(updated.id);
       setSelectedArtifactId(null);
@@ -1014,15 +1149,44 @@ export function App() {
     });
   }
 
-  async function runAgent(stage: Stage = selectedStage, mode: AgentRunMode = "smart") {
+  function redirectToStoryBibleIfDraftBlocked(stage: Stage) {
+    if (stage !== "draft" || !detail) return false;
+
+    let message: string | null = null;
+    if (!detail.story_bible || detail.story_bible.status !== "confirmed") {
+      message = "写作前请先在这里确认创作基准。";
+    } else if (!activeStoryArc) {
+      message = "写作前请先确认当前故事阶段。";
+    } else if (!detail.story_bible_review) {
+      message = "创作基准已确认，请先运行一致性审校。";
+    } else if (detail.story_bible_review.status !== "confirmed") {
+      message = "请先人工确认最新的一致性审校结论。";
+    }
+
+    if (!message) return false;
+    setLibraryOriginSurface("workbench");
+    setLibrarySection("setting");
+    setLibraryFocus("setting");
+    setMainSurface("library");
+    setNotice(null);
+    setError(message);
+    return true;
+  }
+
+  async function runAgent(
+    stage: Stage = selectedStage,
+    mode: AgentRunMode = "smart",
+  ) {
     if (!detail) return;
+    if (stage === "setting" || stage === "outline" || stage === "characters") {
+      return runStoryArchitect(architectModeByStage[stage], mode);
+    }
     if (detail.project.id !== selectedProjectId) {
       setError("书籍切换尚未完成，请等待当前书籍加载后再运行 Agent。");
       return;
     }
-    setMainSurface(
-      stage === "setting" || stage === "outline" || stage === "characters" ? "library" : "workbench"
-    );
+    if (redirectToStoryBibleIfDraftBlocked(stage)) return;
+    setMainSurface("workbench");
     const meta = stages.find((item) => item.id === stage);
     await runTask("运行 Agent", async () => {
       const sourceArtifactId =
@@ -1032,13 +1196,7 @@ export function App() {
             (selectedArtifact.stage === "draft" || selectedArtifact.stage === "revision")
             ? selectedArtifact.id
             : null
-          : mode === "smart" &&
-            selectedArtifact &&
-              selectedArtifact.stage === stage &&
-              selectedArtifact.chapter_id === (meta?.scope === "chapter" ? selectedChapterId : null) &&
-              (stage === "setting" || stage === "outline" || stage === "characters")
-            ? selectedArtifact.id
-            : null;
+          : null;
       const stopPolling = beginStreamingPoll(detail.project.id);
       let result;
       try {
@@ -1050,17 +1208,159 @@ export function App() {
           source_artifact_id: sourceArtifactId,
         });
       } finally {
-        stopPolling();
+        await stopPolling();
       }
       setSelectedStage(stage);
       setSelectedArtifactId(result.artifact.id);
       setInstruction("");
-      await refreshDetail(detail.project.id);
+      await loadProjectDetail(detail.project.id);
+      if (stage === "review" && sourceArtifactId) {
+        try {
+          setLedgerContinuityReport(
+            await api.checkArtifactLedgerContinuity({
+              project_id: detail.project.id,
+              artifact_id: sourceArtifactId,
+            })
+          );
+        } catch {
+          // Trial reading already completed. The ledger is an additional, non-blocking check.
+          setLedgerContinuityReport(null);
+        }
+      }
       setNotice(
         mode === "smart" && sourceArtifactId
           ? `${meta?.label ?? "Agent"}已基于当前版本生成 v${result.artifact.version}`
           : `${meta?.label ?? "Agent"}已生成 v${result.artifact.version}`
       );
+    });
+  }
+
+  async function runStoryArchitect(
+    architectMode: StoryArchitectMode,
+    runMode: AgentRunMode = "smart",
+  ) {
+    if (!detail) return;
+    const stage = artifactStageForArchitectMode(architectMode);
+    setMainSurface("library");
+    await runTask("运行故事架构 Agent", async () => {
+      const explicitSource = detail.artifacts.find((artifact) => artifact.id === explicitArchitectSourceId);
+      const sourceArtifactId = runMode === "smart"
+        && explicitSource?.stage === stage
+        && explicitSource.chapter_id == null
+        ? explicitSource.id
+        : null;
+      const stopPolling = beginStreamingPoll(detail.project.id);
+      let result;
+      try {
+        result = await api.runStoryArchitect({
+          project_id: detail.project.id,
+          mode: architectMode,
+          arc_id: activeStoryArc?.id ?? null,
+          user_instruction: instruction.trim() || null,
+          source_artifact_id: sourceArtifactId,
+        });
+      } finally {
+        await stopPolling();
+      }
+      setSelectedStage(stage);
+      setSelectedArtifactId(result.artifact.id);
+      setExplicitArchitectSourceId(null);
+      setInstruction("");
+      await loadProjectDetail(detail.project.id);
+      setNotice(`${architectModeLabel[architectMode]}已生成 v${result.artifact.version}`);
+    });
+  }
+
+  async function createTargetedRework(issue: CanonIssue) {
+    if (!detail) return;
+    const architectMode = resolveArchitectMode(issue.owner_mode);
+    const stage = artifactStageForArchitectMode(architectMode);
+    setMainSurface("library");
+    await runTask("定向返工故事资料", async () => {
+      const stopPolling = beginStreamingPoll(detail.project.id);
+      let result;
+      try {
+        result = await api.createTargetedRework({
+          project_id: detail.project.id,
+          mode: architectMode,
+          arc_id: activeStoryArc?.id ?? null,
+          user_instruction: issue.rework_instruction,
+          source_artifact_id: null,
+        });
+      } finally {
+        await stopPolling();
+      }
+      setSelectedStage(stage);
+      setSelectedArtifactId(result.artifact.id);
+      await loadProjectDetail(detail.project.id);
+      setNotice(`已生成针对“${issue.title}”的候选资料版本`);
+    });
+  }
+
+  async function confirmStoryBible() {
+    if (!detail) return;
+    await runTask("确认创作基准", async () => {
+      await api.confirmStoryBible({ project_id: detail.project.id, note: storyBibleNote });
+      setStoryBibleNote("");
+      await loadProjectDetail(detail.project.id);
+      setNotice("创作基准与当前故事阶段已确认");
+    });
+  }
+
+  async function reviewStoryBible() {
+    if (!detail) return;
+    await runTask("审校创作基准", async () => {
+      await api.reviewStoryBible({ project_id: detail.project.id });
+      await loadProjectDetail(detail.project.id);
+      setNotice("创作基准一致性审校已生成，等待人工确认");
+    });
+  }
+
+  async function confirmStoryBibleReview() {
+    if (!detail?.story_bible_review) return;
+    const reviewId = detail.story_bible_review.id;
+    await runTask("确认一致性审校", async () => {
+      await api.confirmStoryBibleReview({
+        project_id: detail.project.id,
+        review_id: reviewId,
+        note: storyBibleNote,
+      });
+      setStoryBibleNote("");
+      await loadProjectDetail(detail.project.id);
+      setNotice("一致性审校已人工确认，可以继续正文创作");
+    });
+  }
+
+  function agentSourceArtifactId(stage: Stage) {
+    const meta = stages.find((item) => item.id === stage);
+    if (stage === "review") {
+      return selectedArtifact &&
+        selectedArtifact.chapter_id === selectedChapterId &&
+        (selectedArtifact.stage === "draft" || selectedArtifact.stage === "revision")
+        ? selectedArtifact.id
+        : null;
+    }
+    return selectedArtifact &&
+      selectedArtifact.stage === stage &&
+      selectedArtifact.chapter_id === (meta?.scope === "chapter" ? selectedChapterId : null) &&
+      (stage === "setting" || stage === "outline" || stage === "characters")
+      ? selectedArtifact.id
+      : null;
+  }
+
+  async function previewAgentContext() {
+    if (!detail) return;
+    if (redirectToStoryBibleIfDraftBlocked(selectedStage)) return;
+    const meta = stages.find((item) => item.id === selectedStage);
+    await runTask("整理生成上下文", async () => {
+      const preview = await api.previewAgentContext({
+        project_id: detail.project.id,
+        stage: selectedStage,
+        chapter_id: meta?.scope === "chapter" ? selectedChapterId : null,
+        user_instruction: instruction.trim() || null,
+        source_artifact_id: agentSourceArtifactId(selectedStage),
+      });
+      setContextPreview(preview);
     });
   }
 
@@ -1075,6 +1375,7 @@ export function App() {
       await api.approveStage(detail.project.id, approvedArtifact.stage, approvedArtifact.id, approvalNote);
       setApprovalNote("");
       await refreshDetail(detail.project.id);
+      await refreshStorySearchStatus(detail.project.id);
       if (approvedArtifact.stage === "draft" || approvedArtifact.stage === "revision") {
         setSelectedStage(approvedArtifact.stage);
         setSelectedArtifactId(approvedArtifact.id);
@@ -1095,10 +1396,59 @@ export function App() {
       await api.approveStage(detail.project.id, artifact.stage, artifact.id, approvalNote);
       setApprovalNote("");
       await refreshDetail(detail.project.id);
+      await refreshStorySearchStatus(detail.project.id);
       setSelectedChapterId(selectedChapter.id);
       setSelectedStage(artifact.stage);
       setSelectedArtifactId(artifact.id);
       setNotice(`已将 ${artifact.stage === "revision" ? "修订稿" : "草稿"} v${artifact.version} 应用为当前正文`);
+    });
+  }
+
+  async function prepareArtifactAdoptions() {
+    if (!detail || !selectedArtifact || !selectedArtifactSupportsAdoption) return;
+    setShowAdoptionDrawer(true);
+    await runTask("整理资料变更", async () => {
+      const proposals = await api.prepareArtifactAdoptions({
+        project_id: detail.project.id,
+        artifact_id: selectedArtifact.id,
+      });
+      await loadProjectDetail(detail.project.id);
+      setNotice(proposals.length > 0 ? `已整理出 ${proposals.length} 条待确认资料` : "未发现可靠的资料变更");
+    });
+  }
+
+  async function saveAdoptionProposal(proposalId: number, data: Record<string, unknown>) {
+    if (!detail) return;
+    await runTask("保存资料候选", async () => {
+      await api.updateAdoptionProposal({ proposal_id: proposalId, data });
+      await loadProjectDetail(detail.project.id);
+      setNotice("候选已保存并重新校验");
+    });
+  }
+
+  async function applyAdoptionProposals(proposalIds: number[], note: string) {
+    if (!detail || proposalIds.length === 0) return;
+    await runTask("采纳资料变更", async () => {
+      await api.applyAdoptionProposals({
+        project_id: detail.project.id,
+        proposal_ids: proposalIds,
+        note,
+      });
+      await loadProjectDetail(detail.project.id);
+      setNotice(`已采纳 ${proposalIds.length} 条资料变更`);
+    });
+  }
+
+  async function rejectAdoptionProposals(proposalIds: number[], note: string) {
+    if (!detail || proposalIds.length === 0) return;
+    await runTask("拒绝资料变更", async () => {
+      await api.rejectAdoptionProposals({
+        project_id: detail.project.id,
+        proposal_ids: proposalIds,
+        note,
+      });
+      await loadProjectDetail(detail.project.id);
+      setNotice(`已拒绝 ${proposalIds.length} 条资料变更`);
     });
   }
 
@@ -1114,13 +1464,13 @@ export function App() {
           feedback: revisionFeedback,
         });
       } finally {
-        stopPolling();
+        await stopPolling();
       }
       setSelectedStage("revision");
       setSelectedArtifactId(result.artifact.id);
       setRevisionFeedback("");
       setReviewIssues([]);
-      await refreshDetail(detail.project.id);
+      await loadProjectDetail(detail.project.id);
       setNotice("修订稿已生成");
     });
   }
@@ -1173,8 +1523,12 @@ export function App() {
 
   async function deleteSelectedArtifact() {
     if (!detail || !selectedArtifact) return;
+    if (selectedArtifactDeleteBlockReason) {
+      setError(selectedArtifactDeleteBlockReason);
+      return;
+    }
     const confirmed = window.confirm(
-      `确定删除 ${selectedArtifact.title} · v${selectedArtifact.version} 吗？\n已采纳正文和当前已批准底稿不会被删除。`
+      `确定删除 ${selectedArtifact.title} · v${selectedArtifact.version} 吗？`
     );
     if (!confirmed) return;
     await runTask("删除版本", async () => {
@@ -1288,7 +1642,6 @@ export function App() {
         id: selectedChapter.id,
         title,
         status: selectedChapter.status,
-        current_artifact_id: selectedChapter.current_artifact_id ?? null,
       });
       await refreshDetail(detail.project.id);
       setSelectedChapterId(updated.id);
@@ -1347,6 +1700,21 @@ export function App() {
     });
   }
 
+  async function checkLedgerContinuity() {
+    if (!detail || !selectedArtifact || (selectedArtifact.stage !== "draft" && selectedArtifact.stage !== "revision")) {
+      setNotice("请选择一份章节草稿或修订稿进行状态账本核对");
+      return;
+    }
+    await runTask("状态账本核对", async () => {
+      const report = await api.checkArtifactLedgerContinuity({
+        project_id: detail.project.id,
+        artifact_id: selectedArtifact.id,
+      });
+      setLedgerContinuityReport(report);
+      setNotice(report.issues.length > 0 ? `状态账本发现 ${report.issues.length} 条直接冲突` : "状态账本未发现直接冲突");
+    });
+  }
+
   async function searchContext() {
     if (!detail || !contextQuery.trim()) return;
     await runTask("历史检索", async () => {
@@ -1387,6 +1755,7 @@ export function App() {
   }
 
   function stageLabel(stage: string) {
+    if (stage === "context_search_plan") return "上下文检索";
     return stages.find((item) => item.id === stage)?.label ?? stage;
   }
 
@@ -1490,6 +1859,8 @@ export function App() {
     return (
       <SettingsView
         settings={settings}
+        projectId={detail?.project.id ?? null}
+        storySearchStatus={storySearchStatus}
         apiKey={apiKey}
         settingsCategory={settingsCategory}
         onSettingsCategoryChange={setSettingsCategory}
@@ -1497,6 +1868,10 @@ export function App() {
         onSaveSettings={handleSaveSettings}
         onTestConnection={handleTestConnection}
         onRefreshModels={handleRefreshModels}
+        onRefreshStorySearchStatus={refreshStorySearchStatus}
+        onRebuildStorySearch={rebuildStorySearchIndex}
+        agents={detail?.agents ?? []}
+        genreAgent={detail?.genre_agent}
         writingSkills={writingSkills}
         onSaveWritingSkill={handleSaveWritingSkill}
         onSaveCategory={handleSaveCategory}
@@ -1540,6 +1915,139 @@ export function App() {
                 </div>
               </header>
 
+              {(libraryFocus === "characters" || libraryFocus === "items" || libraryFocus === "events") && (
+                <section className="continuity-library">
+                  <header className="continuity-library-head">
+                    <div>
+                      <div className="panel-title">
+                        {libraryFocus === "characters" ? <Users size={15} /> : libraryFocus === "items" ? <Box size={15} /> : <CalendarDays size={15} />}
+                        连续性资料
+                      </div>
+                      <h3>{libraryFocus === "characters" ? "角色时间线" : libraryFocus === "items" ? "物品与资源" : "事件时间线"}</h3>
+                      <p>仅显示已通过正式正文中有原文出处的记录。点击章节可回到正式内容。</p>
+                      {storyIndexStatus.approved > 0 && (
+                        <div className={storyIndexStatus.failed.length > 0 ? "library-index-status has-error" : "library-index-status"}>
+                          <span>资料索引</span>
+                          <strong>已覆盖 {storyIndexStatus.succeeded}/{storyIndexStatus.approved} 章</strong>
+                          {storyIndexStatus.pending > 0 && <small>{storyIndexStatus.pending} 章待更新</small>}
+                          {storyIndexStatus.failed.length > 0 && (
+                            <small title={storyIndexStatus.failed.map(({ chapter, source }) => `第 ${chapter.chapter_no} 章：${source?.error ?? "更新失败"}`).join("\n")}>
+                              {storyIndexStatus.failed.length} 章更新失败
+                            </small>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <button onClick={rebuildLibraryIndex} disabled={!detail || Boolean(busy)}>
+                      <RefreshCcw size={14} /> 更新资料索引
+                    </button>
+                  </header>
+
+                  {libraryFocus === "events" ? (
+                    <div className="event-timeline">
+                      {(detail?.story_events ?? []).map((event: StoryEvent) => {
+                        const chapter = detail?.chapters.find((item) => item.id === event.narrative_chapter_id);
+                        const participants = participantsByEvent.get(event.id) ?? [];
+                        return (
+                          <article key={event.id} className="timeline-event">
+                            <div className="timeline-marker" />
+                            <div className="timeline-event-body">
+                              <div className="timeline-event-head">
+                                <div><span>{chapter ? `第 ${chapter.chapter_no} 章` : "章节未定"}</span><strong>{event.title}</strong></div>
+                                {event.story_time && <small>{event.story_time}</small>}
+                              </div>
+                              <p>{event.summary}</p>
+                              {participants.length > 0 && (
+                                <div className="timeline-participants">
+                                  {participants.map((participant) => (
+                                    <button key={`${participant.event_id}-${participant.entity_id}-${participant.role}`} onClick={() => {
+                                      openLibrary("characters");
+                                      setSelectedLibraryEntityId(participant.entity_id);
+                                    }}>
+                                      {participant.entity_name}<span>{participant.role}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                              <blockquote>{event.source_quote}</blockquote>
+                              {chapter && <button className="timeline-source" onClick={() => openTimelineChapter(chapter.id)}>查看正式正文</button>}
+                            </div>
+                          </article>
+                        );
+                      })}
+                      {(detail?.story_events?.length ?? 0) === 0 && <div className="empty-state compact">暂无事件索引。通过章节正文后会自动更新，也可手动更新索引。</div>}
+                    </div>
+                  ) : (
+                    <div className="entity-timeline-layout">
+                      <nav className="entity-list" aria-label={libraryFocus === "characters" ? "角色列表" : "物品与资源列表"}>
+                        {visibleTimelineEntities.map((entity: StoryEntity) => (
+                          <button
+                            key={entity.id}
+                            className={entity.id === selectedLibraryEntity?.id ? "active" : ""}
+                            onClick={() => setSelectedLibraryEntityId(entity.id)}
+                          >
+                            <strong>{entity.name}</strong>
+                            <span>{entity.kind === "character" ? "角色" : entity.kind === "resource" ? "资源" : "物品"}</span>
+                          </button>
+                        ))}
+                        {visibleTimelineEntities.length === 0 && <div className="empty-inline">暂无可用索引</div>}
+                      </nav>
+
+                      <section className="entity-detail">
+                        {selectedLibraryEntity ? (
+                          <>
+                            <header className="entity-detail-head">
+                              <div>
+                                <span>{selectedLibraryEntity?.kind === "character" ? "角色" : selectedLibraryEntity?.kind === "resource" ? "资源" : "物品"}</span>
+                                <h4>{selectedLibraryEntity?.name}</h4>
+                              </div>
+                              <small>截至已索引章节</small>
+                            </header>
+                            {selectedEntityCurrentFacts.length > 0 && (
+                              <div className="entity-current-state">
+                                {selectedEntityCurrentFacts.map((fact) => (
+                                  <div key={fact.dimension}>
+                                    <span>{fact.dimension}</span>
+                                    <strong>{fact.value}</strong>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            <div className="entity-timeline">
+                              {selectedEntityTimeline.map((entry) => {
+                                const chapter = detail?.chapters.find((item) => item.id === entry.chapterId);
+                                if (entry.type === "event") {
+                                  return (
+                                    <article className="entity-timeline-entry event" key={`event-${entry.id}`}>
+                                      <span className="entity-timeline-chapter">{chapter ? `第 ${chapter.chapter_no} 章` : "章节未定"}</span>
+                                      <strong>{entry.event.title}</strong>
+                                      <p>{entry.event.summary}</p>
+                                      <blockquote>{entry.event.source_quote}</blockquote>
+                                      {chapter && <button className="timeline-source" onClick={() => openTimelineChapter(chapter.id)}>查看正式正文</button>}
+                                    </article>
+                                  );
+                                }
+                                return (
+                                  <article className="entity-timeline-entry" key={`fact-${entry.id}`}>
+                                    <span className="entity-timeline-chapter">{chapter ? `第 ${chapter.chapter_no} 章` : "章节未定"}</span>
+                                    <strong>{entry.fact.dimension}</strong>
+                                    <p>{entry.fact.value}</p>
+                                    <blockquote>{entry.fact.source_quote}</blockquote>
+                                    {chapter && <button className="timeline-source" onClick={() => openTimelineChapter(chapter.id)}>查看正式正文</button>}
+                                  </article>
+                                );
+                              })}
+                              {selectedEntityTimeline.length === 0 && <div className="empty-inline">尚无该实体的状态变化记录</div>}
+                            </div>
+                          </>
+                        ) : <div className="empty-state compact">选择一个{libraryFocus === "characters" ? "角色" : "物品"}查看时间线。</div>}
+                      </section>
+                    </div>
+                  )}
+                </section>
+              )}
+
+              {!["characters", "items", "events"].includes(libraryFocus) && (
               <div className="library-layout">
                 <nav className="library-nav" aria-label="书籍资料分类">
                   {foundationStages.map((stage) => (
@@ -1650,6 +2158,7 @@ export function App() {
                   </section>
                 </aside>
               </div>
+              )}
             </section>
           ) : (
             <>
@@ -1712,7 +2221,7 @@ export function App() {
                         aria-label={`删除《${project.title}》`}
                         onClick={(event) => {
                           event.stopPropagation();
-                          void deleteProject(project);
+                          setProjectPendingDeletion(project);
                         }}
                         disabled={busy === "删除书籍"}
                       >
@@ -1773,13 +2282,6 @@ export function App() {
               )}
             </div>
             {!detail && <p>设定、大纲、角色、写作、试读、修订，每一步都由人工确认推进。</p>}
-            {!detail && runtimeMode === "web-dev-api" && (
-              <div className="project-summary">
-                <span>Web 可见调试</span>
-                <span>已连接本地 Rust Dev API</span>
-                <span>可直接新建项目并调用真实后端</span>
-              </div>
-            )}
             {detail && (
               <div className="surface-switch" role="tablist" aria-label="内容区域">
                 <button
@@ -1837,6 +2339,20 @@ export function App() {
                     <span>{stage.label}</span>
                   </button>
                 ))}
+                <button
+                  className={mainSurface === "library" && libraryFocus === "items" ? "active" : ""}
+                  onClick={() => openLibrary("items")}
+                >
+                  <span>物品</span>
+                  <small>{detail?.story_entities?.filter((entity) => entity.kind === "item" || entity.kind === "resource").length ?? 0}</small>
+                </button>
+                <button
+                  className={mainSurface === "library" && libraryFocus === "events" ? "active" : ""}
+                  onClick={() => openLibrary("events")}
+                >
+                  <span>事件</span>
+                  <small>{detail?.story_events?.length ?? 0}</small>
+                </button>
                 <button
                   className={mainSurface === "library" && libraryFocus === "foreshadowing" ? "active" : ""}
                   onClick={() => openLibrary()}
@@ -1978,17 +2494,104 @@ export function App() {
                 )}
               </article>
             </section>
+          ) : mainSurface === "library" && ["characters", "items", "events"].includes(libraryFocus) ? (
+            <ContinuityLibraryPanel
+              focus={libraryFocus as "characters" | "items" | "events"}
+              detail={detail}
+              busy={Boolean(busy)}
+              status={storyIndexStatus}
+              participantsByEvent={participantsByEvent}
+              entities={visibleTimelineEntities}
+              selectedEntity={selectedLibraryEntity}
+              currentFacts={selectedEntityCurrentFacts}
+              timeline={selectedEntityTimeline}
+              onRebuild={rebuildLibraryIndex}
+              onSelectEntity={setSelectedLibraryEntityId}
+              onOpenEntity={(entityId, kind) => {
+                openLibrary(kind === "character" ? "characters" : "items");
+                setSelectedLibraryEntityId(entityId);
+              }}
+              onOpenChapter={openTimelineChapter}
+            />
           ) : mainSurface === "library" ? (
             <section className="library-workspace">
               <header className="library-header">
                 <div>
-                  <h2>书籍资料</h2>
-                  <p>设定、大纲、角色与伏笔会随创作逐步扩展，并作为后续写作的事实依据。</p>
+                  <h2>创作基准</h2>
+                  <p>故事架构 Agent 统一维护世界、阶段大纲、角色与伏笔；资料视图会随创作逐步扩展。</p>
                 </div>
                 <button onClick={() => (showKnowledgeComposer ? resetKnowledgeComposer() : setShowKnowledgeComposer(true))} disabled={!detail || Boolean(busy)}>
                   <Plus size={14} /> 补充资料
                 </button>
               </header>
+
+              <section className="story-bible-overview">
+                <div className="story-bible-summary">
+                  <div>
+                    <span className={`library-status ${detail?.story_bible?.status ?? "draft"}`}>
+                      {detail?.story_bible?.status === "confirmed" ? "已确认" : "待确认"}
+                    </span>
+                    <h3>故事架构 Agent</h3>
+                    <p>{activeStoryArc ? `当前阶段：${activeStoryArc.title}` : "尚未确认进行中的故事阶段"}</p>
+                  </div>
+                  <div className="story-bible-actions">
+                    <button
+                      className="btn-primary"
+                      onClick={() => runStoryArchitect(libraryArtifact ? "refine_canon" : "initialize")}
+                      disabled={!detail || Boolean(busy)}
+                    >
+                      <Sparkles size={14} /> {libraryArtifact ? "补充创作基准" : "初始化创作基准"}
+                    </button>
+                    <button onClick={() => runStoryArchitect("plan_current_arc")} disabled={!detail || Boolean(busy)}>
+                      <Rows3 size={14} /> 细化当前阶段
+                    </button>
+                    <details className="toolbar-more">
+                      <summary>更多</summary>
+                      <div className="toolbar-more-menu">
+                        <button onClick={() => runStoryArchitect("extend_next_arc")} disabled={!detail || Boolean(busy)}><ChevronRight size={14} /> 扩展下一阶段</button>
+                        <button onClick={() => runStoryArchitect("design_characters")} disabled={!detail || Boolean(busy)}><MessageSquare size={14} /> 补充角色</button>
+                      </div>
+                    </details>
+                  </div>
+                </div>
+                <div className="story-bible-status-row">
+                  <span>基准版本 v{detail?.story_bible?.canon_version ?? 0}</span>
+                  <span>{detail?.story_arcs?.length ?? 0} 个故事阶段</span>
+                  <span>{detail?.story_bible_review?.status === "confirmed" ? "一致性已确认" : "一致性待审校"}</span>
+                </div>
+                {detail?.story_arcs?.length ? (
+                  <div className="story-arc-list">
+                    {detail.story_arcs.map((arc) => (
+                      <article key={arc.id} className={arc.status === "active" ? "story-arc active" : "story-arc"}>
+                        <span>阶段 {arc.arc_no}</span><strong>{arc.title}</strong><p>{arc.objective || "等待细化阶段目标"}</p>
+                      </article>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="story-bible-review-row">
+                  <input value={storyBibleNote} onChange={(event) => setStoryBibleNote(event.target.value)} placeholder="人工确认备注，可为空" />
+                  {!detail?.story_bible || detail.story_bible.status !== "confirmed" ? (
+                    <button onClick={confirmStoryBible} disabled={!detail || Boolean(busy)}><Check size={14} /> 确认创作基准</button>
+                  ) : detail.story_bible_review?.status === "pending_human_confirmation" ? (
+                    <button onClick={confirmStoryBibleReview} disabled={Boolean(busy)}><Check size={14} /> 确认审校结论</button>
+                  ) : (
+                    <button onClick={reviewStoryBible} disabled={Boolean(busy)}><Eye size={14} /> 审校一致性</button>
+                  )}
+                </div>
+                {detail?.story_bible_review && (
+                  <details className="story-bible-review" open={detail.story_bible_review.status === "pending_human_confirmation"}>
+                    <summary>一致性审校 · {detail.story_bible_review.verdict} · {detail.story_bible_review.issues.length} 项</summary>
+                    <p>{detail.story_bible_review.summary}</p>
+                    {detail.story_bible_review.issues.map((issue, index) => (
+                      <article key={`${issue.title}-${index}`} className={`canon-issue ${issue.severity}`}>
+                        <strong>{issue.title}</strong><span>{issue.domain} · {issue.severity}</span>
+                        <p>{issue.conflict}</p><p>{issue.impact}</p>
+                        <button onClick={() => createTargetedRework(issue)} disabled={Boolean(busy)}><RefreshCcw size={14} /> 交给故事架构 Agent 修复</button>
+                      </article>
+                    ))}
+                  </details>
+                )}
+              </section>
 
               <div className="library-layout">
                 <section className="library-canvas">
@@ -1998,7 +2601,7 @@ export function App() {
                       <p>{libraryArtifact ? "当前确认版本已拆分为可阅读卡片。" : "尚未生成该类资料。"}</p>
                     </div>
                     <button onClick={() => runAgent(librarySection)} disabled={!detail || Boolean(busy)}>
-                      <RefreshCcw size={14} /> {libraryArtifact ? "迭代资料" : "生成资料"}
+                      <RefreshCcw size={14} /> {libraryArtifact ? "用故事架构 Agent 迭代" : "用故事架构 Agent 生成"}
                     </button>
                   </div>
 
@@ -2108,6 +2711,17 @@ export function App() {
                 >
                   <Check size={14} /> {selectedArtifactApproved ? "已通过" : "人工通过"}
                 </button>
+                {selectedArtifactSupportsAdoption && (
+                  <button
+                    onClick={() => selectedArtifactProposals.length > 0 ? setShowAdoptionDrawer(true) : prepareArtifactAdoptions()}
+                    disabled={Boolean(busy)}
+                  >
+                    <Rows3 size={14} /> 整理资料
+                    {selectedArtifactProposals.filter((proposal) => proposal.status === "pending").length > 0
+                      ? ` (${selectedArtifactProposals.filter((proposal) => proposal.status === "pending").length})`
+                      : ""}
+                  </button>
+                )}
                 <details className="toolbar-more">
                   <summary>更多</summary>
                   <div className="toolbar-more-menu">
@@ -2117,8 +2731,13 @@ export function App() {
                     >
                       <RefreshCcw size={14} /> {selectedBookArtifactCanIterate ? "整版重写" : "重新生成"}
                     </button>
-                    <button onClick={deleteSelectedArtifact} disabled={!selectedArtifact || Boolean(busy)}>
-                      <Trash2 size={14} /> 删除当前版本
+                    <button
+                      onClick={deleteSelectedArtifact}
+                      disabled={!selectedArtifact || Boolean(busy) || Boolean(selectedArtifactDeleteBlockReason)}
+                      title={selectedArtifactDeleteBlockReason ?? "删除当前版本"}
+                    >
+                      <Trash2 size={14} />
+                      {selectedArtifactDeleteBlockReason ?? "删除当前版本"}
                     </button>
                   </div>
                 </details>
@@ -2132,7 +2751,15 @@ export function App() {
                   <button
                     key={artifact.id}
                     className={artifact.id === selectedArtifact?.id ? "artifact-tab active" : "artifact-tab"}
-                    onClick={() => setSelectedArtifactId(artifact.id)}
+                    onClick={() => {
+                      setSelectedArtifactId(artifact.id);
+                      setExplicitArchitectSourceId(
+                        artifact.chapter_id == null &&
+                        (artifact.stage === "setting" || artifact.stage === "outline" || artifact.stage === "characters")
+                          ? artifact.id
+                          : null
+                      );
+                    }}
                   >
                     v{artifact.version} · {artifact.status}
                     {selectedChapter?.current_artifact_id === artifact.id ? " · 当前正文" : ""}
@@ -2190,37 +2817,8 @@ export function App() {
               )}
             </article>
 
-            {selectedArtifact && compareArtifact && diffLines.length > 0 && (
-              <details className="version-drawer diff-drawer">
-                <summary>查看版本差异</summary>
-              <section className="diff-board">
-                <div className="diff-board-head">
-                  <strong>版本对比</strong>
-                  <span>
-                    当前 v{selectedArtifact.version} 对比 v{compareArtifact.version}
-                  </span>
-                </div>
-                <div className="diff-lines">
-                  {visibleDiffLines.slice(0, 160).map((line, index) => (
-                    <article className={`diff-line ${line.kind}`} key={`${line.baseLine ?? "-"}-${line.currentLine ?? "-"}-${index}`}>
-                      <span className="diff-marker" aria-hidden="true">
-                        {line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}
-                      </span>
-                      <span className="diff-line-number">
-                        {line.kind === "added" ? `当前 ${line.currentLine}` : line.kind === "removed" ? `旧版 ${line.baseLine}` : `${line.baseLine}`}
-                      </span>
-                      <pre>{line.text || "（空行）"}</pre>
-                    </article>
-                  ))}
-                  {diffLines.every((line) => line.kind === "same") && (
-                    <div className="empty-inline">两个版本内容一致</div>
-                  )}
-                  {visibleDiffLines.length > 160 && (
-                    <div className="empty-inline">差异较多，当前仅显示前 160 行及其上下文。</div>
-                  )}
-                </div>
-              </section>
-              </details>
+            {selectedArtifact && compareArtifact && selectedArtifact.id !== compareArtifact.id && (
+              <ArtifactDiffPanel selectedArtifact={selectedArtifact} compareArtifact={compareArtifact} />
             )}
 
             {selectedArtifact?.stage === "review" && (
@@ -2241,6 +2839,27 @@ export function App() {
                 <div className="empty-state compact">试读结果还不是结构化 JSON，先看原文。</div>
               )}
             </div>
+            )}
+            {selectedArtifact?.stage === "review" &&
+              ledgerContinuityReport &&
+              selectedArtifact.parent_artifact_id === ledgerContinuityReport.artifact_id && (
+              <section className="ledger-report" aria-label="状态账本核对结果">
+                <div className="ledger-report-head">
+                  <strong>状态账本核对</strong>
+                  <span>{ledgerContinuityReport.issues.length > 0 ? `${ledgerContinuityReport.issues.length} 条需核对` : "未发现直接冲突"}</span>
+                </div>
+                <p>{ledgerContinuityReport.summary}</p>
+                {ledgerContinuityReport.issues.map((issue, index) => (
+                  <article className="ledger-issue" key={`${issue.entity_label}-${issue.candidate_quote}-${index}`}>
+                    <strong>{issue.entity_label}</strong>
+                    <span>{issue.severity}</span>
+                    <p>{issue.reason}</p>
+                    <p><b>候选稿：</b>{issue.candidate_quote}</p>
+                    <p><b>{issue.source_chapter}：</b>{issue.source_quote}</p>
+                    <small>{issue.suggestion}</small>
+                  </article>
+                ))}
+              </section>
             )}
           </section>
 
@@ -2275,6 +2894,38 @@ export function App() {
               >
                 <Sparkles size={14} /> {selectedBookArtifactCanIterate ? "带指令局部迭代" : "带指令运行"}
               </button>
+              <button
+                className="secondary-action"
+                onClick={previewAgentContext}
+                disabled={!detail || Boolean(busy)}
+              >
+                <Eye size={14} /> 查看生成上下文
+              </button>
+              {contextPreview && (
+                <section className="context-preview-panel">
+                  <div className="context-preview-head">
+                    <div>
+                      <strong>{contextPreview.genre_agent.name}将使用的上下文</strong>
+                      <span>{contextPreview.total_chars.toLocaleString()} 字符 · 约 {contextPreview.estimated_tokens.toLocaleString()} tokens</span>
+                    </div>
+                    <button className="icon-btn" onClick={() => setContextPreview(null)} title="关闭上下文预览" aria-label="关闭上下文预览">×</button>
+                  </div>
+                  <p className="context-preview-note">这是只读预览，内容来自已批准资料、章节状态、历史检索和当前人工指令；不会修改数据库。</p>
+                  <details className="context-preview-section">
+                    <summary>Agent 角色规则</summary>
+                    <pre>{contextPreview.system_prompt}</pre>
+                  </details>
+                  {contextPreview.segments.map((segment) => (
+                    <details className="context-preview-section" key={`${segment.label}-${segment.chars}`}>
+                      <summary>
+                        <span>{segment.label}</span>
+                        <small>{segment.chars.toLocaleString()} 字符{segment.truncated ? " · 已截断预览" : ""}</small>
+                      </summary>
+                      <pre>{segment.content}</pre>
+                    </details>
+                  ))}
+                </section>
+              )}
               {canRunReview && selectedArtifact?.stage !== "review" && (
                 <button
                   className="secondary-action"
@@ -2548,6 +3199,12 @@ export function App() {
                 连续性审校
               </div>
               <button
+                onClick={checkLedgerContinuity}
+                disabled={!selectedArtifact || (selectedArtifact.stage !== "draft" && selectedArtifact.stage !== "revision") || Boolean(busy)}
+              >
+                <Rows3 size={14} /> 状态账本核对
+              </button>
+              <button
                 onClick={reviewContinuity}
                 disabled={!detail || detail.chapters.length < 2 || Boolean(busy)}
               >
@@ -2705,6 +3362,52 @@ export function App() {
           busy={Boolean(busy)}
         />
       )}
+
+      {projectPendingDeletion && (
+        <div
+          className="modal-overlay"
+          role="presentation"
+          onClick={() => {
+            if (!busy) setProjectPendingDeletion(null);
+          }}
+        >
+          <section
+            className="modal project-delete-confirmation"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="project-delete-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="modal-header">
+              <h2 id="project-delete-title">删除书籍</h2>
+            </header>
+            <div className="modal-body">
+              <p>确定删除《{projectPendingDeletion.title}》吗？</p>
+              <p className="project-delete-warning">该书籍的章节、产物和记录都会一并删除，且无法恢复。</p>
+            </div>
+            <footer className="modal-footer">
+              <button onClick={() => setProjectPendingDeletion(null)} disabled={Boolean(busy)}>取消</button>
+              <button className="btn-danger" onClick={() => void deleteProject(projectPendingDeletion)} disabled={Boolean(busy)}>
+                {busy === "删除书籍" ? "正在删除..." : "删除书籍"}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+
+      <AdoptionDrawer
+        open={showAdoptionDrawer}
+        proposals={selectedArtifactProposals as AdoptionProposal[]}
+        chapters={detail?.chapters ?? []}
+        knowledgeCards={detail?.knowledge_cards ?? []}
+        foreshadowings={detail?.foreshadowings ?? []}
+        busy={Boolean(busy)}
+        onClose={() => setShowAdoptionDrawer(false)}
+        onExtract={prepareArtifactAdoptions}
+        onSave={saveAdoptionProposal}
+        onApply={applyAdoptionProposals}
+        onReject={rejectAdoptionProposals}
+      />
     </main>
   );
 }

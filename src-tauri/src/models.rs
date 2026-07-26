@@ -25,12 +25,42 @@ impl Stage {
 
     pub fn title(&self) -> &'static str {
         match self {
-            Stage::Setting => "设定 Agent",
-            Stage::Outline => "大纲 Agent",
-            Stage::Characters => "角色 Agent",
+            Stage::Setting => "设定资料",
+            Stage::Outline => "阶段大纲",
+            Stage::Characters => "角色资料",
             Stage::Draft => "写作 Agent",
             Stage::Review => "试读 Agent",
             Stage::Revision => "修订 Agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryArchitectMode {
+    Initialize,
+    RefineCanon,
+    PlanCurrentArc,
+    ExtendNextArc,
+    DesignCharacters,
+}
+
+impl StoryArchitectMode {
+    pub fn artifact_stage(&self) -> Stage {
+        match self {
+            Self::Initialize | Self::RefineCanon => Stage::Setting,
+            Self::PlanCurrentArc | Self::ExtendNextArc => Stage::Outline,
+            Self::DesignCharacters => Stage::Characters,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Initialize => "初始化创作基准",
+            Self::RefineCanon => "补充设定",
+            Self::PlanCurrentArc => "细化当前阶段",
+            Self::ExtendNextArc => "扩展下一阶段",
+            Self::DesignCharacters => "补充角色",
         }
     }
 }
@@ -76,7 +106,6 @@ pub struct ChapterUpdate {
     pub id: i64,
     pub title: String,
     pub status: String,
-    pub current_artifact_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +116,16 @@ pub struct Agent {
     pub role: String,
     pub system_prompt: String,
     pub temperature: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenreAgentProfile {
+    pub agent_key: String,
+    pub name: String,
+    pub role: String,
+    pub system_prompt: String,
+    pub primary_skill_key: String,
+    pub allowed_skill_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +190,19 @@ pub struct WorkflowRun {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChapterMemoryRecord {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_id: i64,
+    pub source_artifact_id: i64,
+    pub source_text_hash: String,
+    pub normalization_version: String,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryThread {
     pub id: i64,
     pub project_id: i64,
@@ -207,6 +259,293 @@ pub struct Foreshadowing {
     pub updated_at: String,
 }
 
+/// A named story-world entity. This is an identity registry, not a mutable
+/// character sheet: changing facts are stored separately with source evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryEntity {
+    pub id: i64,
+    pub project_id: i64,
+    pub kind: String,
+    pub name: String,
+    pub status: String,
+    pub first_seen_chapter_id: Option<i64>,
+    pub source_artifact_id: Option<i64>,
+    pub source_quote: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryEvent {
+    pub id: i64,
+    pub project_id: i64,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    pub story_time: String,
+    pub summary: String,
+    pub narrative_chapter_id: Option<i64>,
+    pub source_artifact_id: i64,
+    pub source_quote: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryEventParticipant {
+    pub event_id: i64,
+    pub entity_id: i64,
+    pub entity_name: String,
+    pub role: String,
+}
+
+/// An immutable, evidence-backed assertion extracted from approved formal text.
+/// `status` and `supersedes_fact_id` make a later change traceable rather than
+/// silently overwriting earlier text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryFact {
+    pub id: i64,
+    pub project_id: i64,
+    pub entity_id: i64,
+    pub event_id: Option<i64>,
+    pub dimension: String,
+    pub value: String,
+    pub visibility: String,
+    pub status: String,
+    pub narrative_chapter_id: Option<i64>,
+    pub source_artifact_id: i64,
+    pub source_quote: String,
+    pub supersedes_fact_id: Option<i64>,
+    pub created_at: String,
+}
+
+/// The derived-index result for one approved formal chapter. This is exposed
+/// separately from creative approval so the UI can distinguish a valid chapter
+/// from an index that merely needs a retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryIndexSource {
+    pub project_id: i64,
+    pub chapter_id: i64,
+    pub source_artifact_id: i64,
+    pub status: String,
+    pub error: Option<String>,
+    pub indexed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebuildStoryIndexRequest {
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryIndexSummary {
+    pub project_id: i64,
+    pub chapter_id: i64,
+    pub source_artifact_id: i64,
+    pub entity_count: usize,
+    pub event_count: usize,
+    pub fact_count: usize,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorySearchSource {
+    pub project_id: i64,
+    pub source_kind: String,
+    pub source_id: i64,
+    pub chapter_id: Option<i64>,
+    pub chapter_no_sort: Option<i64>,
+    pub stage: Option<String>,
+    pub source_artifact_id: Option<i64>,
+    pub source_text_hash: String,
+    pub normalization_version: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub indexed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivedIndexJob {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub source_artifact_id: Option<i64>,
+    pub job_type: String,
+    pub scope_key: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub next_attempt_at: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryIndexJobsRequest {
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorySearchStatus {
+    pub project_id: i64,
+    pub model_version: String,
+    pub model_status: String,
+    pub sqlite_vec_status: String,
+    pub document_count: usize,
+    pub embedding_count: usize,
+    pub indexed_source_count: usize,
+    pub last_indexed_at: Option<String>,
+    pub stale: bool,
+    pub stale_sources: usize,
+    pub sources: Vec<StorySearchSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebuildStorySearchIndexRequest {
+    pub project_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryBible {
+    pub id: i64,
+    pub project_id: i64,
+    pub reader_promise: String,
+    pub protagonist_engine: String,
+    pub core_conflict: String,
+    pub endgame_direction: String,
+    pub immutable_rules: String,
+    pub canon_version: i64,
+    pub status: String,
+    pub source_artifact_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryArc {
+    pub id: i64,
+    pub project_id: i64,
+    pub arc_no: i64,
+    pub title: String,
+    pub objective: String,
+    pub entry_state: String,
+    pub exit_change: String,
+    pub core_conflict: String,
+    pub involved_characters: String,
+    pub chapter_start: Option<i64>,
+    pub chapter_end: Option<i64>,
+    pub status: String,
+    pub source_artifact_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonIssue {
+    pub domain: String,
+    pub severity: String,
+    pub title: String,
+    pub conflict: String,
+    pub impact: String,
+    pub owner_mode: String,
+    pub rework_instruction: String,
+    #[serde(default)]
+    pub evidence_quotes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryBibleReview {
+    pub id: i64,
+    pub project_id: i64,
+    pub canon_fingerprint: String,
+    pub verdict: String,
+    pub summary: String,
+    pub issues: Vec<CanonIssue>,
+    pub status: String,
+    pub note: String,
+    pub created_at: String,
+    pub confirmed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunStoryArchitectRequest {
+    pub project_id: i64,
+    pub mode: StoryArchitectMode,
+    pub arc_id: Option<i64>,
+    pub user_instruction: Option<String>,
+    pub source_artifact_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmStoryBibleRequest {
+    pub project_id: i64,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryBibleReviewRequest {
+    pub project_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmStoryBibleReviewRequest {
+    pub project_id: i64,
+    pub review_id: i64,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptionProposal {
+    pub id: i64,
+    pub project_id: i64,
+    pub source_artifact_id: i64,
+    pub target_kind: String,
+    pub target_id: Option<i64>,
+    pub operation: String,
+    pub data: serde_json::Value,
+    pub evidence_quote: String,
+    pub target_snapshot: Option<String>,
+    pub status: String,
+    pub validation_error: Option<String>,
+    pub decision_note: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareArtifactAdoptionsRequest {
+    pub project_id: i64,
+    pub artifact_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAdoptionProposalsRequest {
+    pub project_id: i64,
+    pub artifact_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAdoptionProposalRequest {
+    pub proposal_id: i64,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideAdoptionProposalsRequest {
+    pub project_id: i64,
+    pub proposal_ids: Vec<i64>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptionBatchResult {
+    pub proposals: Vec<AdoptionProposal>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveForeshadowing {
     pub id: Option<i64>,
@@ -246,6 +585,7 @@ pub struct SaveWritingSkill {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDetail {
     pub project: Project,
+    pub genre_agent: GenreAgentProfile,
     pub chapters: Vec<Chapter>,
     pub agents: Vec<Agent>,
     pub artifacts: Vec<Artifact>,
@@ -255,6 +595,17 @@ pub struct ProjectDetail {
     pub story_threads: Vec<StoryThread>,
     pub knowledge_cards: Vec<KnowledgeCard>,
     pub foreshadowings: Vec<Foreshadowing>,
+    pub story_entities: Vec<StoryEntity>,
+    pub story_events: Vec<StoryEvent>,
+    pub story_event_participants: Vec<StoryEventParticipant>,
+    pub story_facts: Vec<StoryFact>,
+    pub story_index_sources: Vec<StoryIndexSource>,
+    pub story_search_sources: Vec<StorySearchSource>,
+    pub index_jobs: Vec<DerivedIndexJob>,
+    pub adoption_proposals: Vec<AdoptionProposal>,
+    pub story_bible: Option<StoryBible>,
+    pub story_arcs: Vec<StoryArc>,
+    pub story_bible_review: Option<StoryBibleReview>,
     pub settings: AiSettings,
 }
 
@@ -322,6 +673,30 @@ pub struct RunAgentRequest {
     pub chapter_id: Option<i64>,
     pub user_instruction: Option<String>,
     pub source_artifact_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebuildChapterMemoryRequest {
+    pub project_id: i64,
+    pub chapter_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPreviewSegment {
+    pub label: String,
+    pub content: String,
+    pub chars: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPreview {
+    pub stage: String,
+    pub genre_agent: GenreAgentProfile,
+    pub system_prompt: String,
+    pub segments: Vec<ContextPreviewSegment>,
+    pub total_chars: usize,
+    pub estimated_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,6 +842,50 @@ pub struct ContinuityReport {
     pub verdict: String,
     pub summary: String,
     pub issues: Vec<ContinuityIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityLedgerEntry {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_id: i64,
+    pub source_artifact_id: i64,
+    pub source_text_hash: String,
+    pub normalization_version: String,
+    pub entity_kind: String,
+    pub entity_key: String,
+    pub entity_label: String,
+    pub state_kind: String,
+    pub state_value: String,
+    pub evidence_quote: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerContinuityCheckRequest {
+    pub project_id: i64,
+    pub artifact_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerContinuityIssue {
+    pub severity: String,
+    pub entity_label: String,
+    pub entity_kind: String,
+    pub state_kind: String,
+    pub candidate_quote: String,
+    pub source_chapter: String,
+    pub source_quote: String,
+    pub reason: String,
+    pub suggestion: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerContinuityReport {
+    pub project_id: i64,
+    pub artifact_id: i64,
+    pub summary: String,
+    pub issues: Vec<LedgerContinuityIssue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

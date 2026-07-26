@@ -1,16 +1,23 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AdoptionBatchResult,
+  AdoptionProposal,
+  Approval,
   AiSpanRevisionInput,
   AgentStepResult,
   AiSettings,
   Artifact,
   Chapter,
+  ChapterMemoryRecord,
   ChapterGateReport,
   ChapterSplitPlan,
   ChapterUpdate,
   ClearChapterHistoryInput,
   DeleteArtifactInput,
+  LedgerContinuityReport,
   ContinuityReport,
+  ContextPreview,
+  DerivedIndexJob,
   Foreshadowing,
   HistoryCleanupResult,
   KnowledgeCard,
@@ -28,6 +35,12 @@ import type {
   SaveKnowledgeCardInput,
   Stage,
   StoryContextSnippet,
+  StorySearchStatus,
+  StoryIndexSummary,
+  StoryArc,
+  StoryBible,
+  StoryBibleReview,
+  StoryArchitectMode,
   WritingSkill
 } from "./types";
 
@@ -90,6 +103,16 @@ export const api = {
     invokeCommand<KnowledgeCard>("save_knowledge_card", { input }),
   saveForeshadowing: (input: SaveForeshadowingInput) =>
     invokeCommand<Foreshadowing>("save_foreshadowing", { input }),
+  prepareArtifactAdoptions: (input: { project_id: number; artifact_id: number }) =>
+    invokeCommand<AdoptionProposal[]>("prepare_artifact_adoptions", { input }),
+  listAdoptionProposals: (input: { project_id: number; artifact_id?: number | null }) =>
+    invokeCommand<AdoptionProposal[]>("list_adoption_proposals", { input }),
+  updateAdoptionProposal: (input: { proposal_id: number; data: Record<string, unknown> }) =>
+    invokeCommand<AdoptionProposal>("update_adoption_proposal", { input }),
+  applyAdoptionProposals: (input: { project_id: number; proposal_ids: number[]; note: string }) =>
+    invokeCommand<AdoptionBatchResult>("apply_adoption_proposals", { input }),
+  rejectAdoptionProposals: (input: { project_id: number; proposal_ids: number[]; note: string }) =>
+    invokeCommand<AdoptionBatchResult>("reject_adoption_proposals", { input }),
   getSettings: () => invokeCommand<AiSettings>("get_settings"),
   testAiConnection: (input?: {
     base_url?: string | null;
@@ -107,8 +130,46 @@ export const api = {
     user_instruction?: string | null;
     source_artifact_id?: number | null;
   }) => invokeCommand<AgentStepResult>("run_agent_step", { input }),
+  rebuildChapterMemory: (input: { project_id: number; chapter_id: number }) =>
+    invokeCommand<ChapterMemoryRecord>("rebuild_chapter_memory", { input }),
+  rebuildStoryIndex: (input: { project_id: number; chapter_id?: number | null }) =>
+    invokeCommand<StoryIndexSummary[]>("rebuild_story_index", { input }),
+  retryIndexJobs: (input: { project_id: number; chapter_id?: number | null }) =>
+    invokeCommand<DerivedIndexJob[]>("retry_index_jobs", { input }),
+  rebuildStorySearchIndex: (input: { project_id: number }) =>
+    invokeCommand<StorySearchStatus>("rebuild_story_search_index", { input }),
+  getStorySearchStatus: (projectId: number) =>
+    invokeCommand<StorySearchStatus>("get_story_search_status", { projectId }),
+  runStoryArchitect: (input: {
+    project_id: number;
+    mode: StoryArchitectMode;
+    arc_id?: number | null;
+    user_instruction?: string | null;
+    source_artifact_id?: number | null;
+  }) => invokeCommand<AgentStepResult>("run_story_architect", { input }),
+  createTargetedRework: (input: {
+    project_id: number;
+    mode: StoryArchitectMode;
+    arc_id?: number | null;
+    user_instruction?: string | null;
+    source_artifact_id?: number | null;
+  }) => invokeCommand<AgentStepResult>("create_targeted_rework", { input }),
+  confirmStoryBible: (input: { project_id: number; note: string }) =>
+    invokeCommand<StoryBible>("confirm_story_bible", { input }),
+  reviewStoryBible: (input: { project_id: number }) =>
+    invokeCommand<StoryBibleReview>("review_story_bible", { input }),
+  confirmStoryBibleReview: (input: { project_id: number; review_id: number; note: string }) =>
+    invokeCommand<StoryBibleReview>("confirm_story_bible_review", { input }),
+  listStoryArcs: (projectId: number) => invokeCommand<StoryArc[]>("list_story_arcs", { projectId }),
+  previewAgentContext: (input: {
+    project_id: number;
+    stage: Stage;
+    chapter_id?: number | null;
+    user_instruction?: string | null;
+    source_artifact_id?: number | null;
+  }) => invokeCommand<ContextPreview>("preview_agent_context", { input }),
   approveStage: (projectId: number, stage: Stage, artifactId: number, note?: string) =>
-    invokeCommand("approve_stage", {
+    invokeCommand<Approval>("approve_stage", {
       projectId,
       stage,
       artifactId,
@@ -141,6 +202,8 @@ export const api = {
     candidate_artifact_ids?: number[] | null;
   }) =>
     invokeCommand<ContinuityReport>("review_project_continuity", { input }),
+  checkArtifactLedgerContinuity: (input: { project_id: number; artifact_id: number }) =>
+    invokeCommand<LedgerContinuityReport>("check_artifact_ledger_continuity", { input }),
   searchStoryContext: (input: {
     project_id: number;
     chapter_id?: number | null;

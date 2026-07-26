@@ -28,10 +28,18 @@ pub struct ChatCompletionRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_split: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResponseFormat {
     #[serde(rename = "type")]
     pub kind: String,
 }
@@ -48,6 +56,7 @@ struct ChatChoice {
 
 const MAX_AI_RETRIES: usize = 10;
 const AI_REQUEST_TIMEOUT_SECONDS: u64 = 240;
+const AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: u64 = 45;
 const AI_RETRY_DELAY_MILLIS: u64 = 1_000;
 
 pub fn normalize_base_url(base_url: &str) -> String {
@@ -77,6 +86,7 @@ pub fn build_chat_request(
         max_completion_tokens: provider_max_completion_tokens(&settings.base_url),
         thinking: provider_thinking_config(&settings.base_url, settings.thinking_enabled),
         reasoning_split: provider_reasoning_split(&settings.base_url, settings.thinking_enabled),
+        response_format: None,
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -97,6 +107,43 @@ pub async fn complete_chat(
     user_prompt: &str,
     temperature: f64,
 ) -> AppResult<String> {
+    complete_chat_with_format(
+        settings,
+        api_key,
+        system_prompt,
+        user_prompt,
+        temperature,
+        false,
+    )
+    .await
+}
+
+pub async fn complete_json_chat(
+    settings: &AiSettings,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> AppResult<String> {
+    complete_chat_with_format(
+        settings,
+        api_key,
+        system_prompt,
+        user_prompt,
+        temperature,
+        true,
+    )
+    .await
+}
+
+async fn complete_chat_with_format(
+    settings: &AiSettings,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+    json_mode: bool,
+) -> AppResult<String> {
     let normalized_base_url = normalize_base_url(&settings.base_url);
     if normalized_base_url.is_empty() {
         return Err(AppError::Validation("请先设置 API Base URL".to_string()));
@@ -105,7 +152,12 @@ pub async fn complete_chat(
         return Err(AppError::Validation("请先设置模型名称".to_string()));
     }
 
-    let request = build_chat_request(settings, system_prompt, user_prompt, temperature);
+    let mut request = build_chat_request(settings, system_prompt, user_prompt, temperature);
+    if json_mode {
+        request.response_format = Some(ResponseFormat {
+            kind: "json_object".to_string(),
+        });
+    }
     let url = format!("{}/chat/completions", normalized_base_url);
     let client = build_client();
     let mut last_error = None;
@@ -203,16 +255,25 @@ where
     let mut last_error = None;
 
     for attempt in 1..=max_attempts {
-        let response = match client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&request)
-            .send()
-            .await
+        let response = match timeout(
+            Duration::from_secs(AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS),
+            client.post(&url).bearer_auth(api_key).json(&request).send(),
+        )
+        .await
         {
-            Ok(response) => response,
-            Err(error) => {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 last_error = Some(AppError::Network(error));
+                if should_retry(attempt, max_attempts) {
+                    sleep(Duration::from_millis(AI_RETRY_DELAY_MILLIS)).await;
+                }
+                continue;
+            }
+            Err(_) => {
+                last_error = Some(AppError::Validation(format!(
+                    "流式 AI 请求在 {} 秒内没有建立响应",
+                    AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS
+                )));
                 if should_retry(attempt, max_attempts) {
                     sleep(Duration::from_millis(AI_RETRY_DELAY_MILLIS)).await;
                 }
@@ -337,7 +398,7 @@ pub async fn list_models(settings: &AiSettings, api_key: &str) -> AppResult<Vec<
 }
 
 pub fn parse_review_issues(raw: &str) -> Vec<ReviewIssue> {
-    let trimmed = raw.trim();
+    let trimmed = trim_code_fence(raw);
     if let Ok(json) = serde_json::from_str::<Vec<ReviewIssue>>(trimmed) {
         return json;
     }
@@ -385,8 +446,24 @@ where
     let mut raw_response = String::new();
     let mut content = String::new();
     let mut saw_sse_event = false;
+    let mut saw_terminal_event = false;
 
-    while let Some(chunk) = response.chunk().await? {
+    // A provider can accept the connection but never send an SSE event. Bound the
+    // first chunk separately so the shared retry policy can recover visibly.
+    let first_chunk = timeout(
+        Duration::from_secs(AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS),
+        response.chunk(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Validation(format!(
+            "流式 AI 请求在 {} 秒内没有返回首段内容",
+            AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS
+        ))
+    })??;
+
+    let mut next_chunk = first_chunk;
+    while let Some(chunk) = next_chunk {
         let text = String::from_utf8_lossy(&chunk);
         raw_response.push_str(&text);
         buffer.push_str(&text);
@@ -403,6 +480,7 @@ where
             }
             saw_sse_event = true;
             if data == "[DONE]" {
+                saw_terminal_event = true;
                 continue;
             }
             let value: Value = serde_json::from_str(data)
@@ -414,11 +492,28 @@ where
                 content.push_str(&delta);
                 on_update(&content)?;
             }
+            if let Some(reason) = value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                if reason == "length" {
+                    return Err(AppError::Validation(
+                        "AI 输出达到长度上限，已自动重试以避免保存半截正文".to_string(),
+                    ));
+                }
+                saw_terminal_event = true;
+            }
         }
+        next_chunk = response.chunk().await?;
     }
 
     if !saw_sse_event {
         return parse_chat_completion(&raw_response);
+    }
+    if !saw_terminal_event {
+        return Err(AppError::Validation(
+            "AI 流式响应未正常结束，已自动重试以避免保存半截正文".to_string(),
+        ));
     }
     let normalized = strip_think_blocks(&content);
     if normalized.trim().is_empty() {
@@ -729,6 +824,28 @@ mod tests {
             extract_stream_delta_content(&value).as_deref(),
             Some("可见正文")
         );
+    }
+
+    #[test]
+    fn parses_review_issues_wrapped_in_json_code_fence() {
+        let raw = r#"```json
+[
+  {
+    "issue_type": "钩子不足",
+    "severity": "moderate",
+    "location": "章末",
+    "reason": "结尾没有形成下一步压力。",
+    "suggestion": "推进既有时限。",
+    "evidence_quote": "他只剩下两个时辰。",
+    "action_evidence_quote": "他只剩下两个时辰。"
+  }
+]
+```"#;
+
+        let issues = parse_review_issues(raw);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].issue_type, "钩子不足");
+        assert_eq!(issues[0].severity, "moderate");
     }
 
     #[test]

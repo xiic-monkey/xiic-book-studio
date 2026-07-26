@@ -2,7 +2,8 @@ use crate::models::Stage;
 use std::{env, fs, path::PathBuf};
 
 const GENERAL_SERIALIZED_FALLBACK: &str = include_str!("../skills/genres/general_serialized.md");
-const URBAN_MYSTERY_FALLBACK: &str = include_str!("../skills/genres/urban_mystery.md");
+const URBAN_SUPERNATURAL_FALLBACK: &str = include_str!("../skills/genres/urban_supernatural.md");
+const MYSTERY_FALLBACK: &str = include_str!("../skills/genres/mystery.md");
 const XIANXIA_POWER_FANTASY_FALLBACK: &str =
     include_str!("../skills/genres/xianxia_power_fantasy.md");
 const CONTINUITY_AND_AGENCY_FALLBACK: &str =
@@ -11,7 +12,8 @@ const CONTINUITY_AND_AGENCY_FALLBACK: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenreSkillKind {
     GeneralSerialized,
-    UrbanMystery,
+    UrbanSupernatural,
+    Mystery,
     XianxiaPowerFantasy,
 }
 
@@ -19,7 +21,8 @@ impl GenreSkillKind {
     pub fn skill_id(self) -> &'static str {
         match self {
             GenreSkillKind::GeneralSerialized => "general_serialized",
-            GenreSkillKind::UrbanMystery => "urban_mystery",
+            GenreSkillKind::UrbanSupernatural => "urban_supernatural",
+            GenreSkillKind::Mystery => "mystery",
             GenreSkillKind::XianxiaPowerFantasy => "xianxia_power_fantasy",
         }
     }
@@ -27,7 +30,8 @@ impl GenreSkillKind {
     pub fn fallback_template(self) -> &'static str {
         match self {
             GenreSkillKind::GeneralSerialized => GENERAL_SERIALIZED_FALLBACK,
-            GenreSkillKind::UrbanMystery => URBAN_MYSTERY_FALLBACK,
+            GenreSkillKind::UrbanSupernatural => URBAN_SUPERNATURAL_FALLBACK,
+            GenreSkillKind::Mystery => MYSTERY_FALLBACK,
             GenreSkillKind::XianxiaPowerFantasy => XIANXIA_POWER_FANTASY_FALLBACK,
         }
     }
@@ -42,15 +46,24 @@ pub fn detect_genre_skill(genre: &str) -> GenreSkillKind {
         || lowered.contains("男频")
     {
         GenreSkillKind::XianxiaPowerFantasy
-    } else if lowered.contains("都市")
-        || lowered.contains("异能")
-        || lowered.contains("悬疑")
-        || lowered.contains("怪谈")
-        || lowered.contains("推理")
+    } else if lowered.contains("悬疑") || lowered.contains("怪谈") || lowered.contains("推理")
     {
-        GenreSkillKind::UrbanMystery
+        GenreSkillKind::Mystery
+    } else if lowered.contains("异能") || lowered.contains("超能") || lowered.contains("灵气复苏")
+    {
+        GenreSkillKind::UrbanSupernatural
     } else {
         GenreSkillKind::GeneralSerialized
+    }
+}
+
+pub fn genre_skill_for_id(skill_id: &str) -> Option<GenreSkillKind> {
+    match skill_id {
+        "general_serialized" => Some(GenreSkillKind::GeneralSerialized),
+        "urban_supernatural" => Some(GenreSkillKind::UrbanSupernatural),
+        "mystery" => Some(GenreSkillKind::Mystery),
+        "xianxia_power_fantasy" => Some(GenreSkillKind::XianxiaPowerFantasy),
+        _ => None,
     }
 }
 
@@ -72,11 +85,18 @@ pub fn default_writing_skills() -> Vec<DefaultWritingSkill> {
             content: GENERAL_SERIALIZED_FALLBACK,
         },
         DefaultWritingSkill {
-            skill_key: GenreSkillKind::UrbanMystery.skill_id(),
-            name: "都市异能/悬疑",
+            skill_key: GenreSkillKind::UrbanSupernatural.skill_id(),
+            name: "都市异能",
             category: "genre",
-            description: "强调现场压力、职业动作、线索核验和规则试探。",
-            content: URBAN_MYSTERY_FALLBACK,
+            description: "强调异能边界、现代社会反馈、身份变化和能力成长。",
+            content: URBAN_SUPERNATURAL_FALLBACK,
+        },
+        DefaultWritingSkill {
+            skill_key: GenreSkillKind::Mystery.skill_id(),
+            name: "悬疑",
+            category: "genre",
+            description: "强调谜面、证据链、知情边界、解释竞争和公平性。",
+            content: MYSTERY_FALLBACK,
         },
         DefaultWritingSkill {
             skill_key: GenreSkillKind::XianxiaPowerFantasy.skill_id(),
@@ -211,10 +231,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_urban_mystery_skill() {
+    fn separates_urban_supernatural_and_mystery_skills() {
         assert_eq!(
-            detect_genre_skill("都市异能悬疑"),
-            GenreSkillKind::UrbanMystery
+            detect_genre_skill("都市异能"),
+            GenreSkillKind::UrbanSupernatural
+        );
+        assert_eq!(detect_genre_skill("悬疑"), GenreSkillKind::Mystery);
+        assert_eq!(detect_genre_skill("都市悬疑"), GenreSkillKind::Mystery);
+        assert_eq!(
+            detect_genre_skill("都市生活"),
+            GenreSkillKind::GeneralSerialized
         );
     }
 

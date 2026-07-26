@@ -2,6 +2,7 @@ import {
   ArrowLeft,
   Check,
   AlertCircle,
+  Bot,
   ChevronDown,
   Sparkles,
   Type,
@@ -15,9 +16,17 @@ import {
   Trash2,
 } from "lucide-react";
 import { useState, useEffect } from "react";
-import type { AiSettings, ModelInfo, SaveWritingSkill, WritingSkill } from "../types";
+import type {
+  Agent,
+  AiSettings,
+  GenreAgentProfile,
+  ModelInfo,
+  SaveWritingSkill,
+  StorySearchStatus,
+  WritingSkill,
+} from "../types";
 
-type SettingsCategory = "ai" | "skills" | "editor" | "data" | "appearance";
+type SettingsCategory = "ai" | "agents" | "skills" | "editor" | "data" | "appearance";
 
 type ProviderConfig = {
   id: string;
@@ -42,9 +51,9 @@ const defaultProviderConfigs: ProviderConfig[] = [
     id: "minimax",
     label: "MiniMax",
     baseUrl: "https://api.minimaxi.com/v1",
-    model: "",
-    temperature: 0.75,
-    thinkingEnabled: false,
+    model: "MiniMax-M3",
+    temperature: 0.72,
+    thinkingEnabled: true,
   },
 ];
 
@@ -148,6 +157,7 @@ function buildProviderState(settings: AiSettings) {
 
 const categories: { id: SettingsCategory; label: string; icon: React.ReactNode }[] = [
   { id: "ai", label: "服务配置", icon: <Sparkles size={16} /> },
+  { id: "agents", label: "Agent 角色", icon: <Bot size={16} /> },
   { id: "skills", label: "技能库", icon: <Library size={16} /> },
   { id: "editor", label: "编辑器", icon: <Type size={16} /> },
   { id: "data", label: "数据管理", icon: <Database size={16} /> },
@@ -156,6 +166,8 @@ const categories: { id: SettingsCategory; label: string; icon: React.ReactNode }
 
 interface SettingsViewProps {
   settings: AiSettings;
+  projectId?: number | null;
+  storySearchStatus?: StorySearchStatus | null;
   apiKey: string;
   settingsCategory: SettingsCategory;
   onSettingsCategoryChange: (cat: SettingsCategory) => void;
@@ -163,6 +175,10 @@ interface SettingsViewProps {
   onSaveSettings: (settings: AiSettings, key: string) => Promise<void>;
   onTestConnection: (settings: AiSettings, key: string) => Promise<void>;
   onRefreshModels: (input?: { base_url?: string | null; api_key?: string | null }) => Promise<ModelInfo[]>;
+  onRefreshStorySearchStatus: (projectId?: number | null) => Promise<StorySearchStatus | null>;
+  onRebuildStorySearch: () => Promise<void>;
+  agents: Agent[];
+  genreAgent?: GenreAgentProfile | null;
   writingSkills: WritingSkill[];
   onSaveWritingSkill: (input: SaveWritingSkill) => Promise<void>;
   onSaveCategory: (category: SettingsCategory) => Promise<void>;
@@ -173,6 +189,8 @@ interface SettingsViewProps {
 
 export function SettingsView({
   settings,
+  projectId,
+  storySearchStatus,
   apiKey,
   settingsCategory,
   onSettingsCategoryChange,
@@ -180,6 +198,10 @@ export function SettingsView({
   onSaveSettings,
   onTestConnection,
   onRefreshModels,
+  onRefreshStorySearchStatus,
+  onRebuildStorySearch,
+  agents,
+  genreAgent,
   writingSkills,
   onSaveWritingSkill,
   busy,
@@ -196,6 +218,9 @@ export function SettingsView({
   const [modelError, setModelError] = useState<string | null>(null);
   const [selectedSkillKey, setSelectedSkillKey] = useState("");
   const [skillDraft, setSkillDraft] = useState<SaveWritingSkill | null>(null);
+  const [localStorySearchStatus, setLocalStorySearchStatus] = useState<StorySearchStatus | null>(
+    storySearchStatus ?? null
+  );
 
   useEffect(() => {
     const nextProviderState = buildProviderState(settings);
@@ -206,6 +231,20 @@ export function SettingsView({
     setModels([]);
     setModelError(null);
   }, [settings, apiKey]);
+
+  useEffect(() => {
+    setLocalStorySearchStatus(storySearchStatus ?? null);
+  }, [storySearchStatus]);
+
+  useEffect(() => {
+    if (!projectId) {
+      setLocalStorySearchStatus(null);
+      return;
+    }
+    void onRefreshStorySearchStatus(projectId)
+      .then((status) => setLocalStorySearchStatus(status))
+      .catch(() => setLocalStorySearchStatus(null));
+  }, [projectId]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -263,6 +302,12 @@ export function SettingsView({
   const handleSaveSkill = async () => {
     if (!skillDraft) return;
     await onSaveWritingSkill(skillDraft);
+  };
+
+  const handleRebuildStorySearch = async () => {
+    await onRebuildStorySearch();
+    const status = await onRefreshStorySearchStatus(projectId);
+    setLocalStorySearchStatus(status);
   };
 
   const updateCurrentProvider = (patch: Partial<ProviderConfig>) => {
@@ -511,6 +556,55 @@ export function SettingsView({
           </div>
         );
 
+      case "agents":
+        return (
+          <div className="settings-content wide">
+            <div className="settings-intro">
+              <p>每本书持久绑定一个题材专属 Agent；故事架构、写作、试读和修订是它的工作模式。</p>
+              <span>专属 Agent 只能加载白名单 Skill，技能库中的其他题材规则不会进入上下文。</span>
+            </div>
+            {genreAgent && (
+              <section className="agent-prompt-card agent-profile-card">
+                <header>
+                  <div>
+                    <strong>{genreAgent.name}</strong>
+                    <span>{genreAgent.agent_key}</span>
+                  </div>
+                  <small>当前项目专属 Agent</small>
+                </header>
+                <p>{genreAgent.role}</p>
+                <label>主类型 Skill</label>
+                <p>{genreAgent.primary_skill_key}</p>
+                <label>Skill 白名单</label>
+                <p>{genreAgent.allowed_skill_keys.join(" · ")}</p>
+              </section>
+            )}
+            <div className="agent-prompt-list">
+              {agents.map((agent) => (
+                <section className="agent-prompt-card" key={agent.id}>
+                  <header>
+                    <div>
+                      <strong>{agent.name}</strong>
+                      <span>{agent.stage}</span>
+                    </div>
+                    <small>Temperature {agent.temperature}</small>
+                  </header>
+                  <p>{agent.role}</p>
+                  <label htmlFor={`agent-prompt-${agent.id}`}>系统提示词</label>
+                  <textarea
+                    id={`agent-prompt-${agent.id}`}
+                    className="agent-prompt-textarea"
+                    readOnly
+                    value={agent.system_prompt}
+                    spellCheck={false}
+                  />
+                </section>
+              ))}
+              {agents.length === 0 && <p className="settings-hint">选择一个书籍项目后查看 Agent 配置。</p>}
+            </div>
+          </div>
+        );
+
       case "editor":
         return (
           <div className="settings-content">
@@ -608,7 +702,46 @@ export function SettingsView({
           <div className="settings-content">
             <div className="settings-section">
               <h3>数据管理</h3>
-              <p className="settings-hint">数据备份、导入导出功能将在后续版本中开放</p>
+              <div className="local-search-status">
+                <div className="local-search-status-header">
+                  <div>
+                    <strong>本地混合检索</strong>
+                    <span>bge-small-zh-v1.5 · FTS5 trigram · sqlite-vec</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleRebuildStorySearch}
+                    disabled={!projectId || Boolean(busy)}
+                    title="重建当前项目的本地检索索引"
+                  >
+                    <RefreshCcw size={14} />
+                    重建
+                  </button>
+                </div>
+                {localStorySearchStatus ? (
+                  <div className="local-search-status-grid">
+                    <span>模型</span>
+                    <strong>{localStorySearchStatus.model_status}</strong>
+                    <span>sqlite-vec</span>
+                    <strong>{localStorySearchStatus.sqlite_vec_status}</strong>
+                    <span>索引</span>
+                    <strong>
+                      {localStorySearchStatus.document_count} 个片段 · {localStorySearchStatus.embedding_count} 个向量
+                    </strong>
+                    <span>最近更新</span>
+                    <strong>{localStorySearchStatus.last_indexed_at ?? "尚未建立"}</strong>
+                  </div>
+                ) : (
+                  <p className="settings-hint">
+                    {projectId ? "正在读取当前项目的本地检索状态" : "选择书籍项目后查看本地检索状态"}
+                  </p>
+                )}
+                {localStorySearchStatus?.stale && (
+                  <p className="local-search-stale">
+                    有 {localStorySearchStatus.stale_sources} 个来源因正文更新而等待重建。
+                  </p>
+                )}
+              </div>
             </div>
           </div>
         );

@@ -34,11 +34,79 @@ export interface NewChapter {
 
 export interface Agent {
   id: number;
-  stage: Stage;
+  stage: string;
   name: string;
   role: string;
   system_prompt: string;
   temperature: number;
+}
+
+export interface GenreAgentProfile {
+  agent_key: string;
+  name: string;
+  role: string;
+  system_prompt: string;
+  primary_skill_key: string;
+  allowed_skill_keys: string[];
+}
+
+export type StoryArchitectMode = "initialize" | "refine_canon" | "plan_current_arc" | "extend_next_arc" | "design_characters";
+
+export interface StoryBible {
+  id: number;
+  project_id: number;
+  reader_promise: string;
+  protagonist_engine: string;
+  core_conflict: string;
+  endgame_direction: string;
+  immutable_rules: string;
+  canon_version: number;
+  status: string;
+  source_artifact_id?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoryArc {
+  id: number;
+  project_id: number;
+  arc_no: number;
+  title: string;
+  objective: string;
+  entry_state: string;
+  exit_change: string;
+  core_conflict: string;
+  involved_characters: string;
+  chapter_start?: number | null;
+  chapter_end?: number | null;
+  status: string;
+  source_artifact_id?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CanonIssue {
+  domain: string;
+  severity: "minor" | "moderate" | "major" | string;
+  title: string;
+  conflict: string;
+  impact: string;
+  owner_mode: StoryArchitectMode | string;
+  rework_instruction: string;
+  evidence_quotes: string[];
+}
+
+export interface StoryBibleReview {
+  id: number;
+  project_id: number;
+  canon_fingerprint: string;
+  verdict: string;
+  summary: string;
+  issues: CanonIssue[];
+  status: string;
+  note: string;
+  created_at: string;
+  confirmed_at?: string | null;
 }
 
 export interface Chapter {
@@ -56,7 +124,6 @@ export interface ChapterUpdate {
   id: number;
   title: string;
   status: string;
-  current_artifact_id?: number | null;
 }
 
 export interface Artifact {
@@ -135,6 +202,18 @@ export interface WorkflowRun {
   created_at: string;
 }
 
+export interface ChapterMemoryRecord {
+  id: number;
+  project_id: number;
+  chapter_id: number;
+  source_artifact_id: number;
+  source_text_hash: string;
+  normalization_version: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface StoryThread {
   id: number;
   project_id: number;
@@ -188,6 +267,146 @@ export interface Foreshadowing {
   updated_at: string;
 }
 
+export interface StoryEntity {
+  id: number;
+  project_id: number;
+  kind: string;
+  name: string;
+  status: string;
+  first_seen_chapter_id?: number | null;
+  source_artifact_id?: number | null;
+  source_quote: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoryEvent {
+  id: number;
+  project_id: number;
+  title: string;
+  kind: string;
+  status: string;
+  story_time: string;
+  summary: string;
+  narrative_chapter_id?: number | null;
+  source_artifact_id: number;
+  source_quote: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoryEventParticipant {
+  event_id: number;
+  entity_id: number;
+  entity_name: string;
+  role: string;
+}
+
+export interface StoryFact {
+  id: number;
+  project_id: number;
+  entity_id: number;
+  event_id?: number | null;
+  dimension: string;
+  value: string;
+  visibility: string;
+  status: string;
+  narrative_chapter_id?: number | null;
+  source_artifact_id: number;
+  source_quote: string;
+  supersedes_fact_id?: number | null;
+  created_at: string;
+}
+
+export interface StoryIndexSource {
+  project_id: number;
+  chapter_id: number;
+  source_artifact_id: number;
+  status: string;
+  error?: string | null;
+  indexed_at: string;
+}
+
+export interface StoryIndexSummary {
+  project_id: number;
+  chapter_id: number;
+  source_artifact_id: number;
+  entity_count: number;
+  event_count: number;
+  fact_count: number;
+  status: string;
+}
+
+export interface StorySearchSource {
+  project_id: number;
+  source_kind: string;
+  source_id: number;
+  chapter_id?: number | null;
+  chapter_no_sort?: number | null;
+  stage?: string | null;
+  source_artifact_id?: number | null;
+  source_text_hash: string;
+  normalization_version: string;
+  status: string;
+  error?: string | null;
+  indexed_at: string;
+}
+
+export interface DerivedIndexJob {
+  id: number;
+  project_id: number;
+  chapter_id?: number | null;
+  source_artifact_id?: number | null;
+  job_type: string;
+  scope_key: string;
+  status: string;
+  attempt_count: number;
+  next_attempt_at: string;
+  last_error?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  updated_at: string;
+}
+
+export interface StorySearchStatus {
+  project_id: number;
+  model_version: string;
+  model_status: string;
+  sqlite_vec_status: string;
+  document_count: number;
+  embedding_count: number;
+  indexed_source_count: number;
+  last_indexed_at?: string | null;
+  stale: boolean;
+  stale_sources: number;
+  sources: StorySearchSource[];
+}
+
+export type AdoptionTargetKind = "knowledge_card" | "foreshadowing";
+export type AdoptionProposalStatus = "pending" | "applied" | "rejected" | "stale";
+
+export interface AdoptionProposal {
+  id: number;
+  project_id: number;
+  source_artifact_id: number;
+  target_kind: AdoptionTargetKind | string;
+  target_id?: number | null;
+  operation: "create" | "update";
+  data: Record<string, unknown>;
+  evidence_quote: string;
+  target_snapshot?: string | null;
+  status: AdoptionProposalStatus;
+  validation_error?: string | null;
+  decision_note: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdoptionBatchResult {
+  proposals: AdoptionProposal[];
+}
+
 export interface SaveForeshadowingInput {
   id?: number | null;
   project_id: number;
@@ -236,6 +455,7 @@ export interface ModelInfo {
 
 export interface ProjectDetail {
   project: Project;
+  genre_agent: GenreAgentProfile;
   chapters: Chapter[];
   agents: Agent[];
   artifacts: Artifact[];
@@ -245,6 +465,17 @@ export interface ProjectDetail {
   story_threads: StoryThread[];
   knowledge_cards: KnowledgeCard[];
   foreshadowings: Foreshadowing[];
+  story_entities: StoryEntity[];
+  story_events: StoryEvent[];
+  story_event_participants: StoryEventParticipant[];
+  story_facts: StoryFact[];
+  story_index_sources: StoryIndexSource[];
+  story_search_sources: StorySearchSource[];
+  index_jobs: DerivedIndexJob[];
+  adoption_proposals: AdoptionProposal[];
+  story_bible?: StoryBible | null;
+  story_arcs: StoryArc[];
+  story_bible_review?: StoryBibleReview | null;
   settings: AiSettings;
 }
 
@@ -255,6 +486,22 @@ export interface AgentStepResult {
     status: string;
     elapsed_ms: number;
   };
+}
+
+export interface ContextPreviewSegment {
+  label: string;
+  content: string;
+  chars: number;
+  truncated: boolean;
+}
+
+export interface ContextPreview {
+  stage: string;
+  genre_agent: GenreAgentProfile;
+  system_prompt: string;
+  segments: ContextPreviewSegment[];
+  total_chars: number;
+  estimated_tokens: number;
 }
 
 export interface ReviewIssue {
@@ -304,6 +551,25 @@ export interface ContinuityReport {
   verdict: "strong" | "usable" | "needs_revision" | "weak" | string;
   summary: string;
   issues: ContinuityIssue[];
+}
+
+export interface LedgerContinuityIssue {
+  severity: string;
+  entity_label: string;
+  entity_kind: string;
+  state_kind: string;
+  candidate_quote: string;
+  source_chapter: string;
+  source_quote: string;
+  reason: string;
+  suggestion: string;
+}
+
+export interface LedgerContinuityReport {
+  project_id: number;
+  artifact_id: number;
+  summary: string;
+  issues: LedgerContinuityIssue[];
 }
 
 export interface GateBlocker {

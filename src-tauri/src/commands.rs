@@ -1,21 +1,27 @@
 use tauri::State;
 
 use crate::{
-    ai,
+    adoption, ai, chapter_memory, continuity_ledger,
     db::AppState,
     error::AppResult,
-    gate,
+    gate, index_jobs,
     models::{
-        AgentStepResult, AiSettings, AiSpanRevisionRequest, Approval, Artifact, ArtifactFilters,
-        Chapter, ChapterGateReport, ChapterGateRequest, ChapterSplitPlan, ChapterSplitPlanRequest,
-        ChapterUpdate, ClearChapterHistoryRequest, ContinuityReport, ContinuityReviewRequest,
-        DeleteArtifactRequest, Foreshadowing, HistoryCleanupResult, KnowledgeCard, ListModelsInput,
-        NewChapter, NewProject, Project, ProjectDetail, ProjectUpdate, QualityReport,
-        RevisionRequest, RunAgentRequest, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
-        SaveWritingSkill, SpanReplacementRequest, StoryContextSearchInput, StoryContextSnippet,
-        TestAiConnectionInput, WritingSkill,
+        AdoptionBatchResult, AdoptionProposal, AgentStepResult, AiSettings, AiSpanRevisionRequest,
+        Approval, Artifact, ArtifactFilters, Chapter, ChapterGateReport, ChapterGateRequest,
+        ChapterMemoryRecord, ChapterSplitPlan, ChapterSplitPlanRequest, ChapterUpdate,
+        ClearChapterHistoryRequest, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
+        ContextPreview, ContinuityReport, ContinuityReviewRequest, DecideAdoptionProposalsRequest,
+        DeleteArtifactRequest, Foreshadowing, HistoryCleanupResult, KnowledgeCard,
+        LedgerContinuityCheckRequest, LedgerContinuityReport, ListAdoptionProposalsRequest,
+        ListModelsInput, NewChapter, NewProject, PrepareArtifactAdoptionsRequest, Project,
+        ProjectDetail, ProjectUpdate, QualityReport, RebuildChapterMemoryRequest,
+        RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, RetryIndexJobsRequest,
+        RevisionRequest, RunAgentRequest, RunStoryArchitectRequest, SaveAiSettings,
+        SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest, StoryBible,
+        StoryBibleReview, StoryBibleReviewRequest, StoryContextSearchInput, StoryContextSnippet,
+        StoryIndexSummary, TestAiConnectionInput, UpdateAdoptionProposalRequest, WritingSkill,
     },
-    quality, workflow,
+    quality, story_architecture, story_index, story_search, workflow,
 };
 
 #[tauri::command]
@@ -58,8 +64,13 @@ pub fn delete_chapter(
 }
 
 #[tauri::command]
-pub fn update_chapter(state: State<'_, AppState>, input: ChapterUpdate) -> AppResult<Chapter> {
-    state.update_chapter(input)
+pub async fn update_chapter(
+    state: State<'_, AppState>,
+    input: ChapterUpdate,
+) -> AppResult<Chapter> {
+    let chapter = state.update_chapter(input)?;
+    story_search::refresh_chapter_metadata(&state, chapter.project_id, chapter.id)?;
+    Ok(chapter)
 }
 
 #[tauri::command]
@@ -89,19 +100,63 @@ pub fn save_writing_skill(
 }
 
 #[tauri::command]
-pub fn save_knowledge_card(
+pub async fn save_knowledge_card(
     state: State<'_, AppState>,
     input: SaveKnowledgeCard,
 ) -> AppResult<KnowledgeCard> {
-    state.save_knowledge_card(input)
+    let card = state.save_knowledge_card(input)?;
+    let _ = story_search::refresh_knowledge_card(&state, card.project_id, card.id).await;
+    Ok(card)
 }
 
 #[tauri::command]
-pub fn save_foreshadowing(
+pub async fn save_foreshadowing(
     state: State<'_, AppState>,
     input: SaveForeshadowing,
 ) -> AppResult<Foreshadowing> {
-    state.save_foreshadowing(input)
+    let item = state.save_foreshadowing(input)?;
+    let _ = story_search::refresh_foreshadowing(&state, item.project_id, item.id).await;
+    Ok(item)
+}
+
+#[tauri::command]
+pub async fn prepare_artifact_adoptions(
+    state: State<'_, AppState>,
+    input: PrepareArtifactAdoptionsRequest,
+) -> AppResult<Vec<AdoptionProposal>> {
+    adoption::prepare_artifact_adoptions(&state, input.project_id, input.artifact_id).await
+}
+
+#[tauri::command]
+pub fn list_adoption_proposals(
+    state: State<'_, AppState>,
+    input: ListAdoptionProposalsRequest,
+) -> AppResult<Vec<AdoptionProposal>> {
+    adoption::list_adoption_proposals(&state, input.project_id, input.artifact_id)
+}
+
+#[tauri::command]
+pub fn update_adoption_proposal(
+    state: State<'_, AppState>,
+    input: UpdateAdoptionProposalRequest,
+) -> AppResult<AdoptionProposal> {
+    adoption::update_adoption_proposal(&state, input)
+}
+
+#[tauri::command]
+pub fn apply_adoption_proposals(
+    state: State<'_, AppState>,
+    input: DecideAdoptionProposalsRequest,
+) -> AppResult<AdoptionBatchResult> {
+    adoption::apply_adoption_proposals(&state, input)
+}
+
+#[tauri::command]
+pub fn reject_adoption_proposals(
+    state: State<'_, AppState>,
+    input: DecideAdoptionProposalsRequest,
+) -> AppResult<AdoptionBatchResult> {
+    adoption::reject_adoption_proposals(&state, input)
 }
 
 #[tauri::command]
@@ -189,19 +244,133 @@ pub async fn run_agent_step(
 }
 
 #[tauri::command]
-pub fn approve_stage(
+pub async fn rebuild_chapter_memory(
+    state: State<'_, AppState>,
+    input: RebuildChapterMemoryRequest,
+) -> AppResult<ChapterMemoryRecord> {
+    let settings = state.get_ai_settings()?;
+    let api_key = state
+        .get_api_key_for_base_url(&settings.base_url)?
+        .ok_or_else(|| {
+            crate::error::AppError::Validation(
+                "请先在设置里为当前供应商保存 AI API Key".to_string(),
+            )
+        })?;
+    chapter_memory::rebuild_chapter_memory(
+        &state,
+        input.project_id,
+        input.chapter_id,
+        &settings,
+        &api_key,
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn run_story_architect(
+    state: State<'_, AppState>,
+    input: RunStoryArchitectRequest,
+) -> AppResult<AgentStepResult> {
+    story_architecture::run_story_architect(&state, input).await
+}
+
+#[tauri::command]
+pub async fn create_targeted_rework(
+    state: State<'_, AppState>,
+    input: RunStoryArchitectRequest,
+) -> AppResult<AgentStepResult> {
+    story_architecture::create_targeted_rework(&state, input).await
+}
+
+#[tauri::command]
+pub fn confirm_story_bible(
+    state: State<'_, AppState>,
+    input: ConfirmStoryBibleRequest,
+) -> AppResult<StoryBible> {
+    story_architecture::confirm_story_bible(&state, input)
+}
+
+#[tauri::command]
+pub async fn review_story_bible(
+    state: State<'_, AppState>,
+    input: StoryBibleReviewRequest,
+) -> AppResult<StoryBibleReview> {
+    story_architecture::review_story_bible(&state, input).await
+}
+
+#[tauri::command]
+pub fn confirm_story_bible_review(
+    state: State<'_, AppState>,
+    input: ConfirmStoryBibleReviewRequest,
+) -> AppResult<StoryBibleReview> {
+    story_architecture::confirm_story_bible_review(&state, input)
+}
+
+#[tauri::command]
+pub fn list_story_arcs(
+    state: State<'_, AppState>,
+    project_id: i64,
+) -> AppResult<Vec<crate::models::StoryArc>> {
+    state.list_story_arcs(project_id)
+}
+
+#[tauri::command]
+pub fn preview_agent_context(
+    state: State<'_, AppState>,
+    input: RunAgentRequest,
+) -> AppResult<ContextPreview> {
+    workflow::preview_agent_context(&state, input)
+}
+
+#[tauri::command]
+pub async fn approve_stage(
     state: State<'_, AppState>,
     project_id: i64,
     stage: String,
     artifact_id: i64,
     note: Option<String>,
 ) -> AppResult<Approval> {
-    state.approve_stage(
+    let approval = state.approve_stage(
         project_id,
         &stage,
         artifact_id,
         note.as_deref().unwrap_or(""),
-    )
+    )?;
+    state.wake_index_worker();
+    Ok(approval)
+}
+
+#[tauri::command]
+pub fn retry_index_jobs(
+    state: State<'_, AppState>,
+    input: RetryIndexJobsRequest,
+) -> AppResult<Vec<crate::models::DerivedIndexJob>> {
+    index_jobs::retry_index_jobs(&state, input)
+}
+
+#[tauri::command]
+pub async fn rebuild_story_index(
+    state: State<'_, AppState>,
+    input: RebuildStoryIndexRequest,
+) -> AppResult<Vec<StoryIndexSummary>> {
+    story_index::rebuild_story_index(&state, input).await
+}
+
+#[tauri::command]
+pub async fn rebuild_story_search_index(
+    state: State<'_, AppState>,
+    input: RebuildStorySearchIndexRequest,
+) -> AppResult<crate::models::StorySearchStatus> {
+    story_search::rebuild_story_search_index(&state, input).await
+}
+
+#[tauri::command]
+pub fn get_story_search_status(
+    state: State<'_, AppState>,
+    project_id: i64,
+) -> AppResult<crate::models::StorySearchStatus> {
+    story_search::get_story_search_status(&state, project_id)
 }
 
 #[tauri::command]
@@ -282,6 +451,14 @@ pub async fn review_project_continuity(
     input: ContinuityReviewRequest,
 ) -> AppResult<ContinuityReport> {
     workflow::review_project_continuity(&state, input).await
+}
+
+#[tauri::command]
+pub async fn check_artifact_ledger_continuity(
+    state: State<'_, AppState>,
+    input: LedgerContinuityCheckRequest,
+) -> AppResult<LedgerContinuityReport> {
+    continuity_ledger::check_artifact_continuity(&state, input).await
 }
 
 #[tauri::command]

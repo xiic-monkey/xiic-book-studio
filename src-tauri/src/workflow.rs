@@ -5,35 +5,47 @@ use std::{
 
 use serde_json::Value;
 
+mod history_search;
+mod markdown_export;
+mod text;
+use history_search::{build_history_query, extract_history_terms, retrieve_history_snippets};
+use text::{excerpt_around, is_han, is_noise_term, split_query_tokens};
+
+pub use history_search::search_story_context;
+pub use markdown_export::export_markdown;
+
 use crate::{
-    ai,
+    ai, chapter_memory, context_search, continuity_ledger,
     db::AppState,
     error::{AppError, AppResult},
     genre_skill,
     models::{
         AgentStepResult, AiSpanRevisionRequest, Artifact, ChapterSplitPlan,
-        ChapterSplitPlanRequest, ContinuityIssue, ContinuityReport, ContinuityReviewRequest,
-        Project, ReviewIssue, RevisionRequest, RunAgentRequest, SpanReplacementRequest, Stage,
-        StoryContextSearchInput, StoryContextSnippet,
+        ChapterSplitPlanRequest, ContextPreview, ContextPreviewSegment, ContinuityIssue,
+        ContinuityReport, ContinuityReviewRequest, Project, ReviewIssue, RevisionRequest,
+        RunAgentRequest, SpanReplacementRequest, Stage, StoryContextSearchInput,
+        StoryContextSnippet,
     },
-    quality,
+    quality, story_architecture,
 };
 
 #[derive(Debug, Clone)]
-struct ChapterBeatPlan {
+struct ChapterTaskContract {
     chapter_mode: String,
-    opening_pressure: String,
-    scene_one: String,
-    midpoint_reveal: String,
-    cost_turn: String,
-    ending_hook: String,
+    entry_state: String,
+    objective: String,
+    resistance: String,
+    context_focus: String,
+    required_change: String,
+    ending_function: String,
+    next_condition: String,
     payoff: Option<String>,
     hook_carryover: Option<String>,
     must_use_threads: Vec<String>,
     must_avoid_threads: Vec<String>,
 }
 
-const REVISION_FACT_BOUNDARY: &str = "这是最高优先级的修订约束。源稿、已批准设定/大纲/角色、已批准前章、试读报告和人工指令共同构成唯一事实来源。除非其中已经明确存在，否则不得新增过去发生过的事件、隐藏物件/证据、人物、地点、组织、规则、交易习惯、制度条款、关系或角色已知信息。不要为了制造章末钩子补写‘原来早有’的物件、记录、目击、计划或外部安排。需要增强钩子时，只能推进已出现的压力、时限、伤势、资源、关系、场景或主角已经开始的动作。若事实来源不足以支持某项建议，宁可保留原有选择或删去该建议，不得编造补丁。";
+const REVISION_FACT_BOUNDARY: &str = "这是最高优先级的修订约束。源稿、已批准设定/大纲/角色、已批准前章、试读报告和人工指令共同构成唯一事实来源。除非其中已经明确存在，否则不得新增过去发生过的事件、隐藏物件/证据、人物、地点、组织、规则、交易习惯、制度条款、关系或角色已知信息。不要为了制造更刺激的结尾补写‘原来早有’的物件、记录、目击、计划或外部安排。需要强化结尾时，只能落稳或推进已出现的结果、决定、压力、时限、伤势、资源、关系、场景或主角已经开始的动作。若事实来源不足以支持某项建议，宁可保留原有选择或删去该建议，不得编造补丁。";
 const REVIEW_FACT_BOUNDARY: &str = "审校建议也受事实边界约束：只能引用候选稿、已批准资料和已批准前章已经明确的事实。若候选稿凭空加入过去事件、隐藏物件/证据、人物、地点、组织、规则、交易习惯、制度条款、关系或角色已知信息，必须标为“事实越界”，severity 为 major，并指出它不在何处已有来源。建议只能删减、重排、强化或继续使用已有事实；不得建议编造石片、旧记录、目击、临时交易窗口、既有计划、额外物件或新规则来修问题。";
 
 fn review_evidence_corpus(
@@ -76,40 +88,118 @@ fn review_evidence_corpus(
 fn constrain_review_issues(issues: Vec<ReviewIssue>, evidence_corpus: &str) -> Vec<ReviewIssue> {
     issues
         .into_iter()
-        .map(|mut issue| {
-            if evidence_quote_is_verifiable(&issue.evidence_quote, evidence_corpus)
-                && evidence_quote_is_verifiable(&issue.action_evidence_quote, evidence_corpus)
-            {
-                return issue;
+        .filter_map(|mut issue| {
+            // A review issue without a source quote is not actionable. Keeping it
+            // around as a warning makes the UI look authoritative while giving the
+            // revision agent nothing reliable to work from.
+            if !evidence_quote_is_verifiable(&issue.evidence_quote, evidence_corpus) {
+                return None;
             }
 
-            issue.reason = format!(
-                "{}（该意见没有提供可在候选稿或已批准资料中定位的原文依据。）",
-                issue.reason
-            );
-            issue.suggestion =
-                "请人工补充一段可定位的来源原文后，再提出只使用既有事实的修订要求。".to_string();
-            issue.evidence_quote.clear();
-            issue.action_evidence_quote.clear();
-            issue
+            // An action quote is optional: a safe revision can delete or reorder
+            // existing prose without introducing a new factual action. When the
+            // model supplied an unusable one, omit it instead of discarding an
+            // otherwise grounded finding.
+            if !issue.action_evidence_quote.trim().is_empty()
+                && !evidence_quote_is_verifiable(&issue.action_evidence_quote, evidence_corpus)
+            {
+                issue.action_evidence_quote.clear();
+            }
+
+            // A grounded finding can still carry an invented repair, such as
+            // adding a guard or a new object that never appears in the source.
+            // Keep the finding visible, but quarantine that repair before it
+            // reaches the revision prompt.
+            if suggestion_contains_unbound_fact(&issue.suggestion, evidence_corpus) {
+                issue.suggestion =
+                    "原建议包含来源中未确认的新事实，已拦截。修订只能删减、重排或强化已有动作；请人工重新指定修法。"
+                        .to_string();
+                issue.action_evidence_quote.clear();
+            }
+            Some(issue)
         })
         .collect()
 }
 
+fn model_issue_duplicates_ledger_check(issue: &ReviewIssue) -> bool {
+    ["物件状态", "资源状态", "伤势状态", "禁制状态", "状态账本"]
+        .iter()
+        .any(|kind| issue.issue_type.contains(kind))
+}
+
+fn ledger_review_issues(
+    report: Option<&crate::models::LedgerContinuityReport>,
+) -> Vec<ReviewIssue> {
+    report
+        .into_iter()
+        .flat_map(|report| &report.issues)
+        .map(|issue| ReviewIssue {
+            issue_type: format!("状态账本冲突/{}", issue.state_kind),
+            severity: issue.severity.clone(),
+            location: issue.entity_label.clone(),
+            reason: format!(
+                "候选稿对“{}”的使用与{}的最后已确认状态冲突。{}",
+                issue.entity_label, issue.source_chapter, issue.reason
+            ),
+            suggestion: issue.suggestion.clone(),
+            evidence_quote: bounded_evidence_quote(&issue.candidate_quote),
+            action_evidence_quote: bounded_evidence_quote(&issue.source_quote),
+        })
+        .collect()
+}
+
+fn bounded_evidence_quote(quote: &str) -> String {
+    quote.trim().chars().take(80).collect()
+}
+
+fn suggestion_contains_unbound_fact(suggestion: &str, _evidence_corpus: &str) -> bool {
+    const ADDITIVE_WORDS: &[&str] = &["加入", "增加", "补充", "插入", "安排", "添加", "让", "出现"];
+    const SUBSTITUTION_EXAMPLES: &[&str] = &[
+        "可以是",
+        "可以改成",
+        "改为其他",
+        "换成",
+        "例如：",
+        "例如添加",
+        "比如加入",
+    ];
+
+    ADDITIVE_WORDS.iter().any(|word| suggestion.contains(word))
+        || SUBSTITUTION_EXAMPLES
+            .iter()
+            .any(|pattern| suggestion.contains(pattern))
+}
+
 fn evidence_quote_is_verifiable(quote: &str, evidence_corpus: &str) -> bool {
-    let normalized_quote = quote
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
+    let normalized_quote = normalize_evidence_text(quote);
     let quote_length = normalized_quote.chars().count();
     if !(8..=80).contains(&quote_length) {
         return false;
     }
-    let normalized_corpus = evidence_corpus
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
+    let normalized_corpus = normalize_evidence_text(evidence_corpus);
     normalized_corpus.contains(&normalized_quote)
+}
+
+fn normalize_evidence_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .map(|character| match character {
+            '“' | '”' | '‘' | '’' | '"' | '\'' => ' ',
+            '，' => ',',
+            '。' => '.',
+            '：' => ':',
+            '；' => ';',
+            '！' => '!',
+            '？' => '?',
+            '（' => '(',
+            '）' => ')',
+            '【' => '[',
+            '】' => ']',
+            '—' | '–' => '-',
+            other => other,
+        })
+        .filter(|character| *character != ' ')
+        .collect()
 }
 
 pub async fn run_agent_step(
@@ -162,14 +252,67 @@ pub async fn run_agent_step(
         }
     }
 
-    let agent = state.get_agent(input.stage.as_str())?;
+    let agent = state.get_agent_for_project_stage(input.project_id, input.stage.as_str())?;
     let settings = state.get_ai_settings()?;
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| {
             AppError::Validation("请先在设置里为当前供应商保存 AI API Key".to_string())
         })?;
-    let prompt = build_prompt(
+    if chapter_memory::is_enabled()
+        && matches!(input.stage, Stage::Draft | Stage::Review | Stage::Revision)
+    {
+        if let Some(chapter_id) = input.chapter_id {
+            let previous_plan = direct_predecessor_chapter_no(state, input.project_id, chapter_id)?
+                .map(|chapter_no| {
+                    approved_outline_section_for_chapter(state, input.project_id, chapter_no)
+                })
+                .transpose()?
+                .flatten();
+            if let Err(error) = chapter_memory::ensure_predecessor_memory(
+                state,
+                input.project_id,
+                chapter_id,
+                &settings,
+                &api_key,
+                previous_plan.as_deref(),
+            )
+            .await
+            {
+                eprintln!("chapter memory unavailable; falling back to existing context: {error}");
+            }
+        }
+    }
+    if matches!(input.stage, Stage::Draft | Stage::Review | Stage::Revision) {
+        if let Err(error) = continuity_ledger::ensure_ledger_current(state, input.project_id).await
+        {
+            eprintln!("continuity ledger unavailable for context search: {error}");
+        }
+    }
+    let ledger_report = if matches!(input.stage, Stage::Review) {
+        if let Some(artifact) = source_artifact.as_ref() {
+            match continuity_ledger::check_artifact_continuity(
+                state,
+                crate::models::LedgerContinuityCheckRequest {
+                    project_id: input.project_id,
+                    artifact_id: artifact.id,
+                },
+            )
+            .await
+            {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    eprintln!("continuity ledger unavailable; continuing trial read: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let tool_source = agent_search_source(
         state,
         input.project_id,
         &input.stage,
@@ -177,6 +320,47 @@ pub async fn run_agent_step(
         input.user_instruction.as_deref(),
         source_artifact.as_ref(),
     )?;
+    let tool_context = if let Some(chapter_id) = input.chapter_id {
+        match context_search::prepare_tool_context(
+            state,
+            input.project_id,
+            chapter_id,
+            &input.stage,
+            &tool_source,
+            &settings,
+            &api_key,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!(
+                    "App context search unavailable; continuing with static context: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut prompt = build_prompt(
+        state,
+        input.project_id,
+        &input.stage,
+        input.chapter_id,
+        input.user_instruction.as_deref(),
+        source_artifact.as_ref(),
+        tool_context.as_deref(),
+    )?;
+    if let Some(report) = ledger_report.as_ref() {
+        let guidance = continuity_ledger::render_report_for_prompt(report);
+        if !guidance.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&guidance);
+        } else {
+            prompt.push_str("\n\n# App 状态账本核对结论\n程序化核对没有发现候选稿与已结构化物件、资源、禁制或伤势末态之间的直接冲突。不要把同一数量或同一状态的不同措辞误报为硬断点；试读应继续检查尚未结构化的人物知情边界、动机、入场路径和旧事件结果。");
+        }
+    }
     let review_evidence = if matches!(input.stage, Stage::Review) {
         review_evidence_corpus(
             state,
@@ -232,13 +416,13 @@ pub async fn run_agent_step(
     {
         Ok(output) => {
             let normalized_output = if matches!(input.stage, Stage::Review) {
-                let issues =
-                    constrain_review_issues(ai::parse_review_issues(&output), &review_evidence);
-                if issues.is_empty() {
-                    output.clone()
-                } else {
-                    serde_json::to_string_pretty(&issues)?
-                }
+                let mut issues = ai::parse_review_issues(&output);
+                // Item/resource/injury state is checked by the App ledger against
+                // both exact source quotes. Do not let a prose model overrule that
+                // deterministic result with an unsupported "hard" conflict.
+                issues.retain(|issue| !model_issue_duplicates_ledger_check(issue));
+                issues.extend(ledger_review_issues(ledger_report.as_ref()));
+                serde_json::to_string_pretty(&constrain_review_issues(issues, &review_evidence))?
             } else if matches!(input.stage, Stage::Draft | Stage::Revision) {
                 normalize_story_body_output(&output)
             } else {
@@ -293,6 +477,116 @@ pub async fn run_agent_step(
     }
 }
 
+pub fn preview_agent_context(
+    state: &AppState,
+    input: RunAgentRequest,
+) -> AppResult<ContextPreview> {
+    state.get_project(input.project_id)?;
+    let chapter = state.ensure_chapter(input.project_id, input.chapter_id)?;
+    validate_stage_scope(&input.stage, chapter.is_some())?;
+    let source_artifact = input
+        .source_artifact_id
+        .map(|artifact_id| state.get_artifact(artifact_id))
+        .transpose()?;
+
+    if let Some(source) = source_artifact.as_ref() {
+        if source.project_id != input.project_id {
+            return Err(AppError::Validation("候选稿不属于当前项目".to_string()));
+        }
+        let valid_source = match input.stage {
+            Stage::Setting | Stage::Outline | Stage::Characters => {
+                source.chapter_id.is_none() && source.stage == input.stage.as_str()
+            }
+            Stage::Review => {
+                source.chapter_id == input.chapter_id
+                    && (source.stage == "draft" || source.stage == "revision")
+            }
+            _ => false,
+        };
+        if !valid_source {
+            return Err(AppError::Validation(
+                "当前阶段不支持把这个产物作为上下文来源".to_string(),
+            ));
+        }
+    }
+
+    validate_prerequisites(
+        state,
+        input.project_id,
+        &input.stage,
+        input.chapter_id,
+        source_artifact.as_ref(),
+    )?;
+
+    let prompt = build_prompt(
+        state,
+        input.project_id,
+        &input.stage,
+        input.chapter_id,
+        input.user_instruction.as_deref(),
+        source_artifact.as_ref(),
+        None,
+    )?;
+    let agent = state.get_agent_for_project_stage(input.project_id, input.stage.as_str())?;
+    let genre_agent = state.get_genre_agent_for_project(input.project_id)?;
+    let segments = split_context_prompt(&prompt);
+    let total_chars = prompt.chars().count();
+
+    Ok(ContextPreview {
+        stage: input.stage.as_str().to_string(),
+        genre_agent,
+        system_prompt: agent.system_prompt,
+        segments,
+        total_chars,
+        estimated_tokens: total_chars.div_ceil(4),
+    })
+}
+
+fn split_context_prompt(prompt: &str) -> Vec<ContextPreviewSegment> {
+    const MAX_PREVIEW_CHARS: usize = 2400;
+    let mut segments: Vec<(String, String)> = Vec::new();
+
+    for line in prompt.lines() {
+        let is_heading = line.starts_with("# ");
+        if is_heading {
+            segments.push((
+                line.trim_start_matches("# ").trim().to_string(),
+                String::new(),
+            ));
+        } else if let Some((_, content)) = segments.last_mut() {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(line);
+        }
+    }
+
+    if segments.is_empty() {
+        segments.push(("生成上下文".to_string(), prompt.to_string()));
+    }
+
+    segments
+        .into_iter()
+        .filter(|(_, content)| !content.trim().is_empty())
+        .map(|(label, content)| {
+            let chars = content.chars().count();
+            let truncated = chars > MAX_PREVIEW_CHARS;
+            let preview = if truncated {
+                content.chars().take(MAX_PREVIEW_CHARS).collect::<String>()
+                    + "\n…（预览已截断，实际内容仍按完整上下文发送）"
+            } else {
+                content
+            };
+            ContextPreviewSegment {
+                label,
+                content: preview,
+                chars,
+                truncated,
+            }
+        })
+        .collect()
+}
+
 pub async fn request_revision(
     state: &AppState,
     input: RevisionRequest,
@@ -323,7 +617,7 @@ pub async fn request_revision(
         input.feedback.trim(),
     )?;
 
-    let agent = state.get_agent("revision")?;
+    let agent = state.get_agent_for_project_stage(input.project_id, "revision")?;
     let settings = state.get_ai_settings()?;
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
@@ -333,6 +627,31 @@ pub async fn request_revision(
     let revision_source =
         resolve_revision_source(state, input.project_id, source.chapter_id, Some(&source))?
             .ok_or_else(|| AppError::Validation("没有可修订的章节稿件".to_string()))?;
+    if let Err(error) = continuity_ledger::ensure_ledger_current(state, input.project_id).await {
+        eprintln!("continuity ledger unavailable for revision search: {error}");
+    }
+    let tool_source = revision_search_source(&revision_source, &source, input.feedback.as_str());
+    let tool_context = if let Some(chapter_id) = source.chapter_id {
+        match context_search::prepare_tool_context(
+            state,
+            input.project_id,
+            chapter_id,
+            &Stage::Revision,
+            &tool_source,
+            &settings,
+            &api_key,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("App context search unavailable; continuing revision: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut prompt = build_prompt(
         state,
         input.project_id,
@@ -340,7 +659,26 @@ pub async fn request_revision(
         source.chapter_id,
         Some(input.feedback.as_str()),
         Some(&source),
+        tool_context.as_deref(),
     )?;
+    match continuity_ledger::check_artifact_continuity(
+        state,
+        crate::models::LedgerContinuityCheckRequest {
+            project_id: input.project_id,
+            artifact_id: revision_source.id,
+        },
+    )
+    .await
+    {
+        Ok(report) => {
+            let guidance = continuity_ledger::render_report_for_prompt(&report);
+            if !guidance.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&guidance);
+            }
+        }
+        Err(error) => eprintln!("continuity ledger unavailable; continuing revision: {error}"),
+    }
     if let Some(chapter_id) = revision_source.chapter_id {
         if let Some(chapter) = state.ensure_chapter(input.project_id, Some(chapter_id))? {
             if chapter.chapter_no > 1 {
@@ -364,7 +702,7 @@ pub async fn request_revision(
                     .await
                     {
                         prompt.push_str(&format!(
-                            "\n\n# 当前候选稿连续性预检\n结论：{}。\n摘要：{}\n这些问题是拿当前候选稿直接对照最近两章得到的，不是泛化建议。若其中有 major 或 moderate，必须优先修这些，再修句子和钩子：",
+                            "\n\n# 当前候选稿连续性预检\n结论：{}。\n摘要：{}\n这些问题是拿当前候选稿直接对照最近两章得到的，不是泛化建议。若其中有 major 或 moderate，必须优先修这些，再修句子和结尾落点：",
                             report.verdict, report.summary
                         ));
                         for issue in report.issues.iter().take(5) {
@@ -632,11 +970,52 @@ pub async fn revise_artifact_span_with_ai(
             AppError::Validation("请先在设置里为当前供应商保存 AI API Key".to_string())
         })?;
 
+    let tool_context = if matches!(source.stage.as_str(), "draft" | "revision") {
+        if let Some(chapter_id) = source.chapter_id {
+            if let Err(error) =
+                continuity_ledger::ensure_ledger_current(state, input.project_id).await
+            {
+                eprintln!("continuity ledger unavailable for local revision search: {error}");
+            }
+            let search_source = format!(
+                "# 被修订正文\n{}\n\n# 指定片段\n{}\n\n# 人工要求\n{}",
+                source.content,
+                input.find_text,
+                input.instruction.trim()
+            );
+            match context_search::prepare_tool_context(
+                state,
+                input.project_id,
+                chapter_id,
+                &Stage::Revision,
+                &search_source,
+                &settings,
+                &api_key,
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    eprintln!("App context search unavailable for local revision: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let system_prompt = "你是长篇小说编辑助手。你只负责重写用户指定的那一小段文字，保持全文其余部分不变。禁止输出解释、分析、标题、引号外说明，只输出替换后的新片段正文。";
     let user_prompt = format!(
-        "# 当前产物阶段\n{}\n\n# 全文上下文（仅供你保持风格、信息和连续性，不要改未指定部分）\n{}\n\n# 需要局部改写的原文片段\n{}\n\n# 局部修订要求\n{}\n\n# 输出要求\n1. 只输出“替换后的新片段”本身，不要输出别的。\n2. 只改这段，未被要求修改的信息、事实、称呼、物件状态、上下文关系要尽量保持连续。\n3. 若要求与上下文冲突，优先做最小必要修改，不扩展新设定。\n4. 新片段必须能直接替换原文片段。",
+        "# 当前产物阶段\n{}\n\n# 全文上下文（仅供你保持风格、信息和连续性，不要改未指定部分）\n{}{}\n\n# 需要局部改写的原文片段\n{}\n\n# 局部修订要求\n{}\n\n# 输出要求\n1. 只输出“替换后的新片段”本身，不要输出别的。\n2. 只改这段，未被要求修改的信息、事实、称呼、物件状态、上下文关系要尽量保持连续。\n3. 若要求与上下文冲突，优先做最小必要修改，不扩展新设定。\n4. 新片段必须能直接替换原文片段。",
         stage_label(&source.stage),
         source.content,
+        tool_context
+            .as_deref()
+            .map(|context| format!("\n\n{context}"))
+            .unwrap_or_default(),
         input.find_text,
         input.instruction.trim()
     );
@@ -704,143 +1083,6 @@ pub async fn revise_artifact_span_with_ai(
         ),
     )?;
     Ok(AgentStepResult { artifact, run })
-}
-
-pub fn export_markdown(state: &AppState, project_id: i64) -> AppResult<String> {
-    let detail = state.get_detail(project_id)?;
-    let mut output = format!(
-        "# {}\n\n- 类型：{}\n- 预计总字数（仅供整体节奏规划）：{}\n- 状态：{}\n- 章节数：{}\n\n{}\n\n",
-        detail.project.title,
-        detail.project.genre,
-        detail.project.target_words,
-        detail.project.status,
-        detail.chapters.len(),
-        detail.project.premise
-    );
-
-    output.push_str("## 已批准资料\n\n");
-    for stage in ["setting", "outline", "characters"] {
-        if let Some(artifact) = state.approved_artifact(project_id, stage, None)? {
-            output.push_str(&format!(
-                "### {}（v{}）\n\n{}\n\n",
-                stage_label(stage),
-                artifact.version,
-                artifact.content
-            ));
-        }
-    }
-
-    output.push_str("## 正文\n\n");
-    for chapter in &detail.chapters {
-        output.push_str(&format!(
-            "### {}（第 {} 章）\n\n",
-            chapter.title, chapter.chapter_no
-        ));
-        let chapter_body = chapter
-            .current_artifact_id
-            .and_then(|id| state.get_artifact(id).ok())
-            .or_else(|| {
-                state
-                    .approved_artifact(project_id, "revision", Some(chapter.id))
-                    .ok()
-                    .flatten()
-            })
-            .or_else(|| {
-                state
-                    .approved_artifact(project_id, "draft", Some(chapter.id))
-                    .ok()
-                    .flatten()
-            });
-        if let Some(artifact) = chapter_body {
-            output.push_str(&artifact.content);
-            output.push_str("\n\n");
-        } else {
-            output.push_str("_未通过人工确认_\n\n");
-        }
-    }
-
-    output.push_str("## 章节工作记录\n\n");
-    for chapter in &detail.chapters {
-        output.push_str(&format!("### {}\n\n", chapter.title));
-
-        let chapter_approvals: Vec<_> = detail
-            .approvals
-            .iter()
-            .filter(|approval| approval.chapter_id == Some(chapter.id))
-            .collect();
-        if !chapter_approvals.is_empty() {
-            output.push_str("#### 人工确认\n\n");
-            for approval in chapter_approvals {
-                output.push_str(&format!(
-                    "- {}：{}（artifact #{})\n",
-                    approval.created_at,
-                    if approval.note.trim().is_empty() {
-                        format!("{} 已通过", stage_label(&approval.stage))
-                    } else {
-                        format!(
-                            "{} 已通过，备注：{}",
-                            stage_label(&approval.stage),
-                            approval.note.trim()
-                        )
-                    },
-                    approval.artifact_id
-                ));
-            }
-            output.push('\n');
-        }
-
-        let chapter_artifacts: Vec<_> = detail
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.chapter_id == Some(chapter.id))
-            .filter(|artifact| {
-                artifact.stage == "draft"
-                    || artifact.stage == "review"
-                    || artifact.stage == "revision"
-            })
-            .collect();
-
-        if chapter_artifacts.is_empty() {
-            output.push_str("_暂无章节工作记录_\n\n");
-            continue;
-        }
-
-        for artifact in chapter_artifacts {
-            output.push_str(&format!(
-                "#### {} v{}\n\n- 创建时间：{}\n- 状态：{}\n",
-                stage_label(&artifact.stage),
-                artifact.version,
-                artifact.created_at,
-                artifact.status
-            ));
-            if let Some(parent_id) = artifact.parent_artifact_id {
-                output.push_str(&format!("- 基于版本：artifact #{}\n", parent_id));
-            }
-            output.push('\n');
-            output.push_str(&artifact.content);
-            output.push_str("\n\n");
-        }
-    }
-
-    let project_messages: Vec<_> = detail
-        .messages
-        .iter()
-        .filter(|message| message.chapter_id.is_none())
-        .collect();
-    if !project_messages.is_empty() {
-        output.push_str("## 全书协作记录\n\n");
-        for message in project_messages {
-            output.push_str(&format!(
-                "- {} [{}] {}\n",
-                message.created_at,
-                export_role_label(&message.role),
-                message.content
-            ));
-        }
-        output.push('\n');
-    }
-
-    Ok(output)
 }
 
 pub async fn review_project_continuity(
@@ -945,6 +1187,23 @@ pub async fn review_project_continuity(
 
     let mut context = project_context(&detail.project);
     append_approved_context(state, input.project_id, &mut context)?;
+    if let Some(candidate) = candidate_by_chapter.values().next() {
+        if let Ok(ledger_report) = continuity_ledger::check_artifact_continuity(
+            state,
+            crate::models::LedgerContinuityCheckRequest {
+                project_id: input.project_id,
+                artifact_id: candidate.id,
+            },
+        )
+        .await
+        {
+            let guidance = continuity_ledger::render_report_for_prompt(&ledger_report);
+            if !guidance.is_empty() {
+                context.push_str("\n\n");
+                context.push_str(&guidance);
+            }
+        }
+    }
     let prompt = format!(
         "{context}\n\n# 审校任务\n你是连载小说总编，请检查以下连续章节是否具备可追读的一致性和衔接性。重点检查：\n1. 角色口吻、动机、能力、已知信息是否前后一致\n2. 上一章钩子是否在下一章被有效承接\n3. 物件、地点、时间、规则是否自洽\n4. 节奏是否出现断层，是否像不同人拼接出来的\n5. 多章是否持续兑现题材卖点，而不是每章重置气氛\n6. 若相邻两章明显属于同一场景、同一时段或同一冲突的直接续接，检查对白语气、情绪张力、追逐/伤势/门禁/站位等即时状态是否自然延续\n\n# 候选稿事实边界（审批前硬审计）\n若某章标注为“候选稿，尚未人工通过”，先把已批准设定、角色、大纲和此前已通过正文视为唯一事实来源，再审候选稿。不能因为候选稿写得顺、情绪够强或有更好看的场面，就把候选稿新增的内容默认视为有效。\n- 必须逐项核对候选稿是否偷换既有规则的触发条件、作用对象、效果、代价、结算时点或可重复性。\n- 必须核对人物知道什么、为何到场、已经发生过什么；不得把未建立的交易、调查、目击、计划、旧账、组织、地点、物件或关系补写成“原来早有”。\n- 必须核对物件、资源、伤势、禁制、门、令牌、药物和交易余额的状态；已耗尽、受损、未获得、未支付或未确认的内容不能在候选稿中直接可用或变成既成事实。\n- 候选稿可以出现新的现场细节和自然衍生动作，但凡新增内容会改变主角能力、资源、风险、人物动机、世界规则或下一步选择，必须能在已批准资料或前章正文中找到明确来源。找不到来源就是“事实越界”，severity 必须为 major。\n- 事实越界的 suggestion 只能要求删除、降为未确认痕迹、改回已有事实，或补回已有动作与过渡；不得建议再发明一条新规则去解释它。\n- 这条事实审计优先级高于文笔、节奏和爽点建议。\n\n# 同场景衔接规则\n- 这是一条软检查，不是强制要求每次跨章都连续同场景。\n- 若作者显然已经切场景、切视角、切主线，或存在合理时间跳跃，不要硬判问题。\n- 只有当两章看起来是直接接续同一场面时，才检查对白、氛围和即时状态是否接得上。\n- 若只是承接略生硬、气氛突然变调、人物刚才还在对峙下一章却像重开一幕，severity 优先给 minor 或 moderate。\n- 只有出现明确硬伤，例如伤势、位置、门是否打开、谁听见了什么、谁正在追谁等即时事实自相矛盾时，才可以给 major。\n- 遇到这类问题时，issue_type 优先写“同场景衔接”或“即时状态延续”。\n\n请只输出 JSON 数组。每项字段：issue_type, severity, chapters, reason, suggestion。severity 只能是 minor、moderate、major。若问题很少，也至少给出 1-3 条最关键意见。\n\n# 连续章节\n{}\n",
         chapter_blocks.join("\n")
@@ -1124,6 +1383,7 @@ fn validate_prerequisites(
             require_approved(state, project_id, "setting", None)?;
             require_approved(state, project_id, "outline", None)?;
             require_approved(state, project_id, "characters", None)?;
+            story_architecture::ensure_ready_for_draft(state, project_id)?;
         }
         Stage::Review => {
             let chapter_id = chapter_id.ok_or_else(|| {
@@ -1166,7 +1426,7 @@ fn require_approved(
     Ok(())
 }
 
-fn build_prompt(
+fn agent_search_source(
     state: &AppState,
     project_id: i64,
     stage: &Stage,
@@ -1174,11 +1434,76 @@ fn build_prompt(
     user_instruction: Option<&str>,
     source_artifact: Option<&Artifact>,
 ) -> AppResult<String> {
+    let mut parts = Vec::new();
+    match stage {
+        Stage::Draft => {
+            if let Some(chapter_id) = chapter_id {
+                if let Some(chapter) = state.ensure_chapter(project_id, Some(chapter_id))? {
+                    if let Some(section) =
+                        approved_outline_section_for_chapter(state, project_id, chapter.chapter_no)?
+                    {
+                        parts.push(format!("# 本章章纲\n{section}"));
+                    }
+                }
+            }
+        }
+        Stage::Review => {
+            if let Some(source) = source_artifact {
+                parts.push(format!("# 待试读正文\n{}", source.content));
+            } else if let Some(chapter_id) = chapter_id {
+                if let Some(source) = state.latest_approved_chapter_body(project_id, chapter_id)? {
+                    parts.push(format!("# 待试读正文\n{}", source.content));
+                }
+            }
+        }
+        Stage::Revision => {
+            if let Some(source) =
+                resolve_revision_source(state, project_id, chapter_id, source_artifact)?
+            {
+                parts.push(format!("# 被修订正文\n{}", source.content));
+            }
+            if let Some(report) = source_artifact.filter(|artifact| artifact.stage == "review") {
+                parts.push(format!("# 试读报告\n{}", report.content));
+            }
+        }
+        _ => {}
+    }
+    if let Some(instruction) = user_instruction.filter(|text| !text.trim().is_empty()) {
+        parts.push(format!("# 人工指令\n{}", instruction.trim()));
+    }
+    Ok(parts.join("\n\n"))
+}
+
+fn revision_search_source(
+    revision_source: &Artifact,
+    requested_source: &Artifact,
+    feedback: &str,
+) -> String {
+    let mut parts = vec![format!("# 被修订正文\n{}", revision_source.content)];
+    if requested_source.stage == "review" {
+        parts.push(format!("# 试读报告\n{}", requested_source.content));
+    }
+    parts.push(format!("# 人工反馈\n{}", feedback.trim()));
+    parts.join("\n\n")
+}
+
+fn build_prompt(
+    state: &AppState,
+    project_id: i64,
+    stage: &Stage,
+    chapter_id: Option<i64>,
+    user_instruction: Option<&str>,
+    source_artifact: Option<&Artifact>,
+    tool_context: Option<&str>,
+) -> AppResult<String> {
     let project = state.get_project(project_id)?;
     let mut prompt = project_context(&project);
     append_approved_context(state, project_id, &mut prompt)?;
     prompt.push_str(&render_project_genre_skill(state, &project, stage)?);
     prompt.push_str(&render_supporting_skills(state, &project, stage)?);
+    if matches!(stage, Stage::Outline) {
+        append_written_progress_context(state, project_id, &mut prompt)?;
+    }
 
     if let Some(chapter_id) = chapter_id {
         if let Some(chapter) = state.ensure_chapter(project_id, Some(chapter_id))? {
@@ -1213,7 +1538,7 @@ fn build_prompt(
                     &mut prompt,
                 )?;
                 append_foreshadowing_context(state, project_id, chapter.chapter_no, &mut prompt)?;
-                append_chapter_beat_plan(
+                append_chapter_task_contract(
                     state,
                     project_id,
                     chapter.id,
@@ -1223,6 +1548,11 @@ fn build_prompt(
                 )?;
             }
         }
+    }
+
+    if let Some(tool_context) = tool_context.filter(|context| !context.trim().is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(tool_context);
     }
 
     if let Some(source) = source_artifact {
@@ -1236,9 +1566,9 @@ fn build_prompt(
 
     match stage {
         Stage::Setting => prompt.push_str("\n\n# 任务\n生成或重写本书的核心设定。必须包含：一句话卖点、核心规则、主要禁忌、风格标尺、可持续冲突来源。按设定复杂度写足，不用为了压缩字数省掉必要边界；也不要写百科式世界史。"),
-        Stage::Outline => prompt.push_str("\n\n# 任务\n基于已批准设定生成可执行大纲。先写整书主线，再写前 12 章列表；每章只写章节目标、核心冲突、信息释放、结尾钩子。按生产需要完整展开，不设固定字数；但不要把章节正文、重复规则或远期谜底提前写进大纲。已批准设定是能力合同：核心器物、血脉、功法和身份只能使用设定中已明确的功能；任何新效果只能作为未验证痕迹、外部一次性条件或远期问题，不能在前 12 章直接成为稳定解法。"),
+        Stage::Outline => prompt.push_str(&outline_task_for_prompt(state, project_id)?),
         Stage::Characters => prompt.push_str("\n\n# 任务\n基于已批准设定和大纲生成角色卡；每个主要角色必须包含：欲望、恐惧、底线、说话方式、首次登场功能、与主角的冲突/互补。按角色复杂度写足，减少履历堆砌。"),
-        Stage::Draft => prompt.push_str("\n\n# 任务\n为当前章节写完整正文。只输出正文，不要写标题、分析或说明。优先场景、动作、对白和细节推进；少解释设定，少抽象总结，避免连续使用“像……一样”的模板化比喻。开篇前段必须让读者知道本章正在做什么、为什么现在要做，章末必须有新的问题、收获、风险或下一步。严禁把当前章节写成资料汇总、线索清单或设定说明会。若你发现前文有很多待回收线索，本章最多处理其中 1-2 条，其余保留到后续章节。章节可按场景、对白、情绪承接和冲突解决的实际需要写长；只有在重复解释、重复确认或多个独立章节功能互相争抢篇幅时，才应删减或拆章。\n\n把这一章理解成一次单点推进，不是一次世界观清仓：只允许主角完成 1 个明确章节功能，例如修炼小成、炼药试错、开门、核验、跟踪、谈判、藏证据、确认身份、布局下一场。除这个章节功能外，本章最多新增 1 个新名词、1 个新地点、1 个新人物功能。若故事自然冒出更多谜底或设定，只保留最能改变主角下一步选择的一条，其余只写成物证、异常、疑点或未确认线索。不要用“第一/第二/第三”总结真相，不要连续写“不是……而是……”解释机制。\n\n若本章动用了旧能力、旧物件、旧血脉、旧令牌或旧资源做比前文更强的新动作，必须同时满足两件事：1）明确这仍然基于前文已出现的功能，或来自同源外物/一次性触发，不是主角无铺垫永久升级；2）当章立刻兑现更重代价、暴露或失控风险。若做不到，就降回感知、开门、试探、逼退、换取片段信息等较窄用途。"),
+        Stage::Draft => prompt.push_str("\n\n# 任务\n为当前章节写完整正文。只输出正文，不要写标题、分析或说明。优先场景、动作、对白和细节推进；少解释设定，少抽象总结，避免连续使用“像……一样”的模板化比喻。开篇应让读者逐渐或立即看清本章正在处理什么，以及人物为何选择现在行动；章末完成本章功能并形成自然延续，可以落在结果、决定、信息改写、行动启动、关系新平衡或情绪余韵，不强制危险和反转。严禁把当前章节写成资料汇总、线索清单或设定说明会。若你发现前文有很多待回收线索，本章最多处理其中 1-2 条，其余保留到后续章节。章节可按场景、对白、情绪承接和冲突解决的实际需要写长；只有在重复解释、重复确认或多个独立章节功能互相争抢篇幅时，才应删减或拆章。\n\n把这一章理解成一次主要推进，不是一次世界观清仓：优先完成 1 个明确章节功能，例如修炼小成、炼药试错、开门、核验、跟踪、谈判、藏证据、确认身份或布局下一场。新名词、新地点和新人物功能只在完成本章任务确有必要时引入，不按固定数量机械限制。若故事自然冒出更多谜底或设定，只保留最能改变主角下一步选择的一条，其余只写成物证、异常、疑点或未确认线索。不要用“第一/第二/第三”总结真相，不要连续写“不是……而是……”解释机制。\n\n若本章动用了旧能力、旧物件、旧血脉、旧令牌或旧资源做比前文更强的新动作，必须同时满足两件事：1）明确这仍然基于前文已出现的功能，或来自同源外物/一次性触发，不是主角无铺垫永久升级；2）当章立刻兑现更重代价、暴露或失控风险。若做不到，就降回感知、开门、试探、逼退、换取片段信息等较窄用途。"),
         Stage::Review => {
             let chapter_id = chapter_id.ok_or_else(|| {
                 AppError::Validation("写作、试读、修订阶段必须选择章节".to_string())
@@ -1254,7 +1584,7 @@ fn build_prompt(
             })?;
             let quality_report = quality::analyze_artifact(&draft);
             prompt.push_str(&format!(
-                "\n\n# 待试读章节\n{}\n\n# 本地质量信号\n{}\n\n# 审校事实边界\n{}\n\n# 输出格式\n请只输出 JSON 数组，列出 3-8 个最影响追读的问题。每项包含 issue_type、severity、location、reason、suggestion、evidence_quote、action_evidence_quote 七个字段，不要额外解释。evidence_quote 必须是候选稿、已批准资料或已通过前章中连续出现的 8-80 个字原文，用来证明问题。action_evidence_quote 也必须是其中连续出现的 8-80 个字原文，用来证明建议只是在删减、重排、强化或继续使用已有动作；如果建议需要新增事实、物件、人物、地点、规则、安排或过去事件，就不要给出该建议，并将 action_evidence_quote 留空。severity 只能是 minor、moderate、major。优先覆盖本地质量信号暴露出的真实阅读风险，但不要机械复述指标名。",
+                "\n\n# 待试读章节\n{}\n\n# 本地质量信号\n{}\n\n# 章节任务兑现审校\n本章柔性任务契约和章节任务卡是本次审校的语义合同。请先判断候选稿是否实质执行了其中的“本章目标、主要阻力、必须发生的变化、离开状态”：关键行动、选择或结果缺席，被其他事件替代，或只被一句话提及而没有改变局面时，标出 issue_type 为“章节任务未兑现”。只有主要章节功能整体缺席时才给 major；结尾形式与建议不同但已经完成等效状态变化，不算问题。允许同义表达、等效行动、合理场景改写和不同结尾类型；绝不要求照抄章节标题、人物名、资源名或任务卡的字面词汇。\n\n# 审校事实边界\n{}\n建议只能删减、重排、强化候选稿已有动作，或继续使用已批准资料中明确存在的事实。不要建议增加新人物、新物件、新地点、新规则、临时安排或过去事件；如果某个问题只能靠新增事实解决，直接标为事实越界，保留问题但不要给出该新增修法。\n\n# 输出格式\n请只输出 JSON 数组，列出 3-8 个最影响追读的问题。每项包含 issue_type、severity、location、reason、suggestion、evidence_quote、action_evidence_quote 七个字段，不要额外解释。evidence_quote 必须是候选稿、已批准资料或已通过前章中连续出现的 8-80 个字原文，用来证明问题。action_evidence_quote 是可选字段：建议需要强化或继续使用既有动作时，提供其中连续出现的 8-80 个字原文；建议只是删减、合并或重排已有文字时可以留空。若建议需要新增事实、物件、人物、地点、规则、安排或过去事件，就不要给出该建议。severity 只能是 minor、moderate、major。优先覆盖本地质量信号暴露出的真实阅读风险，但不要机械复述指标名。",
                 draft.content,
                 quality_report_for_prompt(&quality_report),
                 REVIEW_FACT_BOUNDARY
@@ -1275,14 +1605,14 @@ fn build_prompt(
                 .map(|artifact| artifact.content.as_str())
                 .unwrap_or("尚无已批准试读报告；请严格依据人工反馈、本地质量信号和连续性修复卡修订。");
             prompt.push_str(&format!(
-                "\n\n# 原稿\n{}\n\n# 已批准试读报告\n{}\n\n# 本地质量信号\n{}\n\n# 修订约束卡\n{}\n\n# 任务\n输出修订后的完整章节正文，不要解释修改。必须优先解决 major/moderate 问题；保留有效氛围和题材细节；删掉解释感、模板化比喻和重复句式；让章末悬念更具体。若本地质量信号显示开篇驱动力、章末钩子、段落重量、解释感或信息反转偏密存在问题，必须在正文里实质修正。若本地质量信号显示叙事失焦，保留必要场景、对白和情绪承接，只删重复解释、重复确认或无后果过渡。\n\n修订时如果发现原稿塞入了过多新名词、新规则、新人物职责、多层真相或多层反转，你必须主动减法：只保留最能改变主角选择的一条核心信息，其余改成疑点、物证、未确认线索或后续章再验证。不要用“第一/第二/第三”总结真相，不要连续写“不是……而是……”解释机制；把说明改成场景阻碍、对白试探、物件状态变化或具体代价。若试读指出对白不足，本章至少加入一段会改变局面的对白对撞。结尾必须出现外部事件、具体时限、具体人物动作或明确威胁，不能只写主角准备、决定或走向某处。若旧能力、旧物件、旧血脉或旧资源在本章被写出了明显超出前文的新用途，优先降效果、补外部来源或改成一次性触发，并把代价写得比收益更具体，不能把一次性爆发写成无铺垫永久升级。",
+                "\n\n# 原稿\n{}\n\n# 已批准试读报告\n{}\n\n# 本地质量信号\n{}\n\n# 修订约束卡\n{}\n\n# 任务\n输出修订后的完整章节正文，不要解释修改。必须优先解决 major/moderate 问题；保留有效氛围和题材细节；删掉解释感、模板化比喻和重复句式。若本地质量信号显示开篇驱动力、结尾功能、段落重量、解释感或信息反转偏密存在问题，必须在正文里实质修正；但不能为了指标把成长、关系、恢复或过渡章强改成冲突章。若本地质量信号显示叙事失焦，保留必要场景、对白和情绪承接，只删重复解释、重复确认或无后果过渡。\n\n修订时如果发现原稿塞入了过多新名词、新规则、新人物职责、多层真相或多层反转，你必须主动减法：只保留最能改变主角选择的一条核心信息，其余改成疑点、物证、未确认线索或后续章再验证。不要用“第一/第二/第三”总结真相，不要连续写“不是……而是……”解释机制；把说明改成场景阻碍、对白试探、物件状态变化或具体代价。只有当人物互动确实承担本章变化时才补对白，不为对白密度硬塞对话。结尾应按本章模式完成结果、决定、信息改写、行动启动、关系新平衡或情绪余韵；不得为了更刺激凭空加入外部事件、时限、人物或威胁。若旧能力、旧物件、旧血脉或旧资源在本章被写出了明显超出前文的新用途，优先降效果、补外部来源或改成一次性触发，并把代价写得比收益更具体，不能把一次性爆发写成无铺垫永久升级。",
                 source.content,
                 review_content,
                 quality_report_for_prompt(&quality_report),
                 revision_contract
             ));
             prompt.push_str("\n\n# 连续性优先级\n修订不是润色。若以下任一类问题存在，必须先改结构再改句子：\n1. 角色已知信息断点：旧角色不能突然知道上一章没有给出的秘密；若必须知道，正文必须写出他/她刚刚获得该信息的动作、代价或路径。\n2. 角色动机断点：上一章为资源、排名、仇怨、交易而行动的人，本章不能无说明变成守门、旁观或单纯推动剧情的工具人。\n3. 物件/禁制状态断点：令牌、门、阵、伤势、药力、封锁若上一章有状态变化，本章必须交代复原、重新激活、持续生效或失效原因。\n4. 主角收益断点：探索/布局章必须让主角带走一个能用的小收益或明确避祸路线；只知道更多秘密不算可用收益。\n若原稿无法同时修好这些问题，允许重写场景顺序、删掉角色提前入场、推迟部分秘密揭示。");
-            prompt.push_str("\n\n修订时必须保留并兑现上面的“本章节拍计划”。如果原稿偏离节拍，不是润色它，而是把正文重新收束回该节拍。");
+            prompt.push_str("\n\n修订时必须保留并兑现上面的“本章柔性任务契约”。如果原稿没有完成目标状态变化，应先修因果与人物选择；不要为了贴合模板强行重排成固定场景数或固定转折位置。");
         }
     }
 
@@ -1306,7 +1636,9 @@ fn render_project_genre_skill(
     project: &Project,
     stage: &Stage,
 ) -> AppResult<String> {
-    let skill = genre_skill::detect_genre_skill(&project.genre);
+    let profile = state.get_genre_agent_for_project(project.id)?;
+    let skill = genre_skill::genre_skill_for_id(&profile.primary_skill_key)
+        .unwrap_or_else(|| genre_skill::detect_genre_skill(&project.genre));
     let template = state
         .get_writing_skill_by_key(skill.skill_id())?
         .filter(|record| record.enabled && !record.content.trim().is_empty())
@@ -1326,7 +1658,8 @@ fn render_supporting_skills(
     project: &Project,
     stage: &Stage,
 ) -> AppResult<String> {
-    let genre_skill_id = genre_skill::detect_genre_skill(&project.genre).skill_id();
+    let profile = state.get_genre_agent_for_project(project.id)?;
+    let genre_skill_id = profile.primary_skill_key.as_str();
     let mut blocks = Vec::new();
 
     for skill in state.list_writing_skills()? {
@@ -1334,6 +1667,13 @@ fn render_supporting_skills(
             continue;
         }
         if skill.skill_key == genre_skill_id || skill.category == "genre" {
+            continue;
+        }
+        if !profile
+            .allowed_skill_keys
+            .iter()
+            .any(|allowed| allowed == &skill.skill_key)
+        {
             continue;
         }
 
@@ -1464,27 +1804,141 @@ fn append_recent_chapter_context(
         return Ok(());
     }
 
-    prompt.push_str("\n\n# 最近已通过章节上下文");
+    let direct_predecessor_id = previous.first().map(|chapter| chapter.id);
+    prompt.push_str(
+        "\n\n# 最近已通过章节上下文\n已批准正文才是事实来源，自动检索只补充较早相关资料。",
+    );
     for chapter in previous.into_iter().rev() {
         if let Some(artifact) = state.latest_approved_chapter_body(project_id, chapter.id)? {
             prompt.push_str(&format!(
-                "\n\n## {}\n上一章正文尾段：\n{}",
+                "\n\n## 近章结尾原文：{}\n{}",
                 chapter.title,
-                tail_excerpt(&artifact.content, 1200)
+                tail_excerpt(&artifact.content, 1_200)
             ));
-            let obligations = carryover_obligations_from_excerpt(&artifact.content);
-            if !obligations.is_empty() {
-                prompt.push_str("\n待承接状态：");
-                for item in obligations {
-                    prompt.push_str(&format!("\n- {}", item));
+            if Some(chapter.id) == direct_predecessor_id {
+                let obligations = carryover_obligations_from_excerpt(&artifact.content);
+                if !obligations.is_empty() {
+                    prompt.push_str("\n原文可见的待承接压力：");
+                    for item in obligations {
+                        prompt.push_str(&format!("\n- {}", item));
+                    }
                 }
             }
         }
     }
+    if chapter_memory::is_enabled() {
+        if let Some(predecessor_id) = direct_predecessor_id {
+            if let Some(memory) =
+                chapter_memory::current_memory_for_chapter(state, project_id, predecessor_id)?
+            {
+                prompt.push_str("\n\n# 直接前章交接记忆（全文提取，来源引文已校验）");
+                prompt.push_str(
+                "\n这是正式前章的可重建派生记忆，用来补足尾段之外的状态变化。若它与上方前章原文冲突，始终以前章原文为准。",
+            );
+                prompt.push('\n');
+                prompt.push_str(&chapter_memory::render_memory_context(&memory)?);
+            }
+        }
+    }
     prompt.push_str(
-        "\n\n请保持上一章已经发生的状态变化、线索、人物情绪和规则信息连续推进，不要无故重置气氛或重复解释。",
+        "\n\n连续性优先级：已批准正文 > 已批准资料 > 本章任务 > 历史检索或派生账本。直接前章若与概括性资料不一致，以正文实际发生的动作、状态和已知信息为准；不要无故重置气氛或重复解释。",
     );
     Ok(())
+}
+
+fn append_written_progress_context(
+    state: &AppState,
+    project_id: i64,
+    prompt: &mut String,
+) -> AppResult<()> {
+    let chapters = state.list_chapters(project_id)?;
+    let written = chapters
+        .iter()
+        .filter_map(|chapter| {
+            chapter
+                .current_artifact_id
+                .map(|artifact_id| (chapter, artifact_id))
+        })
+        .collect::<Vec<_>>();
+    let next_unwritten = chapters
+        .iter()
+        .find(|chapter| chapter.current_artifact_id.is_none());
+
+    prompt.push_str("\n\n# 已写正文进度（应用数据库）");
+    prompt.push_str("\n只有章节当前正式正文会进入这里。候选稿、试读和未批准修订不属于已写进度。");
+    if written.is_empty() {
+        prompt.push_str("\n当前没有已完成的正式章节，可以从第 1 章开始规划。");
+    } else {
+        prompt.push_str("\n以下章节已经写完并锁定：只能总结其实际结果，不能重新规划、改名、替换事件或把它们当成待写章节。");
+        for (chapter, artifact_id) in written {
+            let artifact = state.get_artifact(artifact_id)?;
+            prompt.push_str(&format!(
+                "\n\n## 已锁定：第 {} 章 {}\n- 开场摘录：{}\n- 结尾摘录：{}",
+                chapter.chapter_no,
+                chapter.title,
+                head_excerpt(&artifact.content, 180),
+                tail_excerpt(&artifact.content, 320)
+            ));
+        }
+    }
+    if let Some(chapter) = next_unwritten {
+        prompt.push_str(&format!(
+            "\n\n规划起点：第 {} 章 {}。新章节任务必须从这里或更后面开始。",
+            chapter.chapter_no, chapter.title
+        ));
+    } else {
+        prompt.push_str("\n\n当前章节列表均已有正式正文；如需续写，只规划现有列表之后的新章节。");
+    }
+    Ok(())
+}
+
+fn outline_task_for_prompt(state: &AppState, project_id: i64) -> AppResult<String> {
+    let chapters = state.list_chapters(project_id)?;
+    let written_count = chapters
+        .iter()
+        .filter(|chapter| chapter.current_artifact_id.is_some())
+        .count();
+    let next_unwritten = chapters
+        .iter()
+        .find(|chapter| chapter.current_artifact_id.is_none())
+        .map(|chapter| chapter.chapter_no)
+        .unwrap_or_else(|| {
+            chapters
+                .last()
+                .map(|chapter| chapter.chapter_no + 1)
+                .unwrap_or(1)
+        });
+    let shared = "每个待写章节只写章节模式、进入状态、章节目标、主要阻力、进度/状态变化、退出状态或对下一章形成的新条件。结尾可以是结果落地、决定形成、信息改写、行动启动或情绪余韵，不强制每章制造危险式钩子。按生产需要完整展开，不设固定字数；但不要把章节正文、重复规则或远期谜底提前写进大纲。已批准设定是能力合同：核心器物、血脉、功法和身份只能使用设定中已明确的功能；任何新效果只能作为未验证痕迹、外部一次性条件或远期问题，不能直接成为稳定解法。";
+
+    if written_count == 0 {
+        Ok(format!(
+            "\n\n# 任务\n基于已批准设定生成可执行大纲。先写整书主线，再写前 12 章待写列表；{shared}"
+        ))
+    } else {
+        Ok(format!(
+            "\n\n# 任务\n基于已批准设定和正式正文继续维护可执行大纲。输出分为两部分：\n1. 已写进度摘要：只列上方 {written_count} 个已锁定章节的标题，以及摘录中能够直接验证的实际结果；不得为这些章节重新生成章节模式、目标、阻力、事件、能力、资源或退出状态。\n2. 后续待写规划：详细章节生产卡必须从第 {next_unwritten} 章开始；不要再次输出第 1 章至第 {} 章的生产卡，也不要用规划内容修正正式正文。可以规划接下来最多 12 个待写章节，不按总目标字数平均切块。\n{shared}",
+            next_unwritten - 1
+        ))
+    }
+}
+
+fn direct_predecessor_chapter_no(
+    state: &AppState,
+    project_id: i64,
+    current_chapter_id: i64,
+) -> AppResult<Option<i64>> {
+    let chapters = state.list_chapters(project_id)?;
+    let Some(current) = chapters
+        .iter()
+        .find(|chapter| chapter.id == current_chapter_id)
+    else {
+        return Ok(None);
+    };
+    Ok(chapters
+        .iter()
+        .filter(|chapter| chapter.chapter_no < current.chapter_no)
+        .map(|chapter| chapter.chapter_no)
+        .max())
 }
 
 fn append_split_plan_context(
@@ -1546,12 +2000,11 @@ fn append_chapter_task_card(
 
     prompt.push_str("\n\n# 本章任务卡");
     prompt.push_str(
-        "\n你必须把这一章当作生产任务执行，而不是自由发挥。优先保证目标、冲突、信息释放和章末钩子都能落地。",
+        "\n这是本章的叙事合同，用来保证它确实推进主线，而不是要求按固定模板逐项打卡。优先让章节目标、核心冲突、信息释放和结尾走向在正文中自然落地。",
     );
     prompt.push_str(&format!("\n{}", section));
-    prompt.push_str("\n\n写作时必须兑现本章任务卡里的核心冲突和结尾钩子，不能只借用题目和气氛。单章只推进 1 个主要冲突，优先回收 1-2 条前文线索，最多释放 1 条新的关键规则或新事实。不要把多章谜底、全部物件、全部人物动机一次性塞进本章。");
-    prompt.push_str("\n这一章必须能用一句话概括成“主角为了X，做了Y，最后发现Z”。如果你写到中途发现这一句已经装不下本章内容，说明超载了，必须删掉次要支线、次要解释和次要反转。");
-    prompt.push_str("\n本章禁止同时发生以下任意两项以上：新增重要人物、揭示新层级空间、解释底层机制、回收多个旧伏笔、公布多个编号/版本关系。最多选其中一项做重头，其余只可轻触或不出现。");
+    prompt.push_str("\n\n写作时要兑现任务卡里的核心冲突和结尾走向，不能只借用题目和气氛。通常让一个主要动作线主导本章；成长、关系、恢复、交易和转场也可以是完整章节功能，不必强行追加打斗或反转。若出现多个会改变主角选择的新设定、谜底或人物动机，优先让其中一项成为本章重心，其余保留为未确认线索或留待后文展开。");
+    prompt.push_str("\n章节应能清楚说出“人物此刻想完成什么、遇到什么阻碍、最后局面怎样变化”。这是检查失焦的工具，不是要求把正文压缩成固定句式；章节长短由必要场景、对白和情绪承接决定。");
     Ok(())
 }
 
@@ -1836,7 +2289,7 @@ fn append_chapter_state_ledger(
     }
 
     if current_costs.is_empty() {
-        prompt.push_str("\n- 当前代价：暂无显式代价记录，但必须承接最近章节的危险和压力。");
+        prompt.push_str("\n- 当前代价：暂无显式代价记录；仍需承接最近章节已经成立的行动后果、关系变化或限制条件。");
     } else {
         prompt.push_str("\n- 当前代价：");
         for cost in current_costs {
@@ -1863,7 +2316,7 @@ fn append_chapter_state_ledger(
     }
 
     if object_anchors.is_empty() {
-        prompt.push_str("\n- 物件/规则状态锚点：重要物件、禁制、编号、血滴、令牌、药物一旦写过状态，本章必须接着写，不能默认自动变化。");
+        prompt.push_str("\n- 物件/规则状态锚点：重要物件、证据、工具、契约、伤势、限制条件一旦写过状态，本章必须承接，不能默认自动变化。");
     } else {
         prompt.push_str("\n- 物件/规则状态锚点：");
         for anchor in object_anchors {
@@ -1873,10 +2326,10 @@ fn append_chapter_state_ledger(
 
     if unresolved_hooks.is_empty() {
         prompt.push_str(
-            "\n- 上章未结钩子：若上一章已抛出生死威胁或限时问题，本章开头必须显式回应它。",
+            "\n- 上章未结状态：若上一章留下仍在生效的行动、压力、决定、关系变化或情绪惯性，本章应在合适位置承接；允许通过时间跳跃或切线处理，但要让变化有依据。",
         );
     } else {
-        prompt.push_str("\n- 上章未结钩子：");
+        prompt.push_str("\n- 上章未结状态：");
         for hook in unresolved_hooks {
             prompt.push_str(&format!("\n  * {}", hook));
         }
@@ -1888,13 +2341,13 @@ fn append_chapter_state_ledger(
     }
 
     prompt.push_str(
-        "\n- 本章执行规则：1）只让一个章节功能真正推进；2）最多兑现 1-2 条主处理线；3）暂缓线索只允许点到，不允许展开成新支线；4）优先把当前代价或成长增量写实，而不是继续加设定；5）角色立场、已知信息、物件状态若要变化，必须在正文里写出导致变化的动作或发现；6）若章末没有更具体的收获、危险、发现、代价或下一步问题，说明本章没有收好。",
+        "\n- 本章执行规则：1）形成一个清晰的主要推进；较长章节可以容纳多个因果相连的变化，但不能让互不相关的功能争抢篇幅；2）围绕当前主处理线兑现真正影响本章选择的内容；3）暂缓线索只保留必要存在感，不展开成新支线；4）优先把当前代价、成长、关系或认知变化写实，而不是继续加设定；5）角色立场、已知信息、物件状态若要变化，必须在正文里写出导致变化的动作或发现；6）结尾要落稳本章已经发生的结果、决定、关系、信息、行动或情绪变化，不以是否出现新危险判断好坏。",
     );
 
     Ok(())
 }
 
-fn append_chapter_beat_plan(
+fn append_chapter_task_contract(
     state: &AppState,
     project_id: i64,
     current_chapter_id: i64,
@@ -1902,7 +2355,7 @@ fn append_chapter_beat_plan(
     user_instruction: Option<&str>,
     prompt: &mut String,
 ) -> AppResult<()> {
-    let plan = build_chapter_beat_plan(
+    let contract = build_chapter_task_contract(
         state,
         project_id,
         current_chapter_id,
@@ -1910,37 +2363,42 @@ fn append_chapter_beat_plan(
         user_instruction,
     )?;
 
-    prompt.push_str("\n\n# 本章节拍计划");
+    prompt.push_str("\n\n# 本章柔性任务契约");
     prompt.push_str(
-        "\n先按下面的章节模式和 5 个节拍推进，再写具体场景。不要跳步，不要把多个节拍挤在同一段解释里。每个节拍至少要落一个动作、一个感知细节或一句能改变局面的对白。",
+        "\n以下内容定义本章从什么状态进入、需要完成什么变化，以及结束后局面有什么不同。它不是场景拆分，也不是固定节拍公式；可使用一个长场景、多个短场景、概述、留白或时间跳跃，只要因果和人物反应成立。",
     );
-    prompt.push_str(&format!("\n- 章节模式：{}", plan.chapter_mode));
-    prompt.push_str(&format!("\n1. 开场驱动力：{}", plan.opening_pressure));
-    prompt.push_str(&format!("\n2. 第一推进：{}", plan.scene_one));
-    prompt.push_str(&format!("\n3. 中段发现：{}", plan.midpoint_reveal));
-    prompt.push_str(&format!("\n4. 代价转折：{}", plan.cost_turn));
-    prompt.push_str(&format!("\n5. 章末钩子：{}", plan.ending_hook));
-    if let Some(hook_carryover) = plan.hook_carryover {
+    prompt.push_str(&format!("\n- 章节模式：{}", contract.chapter_mode));
+    prompt.push_str(&format!("\n- 进入状态：{}", contract.entry_state));
+    prompt.push_str(&format!("\n- 本章目标：{}", contract.objective));
+    prompt.push_str(&format!("\n- 主要阻力：{}", contract.resistance));
+    prompt.push_str(&format!("\n- 历史上下文用途：{}", contract.context_focus));
+    prompt.push_str(&format!("\n- 必须发生的变化：{}", contract.required_change));
+    prompt.push_str(&format!("\n- 结尾功能：{}", contract.ending_function));
+    prompt.push_str(&format!(
+        "\n- 离开状态 / 下一章新条件：{}",
+        contract.next_condition
+    ));
+    if let Some(hook_carryover) = contract.hook_carryover {
         prompt.push_str(&format!("\n- 上章钩子回响：{}", hook_carryover));
     }
-    if let Some(payoff) = plan.payoff {
+    if let Some(payoff) = contract.payoff {
         prompt.push_str(&format!("\n- 本章进度增量：{}", payoff));
     }
 
-    if !plan.must_use_threads.is_empty() {
+    if !contract.must_use_threads.is_empty() {
         prompt.push_str("\n- 本章必须兑现的线索：");
-        for item in plan.must_use_threads {
+        for item in contract.must_use_threads {
             prompt.push_str(&format!("\n  * {}", item));
         }
     }
-    if !plan.must_avoid_threads.is_empty() {
+    if !contract.must_avoid_threads.is_empty() {
         prompt.push_str("\n- 本章禁止展开的线索：");
-        for item in plan.must_avoid_threads {
+        for item in contract.must_avoid_threads {
             prompt.push_str(&format!("\n  * {}", item));
         }
     }
     prompt.push_str(
-        "\n- 执行要求：开篇尽早落到第 1 节拍，让读者知道本章目标、时限、瓶颈或准备动作；若上一章章末已经抛出追兵、监视、封锁、对峙、时限或大比压力，前段必须回应它，但回应可以是躲避、疗伤、修炼、推演、布局或正面对抗；正文中段必须出现一次更具体的进度变化，不允许只有气氛升级；结尾要落到第 5 节拍，并留下明确下一步问题、威胁、收获或选择。",
+        "\n- 使用原则：开篇应让读者逐渐或立即看清本章在处理什么；若上一章留下即时压力，本章前段要让它仍然有效，但回应可以是躲避、恢复、准备、推演、布局或正面对抗。结尾不强制危险或反转，可以落在结果、决定、信息改写、行动启动、关系新平衡或情绪余韵上；关键是本章已经交付应有变化。",
     );
     prompt.push_str(
         "\n- 连续性要求：若本章写到旧角色、旧物件、旧禁制、旧编号，先沿用前文最后一次确认的状态；除非正文里真的发生了变化，否则不要私自改阵营、改已知信息、改物件归属、改规则描述。",
@@ -1948,13 +2406,13 @@ fn append_chapter_beat_plan(
     Ok(())
 }
 
-fn build_chapter_beat_plan(
+fn build_chapter_task_contract(
     state: &AppState,
     project_id: i64,
     current_chapter_id: i64,
     chapter_no: i64,
     user_instruction: Option<&str>,
-) -> AppResult<ChapterBeatPlan> {
+) -> AppResult<ChapterTaskContract> {
     let outline =
         approved_outline_section_for_chapter(state, project_id, chapter_no)?.unwrap_or_default();
     let chapter_title = state
@@ -1964,12 +2422,16 @@ fn build_chapter_beat_plan(
     let objective = extract_outline_field(&outline, "章节目标")
         .or_else(|| first_non_heading_line(&outline))
         .unwrap_or_else(|| format!("推进 {}", chapter_title));
-    let conflict = extract_outline_field(&outline, "核心冲突")
-        .unwrap_or_else(|| "让主角立刻处理一个具体异常，而不是先做背景说明".to_string());
-    let release = extract_outline_field(&outline, "信息释放")
-        .unwrap_or_else(|| "只释放一条足够改变判断的新信息".to_string());
-    let hook = extract_outline_field(&outline, "结尾钩子")
-        .unwrap_or_else(|| "章末必须抛出下一步更具体的危险或选择".to_string());
+    let conflict = extract_outline_field(&outline, "核心冲突").unwrap_or_else(|| {
+        "让人物处理与本章目标直接相关的具体阻力，而不是先做背景说明".to_string()
+    });
+    let release = extract_outline_field(&outline, "信息释放").unwrap_or_else(|| {
+        "释放足以改变人物判断或选择的信息，其余内容按需要保留为未确认状态".to_string()
+    });
+    let next_condition = extract_outline_field(&outline, "退出状态")
+        .or_else(|| extract_outline_field(&outline, "下一章新条件"))
+        .or_else(|| extract_outline_field(&outline, "结尾钩子"))
+        .unwrap_or_else(|| "让本章状态变化形成自然结束，或为下一章建立清楚的新条件".to_string());
     let chapter_mode = infer_chapter_mode(
         &chapter_title,
         &objective,
@@ -1994,7 +2456,9 @@ fn build_chapter_beat_plan(
     let cost = collect_current_costs(state, project_id, chapter_no)?
         .into_iter()
         .next()
-        .unwrap_or_else(|| "上一章留下的危险和压力必须具体落地，不能被重置".to_string());
+        .unwrap_or_else(|| {
+            "承接上一章仍然有效的行动后果、关系变化或限制条件，不能无依据重置".to_string()
+        });
     let history_hint = build_history_query(state, project_id, chapter_no, user_instruction)?
         .map(|query| summarize_history_query(&query))
         .unwrap_or_else(|| "只回收最直接相关的旧线索".to_string());
@@ -2002,34 +2466,53 @@ fn build_chapter_beat_plan(
     let hook_carryover = recent_chapter_hook_carryover(state, project_id, chapter_no)?;
     let payoff = match genre_skill {
         crate::genre_skill::GenreSkillKind::XianxiaPowerFantasy => Some(xianxia_progress_requirement(&chapter_mode)),
-        crate::genre_skill::GenreSkillKind::UrbanMystery => Some(
-            "本章至少兑现 1 项硬证据或硬规则推进，例如确认线索真伪、拿到新证据、逼出身份错位或试出规则代价。"
+        crate::genre_skill::GenreSkillKind::Mystery => Some(
+            "本章至少兑现 1 项证据或判断推进，例如确认线索真伪、拿到新证据、排除一种解释、暴露证词矛盾或提出更精确的问题。"
+                .to_string(),
+        ),
+        crate::genre_skill::GenreSkillKind::UrbanSupernatural => Some(
+            "本章至少兑现 1 项能力或现实处境变化，例如试出能力边界、取得成长收益、承担使用代价、改变身份关系或触发可信的社会反馈。"
                 .to_string(),
         ),
         crate::genre_skill::GenreSkillKind::GeneralSerialized => None,
     };
 
-    Ok(ChapterBeatPlan {
+    let entry_state = hook_carryover
+        .clone()
+        .unwrap_or_else(|| format!("承接当前仍有效的压力或代价：{cost}"));
+    let ending_function = ending_function_for_mode(&chapter_mode);
+
+    Ok(ChapterTaskContract {
         chapter_mode,
-        opening_pressure: format!(
-            "开头前段围绕“{}”建立本章驱动力；不要先铺陈背景，要让 {} 具体开始。",
-            conflict, objective
+        entry_state,
+        objective,
+        resistance: conflict,
+        context_focus: history_hint,
+        required_change: format!(
+            "让信息、关系、资源、能力、位置、目标或情绪惯性发生与本章任务相称的可验证变化；当前计划优先关注：{release}。变化可以通过结果、决定或代价逐步形成，不要求固定在中段。"
         ),
-        scene_one: format!(
-            "围绕“{}”推进一个清晰动作，过程中只允许顺手带出 {}。",
-            objective, history_hint
-        ),
-        midpoint_reveal: format!("中段必须拿到一个足以改变主角判断的新发现：{}。", release),
-        cost_turn: format!(
-            "发现之后立刻付出代价或被迫收束选择，优先承接这个压力：{}。",
-            cost
-        ),
-        ending_hook: format!("最后必须把章节收在更具体的下一步问题/威胁上：{}。", hook),
+        ending_function,
+        next_condition,
         payoff,
         hook_carryover,
         must_use_threads,
         must_avoid_threads,
     })
+}
+
+fn ending_function_for_mode(chapter_mode: &str) -> String {
+    if chapter_mode.contains("成长准备") || chapter_mode.contains("资源技艺") {
+        "优先使用结果落地型或决定形成型：写清本次练习、恢复、制作或资源处理实际完成了什么，还留下什么限制；不必追加突发敌人。".to_string()
+    } else if chapter_mode.contains("关系谈判") {
+        "优先落在关系新平衡、承诺、拒绝或筹码变化；可以安静收束，但双方下一次行动条件必须已经改变。"
+            .to_string()
+    } else if chapter_mode.contains("探索调查") {
+        "优先使用信息改写型或行动启动型：确认一层事实并让角色据此做出选择；不要只停在看见新门、新光或新轮廓。".to_string()
+    } else if chapter_mode.contains("强冲突") {
+        "优先使用结果落地型：交代对抗结果、筹码变化和代价；后续压力应从本章结果自然产生，而不是另塞无关悬念。".to_string()
+    } else {
+        "可使用决定形成型、行动启动型或情绪余韵型；不要求制造危险，但必须让路线、关系、准备状态或读者理解比章初更明确。".to_string()
+    }
 }
 
 fn infer_chapter_mode(
@@ -2051,31 +2534,33 @@ fn infer_chapter_mode(
     if contains_any(
         &text,
         &[
-            "修炼", "闭关", "练成", "突破", "瓶颈", "养伤", "疗伤", "试招",
+            "训练", "学习", "练习", "提升", "恢复", "养伤", "疗伤", "准备", "修炼",
         ],
     ) {
-        "发育修炼章：重点写练法、瓶颈、试错、小成和远期压力回响，不要求当场打脸。".to_string()
+        "成长准备章：重点写方法、瓶颈、试错、小成和远期压力回响，不要求当场爆发。".to_string()
     } else if contains_any(
         &text,
-        &["炼药", "丹", "药", "材料", "火候", "灵物", "资源", "灵材"],
+        &[
+            "制作", "调配", "采购", "材料", "工具", "资源", "样品", "修复",
+        ],
     ) {
-        "资源炼药章：重点写材料获取/处理、火候风险、产物效果和资源代价。".to_string()
+        "资源技艺章：重点写资源获取/处理、操作风险、产物效果和现实代价。".to_string()
     } else if contains_any(
         &text,
         &["交易", "谈判", "换", "盟友", "人情", "立场", "合作"],
     ) {
-        "关系交易章：重点写筹码、立场、试探和关系变化，不要求武力冲突。".to_string()
+        "关系谈判章：重点写筹码、立场、试探和关系变化，不要求正面冲突。".to_string()
     } else if contains_any(
         &text,
         &[
             "潜入", "确认", "核验", "探索", "线索", "真相", "遗迹", "秘", "门",
         ],
     ) {
-        "探索揭秘章：重点写行动、痕迹、判断和一层信息揭示，禁止一章揭完整卷谜底。".to_string()
+        "探索调查章：重点写行动、痕迹、判断和一层信息揭示，禁止一章讲透整段谜底。".to_string()
     } else if contains_any(
         &text,
         &[
-            "大比", "挑战", "追", "杀", "堵", "压迫", "抢", "夺", "反击", "对峙",
+            "比赛", "挑战", "追", "杀", "堵", "压迫", "抢", "夺", "反击", "对峙",
         ],
     ) {
         "强冲突章：重点写正面压力、筹码变化、对抗结果和代价。".to_string()
@@ -2085,15 +2570,15 @@ fn infer_chapter_mode(
 }
 
 fn xianxia_progress_requirement(chapter_mode: &str) -> String {
-    if chapter_mode.contains("发育修炼") {
+    if chapter_mode.contains("成长准备") {
         "本章至少兑现 1 项成长增量：练法更清楚、瓶颈被定位、招式有雏形、伤势有处理、境界或战力推进一小步。".to_string()
-    } else if chapter_mode.contains("资源炼药") {
+    } else if chapter_mode.contains("资源技艺") {
         "本章至少兑现 1 项资源增量：材料、丹药、灵物、炼制经验、火候判断或资源代价必须具体可见。"
             .to_string()
-    } else if chapter_mode.contains("关系交易") {
+    } else if chapter_mode.contains("关系谈判") {
         "本章至少兑现 1 项关系/筹码增量：换到情报、建立人情、暴露立场、达成交易或埋下可用承诺。"
             .to_string()
-    } else if chapter_mode.contains("探索揭秘") {
+    } else if chapter_mode.contains("探索调查") {
         "本章至少兑现 1 项信息增量：确认一条旧线索、发现一层规则或拿到一个新判断，但不要一次揭完整卷谜底。".to_string()
     } else if chapter_mode.contains("强冲突") {
         "本章至少兑现 1 项对抗增量：压回挑衅、保住资源、夺到资格、逼退敌人、暴露新风险或付出明确代价。".to_string()
@@ -2124,8 +2609,21 @@ fn recent_chapter_hook_carryover(
     };
     let tail = tail_excerpt(&body.content, 260);
     let triggers = [
-        "盯", "跟", "追", "封", "时辰", "子时", "敲门", "脚步", "大比", "试炼", "杀", "开门",
+        "盯",
+        "跟",
+        "追",
+        "封",
+        "时限",
+        "倒计时",
+        "敲门",
+        "脚步",
+        "比赛",
+        "挑战",
+        "杀",
+        "开门",
         "回来",
+        "必须",
+        "不能",
     ];
     if triggers.iter().any(|needle| tail.contains(needle)) {
         Ok(Some(format!(
@@ -2221,7 +2719,7 @@ pub(crate) fn sync_story_threads_from_artifact(
     {
         query_parts.push(section);
     }
-    let snippets = retrieve_history_snippets(
+    let mut snippets = retrieve_history_snippets(
         state,
         artifact.project_id,
         chapter_id,
@@ -2229,6 +2727,20 @@ pub(crate) fn sync_story_threads_from_artifact(
         true,
         false,
     )?;
+    let registered_labels = registered_story_thread_labels(state, artifact.project_id)?;
+    snippets.retain(|snippet| is_valid_story_thread_term(&snippet.matched_term));
+    snippets.sort_by(|left, right| {
+        story_thread_term_priority(right, &registered_labels)
+            .cmp(&story_thread_term_priority(left, &registered_labels))
+            .then_with(|| right.score.cmp(&left.score))
+            .then_with(|| {
+                right
+                    .matched_term
+                    .chars()
+                    .count()
+                    .cmp(&left.matched_term.chars().count())
+            })
+    });
 
     let mut active_keys = Vec::new();
     let mut deferred_keys = Vec::new();
@@ -2298,6 +2810,90 @@ pub(crate) fn rebuild_story_threads(state: &AppState) -> AppResult<()> {
 
 fn normalize_thread_key(term: &str) -> String {
     term.trim().to_lowercase()
+}
+
+fn registered_story_thread_labels(state: &AppState, project_id: i64) -> AppResult<HashSet<String>> {
+    let mut labels = HashSet::new();
+    for card in state.list_knowledge_cards(project_id)? {
+        if card.status == "approved" && is_valid_story_thread_term(&card.title) {
+            labels.insert(card.title.trim().to_string());
+        }
+    }
+    for foreshadowing in state.list_foreshadowings(project_id)? {
+        if foreshadowing.status != "pending_human_approval"
+            && is_valid_story_thread_term(&foreshadowing.title)
+        {
+            labels.insert(foreshadowing.title.trim().to_string());
+        }
+    }
+    for entry in state.list_continuity_ledger_entries(project_id)? {
+        if is_valid_story_thread_term(&entry.entity_label) {
+            labels.insert(entry.entity_label.trim().to_string());
+        }
+    }
+    Ok(labels)
+}
+
+fn story_thread_term_priority(
+    term: &StoryContextSnippet,
+    registered_labels: &HashSet<String>,
+) -> usize {
+    let mut priority = if registered_labels.contains(term.matched_term.trim()) {
+        1_000
+    } else {
+        0
+    };
+    if term.source_label.contains("角色") {
+        priority += 120;
+    } else if term.source_label.contains("设定") {
+        priority += 100;
+    } else if term.source_label.contains("大纲") {
+        priority += 80;
+    } else if term.source_label.starts_with("第") {
+        priority += 60;
+    }
+    if looks_like_object_term(term.matched_term.trim()) {
+        priority += 20;
+    }
+    priority
+}
+
+fn is_valid_story_thread_term(term: &str) -> bool {
+    let term = term.trim();
+    let length = term.chars().count();
+    if !(2..=12).contains(&length) || !term.chars().all(is_han) || is_noise_term(term) {
+        return false;
+    }
+
+    // A derived story thread is an entity or event label, never an outline
+    // instruction, chapter range, or prose sentence.
+    [
+        "章节目标",
+        "核心冲突",
+        "信息释放",
+        "结尾钩子",
+        "退出状态",
+        "下一章",
+        "上一章",
+        "本章",
+        "章纲",
+        "必须",
+        "不得",
+        "不要",
+        "建议",
+        "需要",
+        "重点",
+        "优先",
+        "推进",
+        "完成",
+        "释放",
+        "交代",
+        "避免",
+        "只揭",
+        "模式",
+    ]
+    .iter()
+    .all(|marker| !term.contains(marker))
 }
 
 fn classify_thread_kind(term: &str, source_label: &str) -> &'static str {
@@ -2520,16 +3116,19 @@ fn collect_unresolved_hooks(
         .map(|chapter| (chapter.id, chapter.title.clone()))
         .collect::<Vec<_>>();
     let triggers = [
-        "烧出来",
         "追",
         "封",
-        "大比",
         "盯",
         "回来",
-        "时辰",
+        "时限",
+        "倒计时",
         "威胁",
-        "谷口",
         "不能",
+        "必须",
+        "否则",
+        "来不及",
+        "发现",
+        "决定",
     ];
     let mut hooks = Vec::new();
 
@@ -2589,296 +3188,6 @@ fn looks_like_object_term(term: &str) -> bool {
     .any(|suffix| term.ends_with(suffix) || term.contains(suffix))
 }
 
-fn build_history_query(
-    state: &AppState,
-    project_id: i64,
-    chapter_no: i64,
-    user_instruction: Option<&str>,
-) -> AppResult<Option<String>> {
-    let mut parts = Vec::new();
-    if let Some(section) = approved_outline_section_for_chapter(state, project_id, chapter_no)? {
-        parts.push(section);
-    }
-    if let Some(instruction) = user_instruction {
-        if !instruction.trim().is_empty() {
-            parts.push(instruction.trim().to_string());
-        }
-    }
-    let messages = state.list_messages(project_id)?;
-    for message in messages.iter().take(8) {
-        if message.role == "human_instruction" || message.role == "revision_feedback" {
-            parts.push(message.content.clone());
-        }
-    }
-
-    let joined = parts.join("\n");
-    if joined.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(joined))
-    }
-}
-
-pub fn search_story_context(
-    state: &AppState,
-    input: StoryContextSearchInput,
-) -> AppResult<Vec<StoryContextSnippet>> {
-    let query = input.query.trim();
-    if query.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let snippets = retrieve_history_snippets(
-        state,
-        input.project_id,
-        input.chapter_id.unwrap_or_default(),
-        query,
-        input.include_immediate_previous,
-        true,
-    )?;
-    let limit = input.limit.unwrap_or(6).clamp(1, 12);
-    Ok(snippets.into_iter().take(limit).collect())
-}
-
-fn retrieve_history_snippets(
-    state: &AppState,
-    project_id: i64,
-    current_chapter_id: i64,
-    query: &str,
-    include_immediate_previous: bool,
-    include_messages: bool,
-) -> AppResult<Vec<StoryContextSnippet>> {
-    let terms = extract_history_terms(query);
-    if terms.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let chapters = state.list_chapters(project_id)?;
-    let current_chapter_no = chapters
-        .iter()
-        .find(|chapter| chapter.id == current_chapter_id)
-        .map(|chapter| chapter.chapter_no)
-        .unwrap_or_default();
-
-    let mut candidates = Vec::new();
-    let chapter_upper_bound = if include_immediate_previous {
-        current_chapter_no
-    } else {
-        current_chapter_no.saturating_sub(1)
-    };
-    for chapter in chapters
-        .iter()
-        .filter(|chapter| chapter.chapter_no < chapter_upper_bound)
-    {
-        if let Some(artifact) = state.latest_approved_chapter_body(project_id, chapter.id)? {
-            if let Some(snippet) = best_snippet_for_text(
-                &artifact.content,
-                &terms,
-                &format!("第 {} 章 {}", chapter.chapter_no, chapter.title),
-            ) {
-                candidates.push(snippet);
-            }
-        }
-    }
-
-    for stage in ["setting", "outline", "characters"] {
-        if let Some(artifact) = state.approved_artifact(project_id, stage, None)? {
-            if let Some(snippet) =
-                best_snippet_for_text(&artifact.content, &terms, stage_label(stage))
-            {
-                candidates.push(snippet);
-            }
-        }
-    }
-
-    if include_messages {
-        for message in state.list_messages(project_id)?.into_iter().take(40) {
-            if let Some(snippet) =
-                best_snippet_for_text(&message.content, &terms, export_role_label(&message.role))
-            {
-                candidates.push(snippet);
-            }
-        }
-    }
-
-    candidates.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.content.len().cmp(&b.content.len()))
-    });
-    candidates
-        .dedup_by(|a, b| a.source_label == b.source_label && a.matched_term == b.matched_term);
-
-    Ok(candidates.into_iter().take(6).collect())
-}
-
-fn best_snippet_for_text(
-    text: &str,
-    terms: &[String],
-    source_label: &str,
-) -> Option<StoryContextSnippet> {
-    let mut best: Option<StoryContextSnippet> = None;
-    for term in terms {
-        if let Some(index) = text.find(term) {
-            let score = score_term(term);
-            let snippet = StoryContextSnippet {
-                source_label: source_label.to_string(),
-                matched_term: term.clone(),
-                content: excerpt_around(text, index, term.chars().count(), 180),
-                score,
-            };
-            if best
-                .as_ref()
-                .map(|current| snippet.score > current.score)
-                .unwrap_or(true)
-            {
-                best = Some(snippet);
-            }
-        }
-    }
-    best
-}
-
-fn extract_history_terms(query: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    let mut seen = HashSet::new();
-
-    for token in split_query_tokens(query) {
-        let trimmed = token.trim();
-        if trimmed.is_empty() || is_noise_term(trimmed) {
-            continue;
-        }
-        if seen.insert(trimmed.to_string()) {
-            terms.push(trimmed.to_string());
-        }
-    }
-
-    terms.sort_by(|a, b| {
-        score_term(b)
-            .cmp(&score_term(a))
-            .then_with(|| b.len().cmp(&a.len()))
-    });
-    terms.truncate(14);
-    terms
-}
-
-fn split_query_tokens(query: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut current_kind: Option<TokenKind> = None;
-
-    for ch in query.chars() {
-        let kind = token_kind(ch);
-        match kind {
-            Some(kind) => {
-                if current_kind == Some(kind) {
-                    current.push(ch);
-                } else {
-                    if !current.is_empty() {
-                        tokens.push(current.clone());
-                        current.clear();
-                    }
-                    current.push(ch);
-                    current_kind = Some(kind);
-                }
-            }
-            None => {
-                if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
-                }
-                current_kind = None;
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenKind {
-    Han,
-    AsciiWord,
-}
-
-fn token_kind(ch: char) -> Option<TokenKind> {
-    if is_han(ch) {
-        Some(TokenKind::Han)
-    } else if ch.is_ascii_alphanumeric() || ch == '-' {
-        Some(TokenKind::AsciiWord)
-    } else {
-        None
-    }
-}
-
-fn is_han(ch: char) -> bool {
-    ('\u{4E00}'..='\u{9FFF}').contains(&ch)
-}
-
-fn is_noise_term(term: &str) -> bool {
-    const NOISE: &[&str] = &[
-        "主角",
-        "当前章节",
-        "章节目标",
-        "核心冲突",
-        "信息释放",
-        "结尾钩子",
-        "这一章",
-        "不要",
-        "需要",
-        "继续",
-        "直接",
-        "控制",
-        "通过",
-        "问题",
-        "线索",
-        "章节",
-        "规则",
-        "身份",
-        "编号",
-        "自己",
-        "东西",
-        "一个",
-        "两个",
-        "三年前",
-        "本章",
-        "上一章",
-        "前文",
-        "任务",
-        "目标",
-    ];
-
-    if term.chars().count() <= 1 {
-        return true;
-    }
-    if NOISE.contains(&term) {
-        return true;
-    }
-    if term.chars().all(|ch| ch.is_ascii_digit()) {
-        return true;
-    }
-    false
-}
-
-fn score_term(term: &str) -> usize {
-    let has_digits = term.chars().any(|ch| ch.is_ascii_digit());
-    let has_hyphen = term.contains('-');
-    let len = term.chars().count();
-    (if has_digits { 5 } else { 0 }) + (if has_hyphen { 4 } else { 0 }) + len.min(8)
-}
-
-fn excerpt_around(text: &str, match_byte_index: usize, term_chars: usize, window: usize) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    let match_char_index = text[..match_byte_index].chars().count();
-    let start = match_char_index.saturating_sub(window / 2);
-    let end = (match_char_index + term_chars + window / 2).min(chars.len());
-    let excerpt = chars[start..end].iter().collect::<String>();
-    excerpt.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn project_context(project: &Project) -> String {
     format!(
         "# 项目\n标题：{}\n类型：{}\n预计总字数（仅供整体节奏规划）：{}\n状态：{}\n核心想法：{}",
@@ -2892,6 +3201,14 @@ fn tail_excerpt(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     chars[chars.len() - max_chars..].iter().collect()
+}
+
+fn head_excerpt(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn approved_outline_section_for_chapter(
@@ -3034,9 +3351,9 @@ fn revision_contract_for_prompt(report: &crate::models::QualityReport) -> String
     let has_reveal_overload = warning_titles
         .iter()
         .any(|title| title.contains("信息反转") || title.contains("信息释放"));
-    let has_weak_hook = warning_titles
+    let has_weak_ending = warning_titles
         .iter()
-        .any(|title| title.contains("章末钩子"));
+        .any(|title| title.contains("结尾功能"));
     let has_low_dialogue = warning_titles.iter().any(|title| title.contains("对白"));
     let has_overlength = warning_titles
         .iter()
@@ -3052,12 +3369,12 @@ fn revision_contract_for_prompt(report: &crate::models::QualityReport) -> String
         lines.push("- 信息过载硬约束：整章只允许 1 条核心确认；其他真相必须降级成疑点、物证、未确认线索或角色隐瞒。禁止使用“第一/第二/第三”列举结论，禁止连续使用“不是……而是……”讲机制。".to_string());
         lines.push("- 禁止新增事实：不要新增新的幕后层级、第二套关键物件、额外持有人、额外名单、额外身份反转；若需要悬念，只能回收原稿已有的人、物、时限或地点。".to_string());
     }
-    if has_weak_hook {
-        lines.push("- 章末钩子硬约束：结尾只能落在已出现威胁的推进上，例如旧敌到场、已知时限提前、已知物件异动、已知地点被封、已知角色发出命令；不能用全新设定制造钩子。".to_string());
-        lines.push("- 补钩子优先级：优先推进前文已经出现的时限、监视、搜查、封锁、药效、伤势、旧物件异动或角色命令；不要为了补钩子再确认第二层用途、额外身份或新规则。".to_string());
+    if has_weak_ending {
+        lines.push("- 结尾功能约束：按本章模式落稳已经形成的结果、决定、信息改写、关系变化、行动启动或情绪余波；不强制危险、反转或悬念句。".to_string());
+        lines.push("- 事实边界：需要延续压力时，只能推进前文已经出现的时限、监视、封锁、伤势、资源或角色命令；不要为了修结尾新增人物、物件、身份或规则。".to_string());
     }
     if has_low_dialogue {
-        lines.push("- 对白硬约束：至少加入一段 2 人以上的对白对撞；对白必须改变局面，例如逼出条件、暴露隐瞒、迫使主角让步或换取筹码。".to_string());
+        lines.push("- 对白判断：先判断人物互动是否承担本章主要变化。若承担，应把已有互动改成能改变局面的对白或潜台词，例如逼出条件、暴露隐瞒、迫使让步或换取筹码；若本章主要是独处修炼、恢复、探索或行动执行，不为指标硬塞第二个人和对白对撞。".to_string());
     }
     if has_overlength {
         lines.push("- 叙事失焦约束：不要求缩短正文。保留必要的场景、对白和情绪承接；只删重复确认、二次解释、低信息量过桥段和同功能的第二段氛围描写。".to_string());
@@ -3470,6 +3787,65 @@ mod tests {
     }
 
     #[test]
+    fn specialist_agent_ignores_skills_outside_its_allowlist() {
+        let temp = NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "Skill 隔离".to_string(),
+                genre: "悬疑".to_string(),
+                target_words: 120000,
+                premise: "测试白名单".to_string(),
+            })
+            .unwrap();
+        state
+            .save_writing_skill(crate::models::SaveWritingSkill {
+                skill_key: "unrelated_romance_craft".to_string(),
+                name: "无关言情规则".to_string(),
+                category: "craft".to_string(),
+                description: "不应进入悬疑 Agent".to_string(),
+                content: "## Always\nUNRELATED_SKILL_MARKER".to_string(),
+                enabled: true,
+            })
+            .unwrap();
+
+        let rendered = render_supporting_skills(&state, &project, &Stage::Draft).unwrap();
+
+        assert!(rendered.contains("continuity_and_agency"));
+        assert!(!rendered.contains("UNRELATED_SKILL_MARKER"));
+    }
+
+    #[test]
+    fn urban_supernatural_and_mystery_prompts_do_not_cross_load() {
+        let temp = NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let urban_project = state
+            .create_project(NewProject {
+                title: "都市异能隔离".to_string(),
+                genre: "都市异能".to_string(),
+                target_words: 120000,
+                premise: "测试题材隔离".to_string(),
+            })
+            .unwrap();
+        let mystery_project = state
+            .create_project(NewProject {
+                title: "悬疑隔离".to_string(),
+                genre: "悬疑".to_string(),
+                target_words: 120000,
+                premise: "测试题材隔离".to_string(),
+            })
+            .unwrap();
+
+        let urban = render_project_genre_skill(&state, &urban_project, &Stage::Draft).unwrap();
+        let mystery = render_project_genre_skill(&state, &mystery_project, &Stage::Draft).unwrap();
+
+        assert!(urban.contains("能力通过行动、限制和后果"));
+        assert!(!urban.contains("关键结论必须有可追溯线索支持"));
+        assert!(mystery.contains("关键结论必须有可追溯线索支持"));
+        assert!(!mystery.contains("能力通过行动、限制和后果"));
+    }
+
+    #[test]
     fn pending_candidate_does_not_pollute_story_threads() {
         let temp = NamedTempFile::new().unwrap();
         let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
@@ -3506,6 +3882,27 @@ mod tests {
 
         sync_story_threads_from_artifact(&state, &candidate).unwrap();
         assert!(state.list_story_threads(project.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn story_thread_filter_keeps_entity_labels_and_rejects_outline_noise() {
+        for label in ["黑牌", "矿洞坍塌", "七号旧炉"] {
+            assert!(
+                is_valid_story_thread_term(label),
+                "{label} should be a label"
+            );
+        }
+        for label in [
+            "1-2",
+            "章节目标",
+            "本章必须推进",
+            "主角必须在执事和同门盯梢下完成试探",
+        ] {
+            assert!(
+                !is_valid_story_thread_term(label),
+                "{label} should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -3670,7 +4067,7 @@ mod tests {
     }
 
     #[test]
-    fn review_suggestion_without_verifiable_evidence_is_downgraded() {
+    fn review_issue_without_verifiable_evidence_is_discarded() {
         let issues = constrain_review_issues(
             vec![ReviewIssue {
                 issue_type: "钩子不足".to_string(),
@@ -3684,8 +4081,7 @@ mod tests {
             "当前稿只有既有内容。",
         );
 
-        assert!(issues[0].suggestion.contains("人工补充"));
-        assert!(issues[0].evidence_quote.is_empty());
+        assert!(issues.is_empty());
     }
 
     #[test]
@@ -3709,6 +4105,117 @@ mod tests {
         assert!(!evidence_quote_is_verifiable(
             &"甲".repeat(81),
             &"甲".repeat(81)
+        ));
+    }
+
+    #[test]
+    fn review_keeps_finding_but_quarantines_unbound_repair() {
+        let issues = constrain_review_issues(
+            vec![ReviewIssue {
+                issue_type: "威胁断线".to_string(),
+                severity: "moderate".to_string(),
+                location: "探索中段".to_string(),
+                reason: "已建立的监视压力在中段消失。".to_string(),
+                suggestion: "加入一支火把和执夜弟子，让监视重新出现。".to_string(),
+                evidence_quote: "赵执事盯着他看了一会儿，没动，也没说话".to_string(),
+                action_evidence_quote: "他没有走谷口正路，而是绕到草棚后面".to_string(),
+            }],
+            "赵执事盯着他看了一会儿，没动，也没说话。他没有走谷口正路，而是绕到草棚后面。",
+        );
+
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].suggestion.contains("已拦截"));
+        assert!(issues[0].action_evidence_quote.is_empty());
+    }
+
+    #[test]
+    fn review_quarantines_substitution_that_invents_a_new_clue() {
+        let issues = constrain_review_issues(
+            vec![ReviewIssue {
+                issue_type: "线索重复".to_string(),
+                severity: "moderate".to_string(),
+                location: "铜门".to_string(),
+                reason: "同一结论第三次确认。".to_string(),
+                suggestion: "删除重复名字，铜门上的刻字可以是另一个失踪者姓名或新编号。"
+                    .to_string(),
+                evidence_quote: "铜门背面又刻着赵吞赤髓四个字".to_string(),
+                action_evidence_quote: "".to_string(),
+            }],
+            "铜门背面又刻着赵吞赤髓四个字。前文已经两次确认相同结论。",
+        );
+
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].suggestion.contains("已拦截"));
+    }
+
+    #[test]
+    fn review_issue_allows_empty_action_evidence_for_deletion_or_reordering() {
+        let issues = constrain_review_issues(
+            vec![ReviewIssue {
+                issue_type: "信息重复".to_string(),
+                severity: "moderate".to_string(),
+                location: "中段".to_string(),
+                reason: "同一判断被重复解释。".to_string(),
+                suggestion: "保留第一处解释，删去后面的重复说明。".to_string(),
+                evidence_quote: "他已经看见柜门上的血字".to_string(),
+                action_evidence_quote: "".to_string(),
+            }],
+            "他已经看见柜门上的血字，随后又把同一行血字逐字解释了一遍。",
+        );
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].suggestion, "保留第一处解释，删去后面的重复说明。");
+        assert!(issues[0].action_evidence_quote.is_empty());
+    }
+
+    #[test]
+    fn hard_state_findings_come_from_the_app_ledger() {
+        let model_issue = ReviewIssue {
+            issue_type: "物件状态断点".to_string(),
+            severity: "major".to_string(),
+            location: "青瓷瓶".to_string(),
+            reason: "模型误判半瓶与剩下半瓶冲突。".to_string(),
+            suggestion: "改写数量。".to_string(),
+            evidence_quote: "青瓷瓶里还剩下半瓶赤髓原浆".to_string(),
+            action_evidence_quote: "陆烬把剩下半瓶原浆封好".to_string(),
+        };
+        assert!(model_issue_duplicates_ledger_check(&model_issue));
+
+        let empty_report = crate::models::LedgerContinuityReport {
+            project_id: 1,
+            artifact_id: 2,
+            summary: "未发现冲突".to_string(),
+            issues: Vec::new(),
+        };
+        assert!(ledger_review_issues(Some(&empty_report)).is_empty());
+
+        let report = crate::models::LedgerContinuityReport {
+            project_id: 1,
+            artifact_id: 2,
+            summary: "发现冲突".to_string(),
+            issues: vec![crate::models::LedgerContinuityIssue {
+                severity: "major".to_string(),
+                entity_label: "裂纹玉牌".to_string(),
+                entity_kind: "item".to_string(),
+                state_kind: "availability".to_string(),
+                candidate_quote: "他再次催动早已碎掉的裂纹玉牌".to_string(),
+                source_chapter: "第 3 章".to_string(),
+                source_quote: "裂纹玉牌在掌心彻底碎成粉末".to_string(),
+                reason: "已毁物件被直接使用".to_string(),
+                suggestion: "删除使用动作，或使用正文已经存在的替代物。".to_string(),
+            }],
+        };
+        let issues = ledger_review_issues(Some(&report));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].issue_type, "状态账本冲突/availability");
+        assert!(issues[0].reason.contains("第 3 章"));
+    }
+
+    #[test]
+    fn review_evidence_normalizes_common_quote_punctuation() {
+        assert!(evidence_quote_is_verifiable(
+            "“柜门上的血字：不要回头。”",
+            "柜门上的血字：不要回头。",
         ));
     }
 
@@ -3827,7 +4334,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_prompt_includes_chapter_beat_plan() {
+    fn draft_prompt_includes_flexible_chapter_contract() {
         let temp = NamedTempFile::new().unwrap();
         let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
         let project = state
@@ -3844,7 +4351,6 @@ mod tests {
                 id: chapter.id,
                 title: "第 1 章 雨夜收尸人".to_string(),
                 status: chapter.status,
-                current_artifact_id: chapter.current_artifact_id,
             })
             .unwrap();
 
@@ -3897,16 +4403,241 @@ mod tests {
             Some(chapter.id),
             Some("开篇要更快进入异常"),
             None,
+            None,
         )
         .unwrap();
 
-        assert!(prompt.contains("# 本章节拍计划"));
+        assert!(prompt.contains("# 本章柔性任务契约"));
         assert!(prompt.contains("- 章节模式："));
-        assert!(prompt.contains("1. 开场驱动力："));
-        assert!(prompt.contains("2. 第一推进："));
-        assert!(prompt.contains("3. 中段发现："));
-        assert!(prompt.contains("4. 代价转折："));
-        assert!(prompt.contains("5. 章末钩子："));
+        assert!(prompt.contains("- 进入状态："));
+        assert!(prompt.contains("- 本章目标："));
+        assert!(prompt.contains("- 必须发生的变化："));
+        assert!(prompt.contains("- 结尾功能："));
+        assert!(prompt.contains("- 离开状态 / 下一章新条件："));
+        assert!(!prompt.contains("3. 中段发现："));
+        assert!(!prompt.contains("4. 代价转折："));
+
+        let candidate = state
+            .insert_artifact(
+                project.id,
+                Some(chapter.id),
+                "draft",
+                "候选稿",
+                "陈渡推开停尸间的门，雨水顺着袖口滴进地面。07号柜忽然响了一声。",
+                None,
+            )
+            .unwrap();
+        let review_prompt = build_prompt(
+            &state,
+            project.id,
+            &Stage::Review,
+            Some(chapter.id),
+            None,
+            Some(&candidate),
+            None,
+        )
+        .unwrap();
+
+        assert!(review_prompt.contains("# 章节任务兑现审校"));
+        assert!(review_prompt.contains("章节任务未兑现"));
+        assert!(review_prompt.contains("允许同义表达、等效行动"));
+        assert!(review_prompt.contains("# 本章任务卡"));
+        assert!(review_prompt.contains("核心冲突：主角想按流程收尸"));
+    }
+
+    #[test]
+    fn base_chapter_modes_are_not_bound_to_xianxia_terms() {
+        let mode = infer_chapter_mode(
+            "第 8 章 修复录音",
+            "修复损坏录音，确认死者留下的时间线",
+            "主角必须在证物被销毁前完成处理",
+            "录音里出现一段陌生的求救声",
+            None,
+        );
+
+        assert!(mode.starts_with("资源技艺章"));
+        assert!(!mode.contains("炼药"));
+        assert!(!mode.contains("修仙"));
+    }
+
+    #[test]
+    fn ending_function_changes_with_chapter_mode_without_forcing_danger() {
+        let growth = ending_function_for_mode("成长准备章：修炼与恢复");
+        let relationship = ending_function_for_mode("关系谈判章：交换筹码");
+        let transition = ending_function_for_mode("过渡布局章：调整路线");
+
+        assert!(growth.contains("不必追加突发敌人"));
+        assert!(relationship.contains("关系新平衡"));
+        assert!(transition.contains("情绪余韵型"));
+        assert!(transition.contains("不要求制造危险"));
+    }
+
+    #[test]
+    fn recent_chapter_context_uses_only_the_two_latest_chapters() {
+        let temp = NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "上下文实验".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 120000,
+                premise: "验证近章上下文层级。".to_string(),
+            })
+            .unwrap();
+        let chapter_one = state.list_chapters(project.id).unwrap().remove(0);
+        let chapter_two = state
+            .create_chapter(NewChapter {
+                project_id: project.id,
+                title: Some("第二章".to_string()),
+            })
+            .unwrap();
+        let chapter_three = state
+            .create_chapter(NewChapter {
+                project_id: project.id,
+                title: Some("第三章".to_string()),
+            })
+            .unwrap();
+        let chapter_four = state
+            .create_chapter(NewChapter {
+                project_id: project.id,
+                title: Some("第四章".to_string()),
+            })
+            .unwrap();
+
+        for (chapter, body) in [
+            (&chapter_one, "第一章原文事实。"),
+            (&chapter_two, "第二章原文事实。"),
+            (&chapter_three, "第三章原文事实。"),
+        ] {
+            let artifact = state
+                .insert_artifact(
+                    project.id,
+                    Some(chapter.id),
+                    "draft",
+                    "章节草稿",
+                    body,
+                    None,
+                )
+                .unwrap();
+            state
+                .approve_stage(project.id, "draft", artifact.id, "通过")
+                .unwrap();
+        }
+
+        let mut compact = String::new();
+        append_recent_chapter_context(&state, project.id, chapter_four.id, &mut compact).unwrap();
+        assert!(compact.contains("最近已通过章节上下文"));
+        assert!(compact.contains("第三章原文事实"));
+        assert!(compact.contains("第二章原文事实"));
+        assert!(!compact.contains("第一章原文事实"));
+    }
+
+    #[test]
+    fn outline_prompt_reads_locked_written_progress_from_the_database() {
+        let temp = NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "进度边界实验".to_string(),
+                genre: "男频修仙".to_string(),
+                target_words: 200_000,
+                premise: "只能从未完成章节继续规划。".to_string(),
+            })
+            .unwrap();
+        let chapter_one = state.list_chapters(project.id).unwrap().remove(0);
+        let chapter_two = state
+            .create_chapter(NewChapter {
+                project_id: project.id,
+                title: Some("第二章 已写".to_string()),
+            })
+            .unwrap();
+        let chapter_three = state
+            .create_chapter(NewChapter {
+                project_id: project.id,
+                title: Some("第三章 待写".to_string()),
+            })
+            .unwrap();
+        let setting = state
+            .insert_artifact(
+                project.id,
+                None,
+                "setting",
+                "设定",
+                "山门以灵砂控制杂役。",
+                None,
+            )
+            .unwrap();
+        state
+            .approve_stage(project.id, "setting", setting.id, "通过")
+            .unwrap();
+
+        for (chapter, body) in [
+            (
+                &chapter_one,
+                "第一章开场事实。主角拿到黑牌。第一章结尾事实。",
+            ),
+            (
+                &chapter_two,
+                "第二章开场事实。主角确认药效。第二章结尾事实。",
+            ),
+        ] {
+            let artifact = state
+                .insert_artifact(
+                    project.id,
+                    Some(chapter.id),
+                    "draft",
+                    "正式正文候选",
+                    body,
+                    None,
+                )
+                .unwrap();
+            state
+                .approve_stage(project.id, "draft", artifact.id, "通过")
+                .unwrap();
+        }
+        state
+            .insert_artifact(
+                project.id,
+                Some(chapter_three.id),
+                "draft",
+                "未批准候选",
+                "未批准候选绝不能进入故事架构上下文。",
+                None,
+            )
+            .unwrap();
+
+        let prompt =
+            build_prompt(&state, project.id, &Stage::Outline, None, None, None, None).unwrap();
+
+        assert!(prompt.contains("# 已写正文进度（应用数据库）"));
+        assert!(prompt.contains("已锁定：第 1 章"));
+        assert!(prompt.contains("已锁定：第 2 章 第二章 已写"));
+        assert!(prompt.contains("第一章开场事实"));
+        assert!(prompt.contains("第二章结尾事实"));
+        assert!(prompt.contains("规划起点：第 3 章 第三章 待写"));
+        assert!(prompt.contains("详细章节生产卡必须从第 3 章开始"));
+        assert!(prompt.contains("不得为这些章节重新生成章节模式、目标、阻力"));
+        assert!(!prompt.contains("再写前 12 章待写列表"));
+        assert!(!prompt.contains("未批准候选绝不能进入故事架构上下文"));
+    }
+
+    #[test]
+    fn outline_task_uses_initial_twelve_chapter_mode_only_before_writing_starts() {
+        let temp = NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "初始大纲实验".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 120_000,
+                premise: "尚无正式正文。".to_string(),
+            })
+            .unwrap();
+
+        let task = outline_task_for_prompt(&state, project.id).unwrap();
+
+        assert!(task.contains("再写前 12 章待写列表"));
+        assert!(!task.contains("已写进度摘要"));
     }
 
     #[test]
@@ -3970,6 +4701,7 @@ mod tests {
             project.id,
             &Stage::Draft,
             Some(chapter.id),
+            None,
             None,
             None,
         )
@@ -4066,7 +4798,6 @@ mod tests {
                 id: chapter.id,
                 title: "第 1 章 雨夜收尸人".to_string(),
                 status: chapter.status,
-                current_artifact_id: chapter.current_artifact_id,
             })
             .unwrap();
 

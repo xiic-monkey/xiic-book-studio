@@ -9,3 +9,9 @@ src-tauri/target
 .env
 .DS_Store
 npm-debug.log*
+
+# Large local-search resources are fetched and checksum-verified by
+# `npm run prepare:local-search` (also invoked by the release workflow).
+src-tauri/resources/models/*
+!src-tauri/resources/models/.gitkeep
+src-tauri/resources/sqlite-vec/vec0.dylib

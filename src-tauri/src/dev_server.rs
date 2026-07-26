@@ -12,18 +12,22 @@ use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    ai,
+    adoption, ai, chapter_memory, continuity_ledger,
     db::AppState,
     error::{AppError, AppResult},
     gate,
     models::{
         AiSpanRevisionRequest, ChapterGateRequest, ChapterSplitPlanRequest,
-        ClearChapterHistoryRequest, ContinuityReviewRequest, DeleteArtifactRequest,
-        ListModelsInput, RevisionRequest, RunAgentRequest, SaveAiSettings, SaveForeshadowing,
-        SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest, StoryContextSearchInput,
-        TestAiConnectionInput,
+        ClearChapterHistoryRequest, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
+        ContinuityReviewRequest, DecideAdoptionProposalsRequest, DeleteArtifactRequest,
+        LedgerContinuityCheckRequest, ListAdoptionProposalsRequest, ListModelsInput,
+        PrepareArtifactAdoptionsRequest, RebuildChapterMemoryRequest, RebuildStoryIndexRequest,
+        RebuildStorySearchIndexRequest, RetryIndexJobsRequest, RevisionRequest, RunAgentRequest,
+        RunStoryArchitectRequest, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
+        SaveWritingSkill, SpanReplacementRequest, StoryBibleReviewRequest, StoryContextSearchInput,
+        TestAiConnectionInput, UpdateAdoptionProposalRequest,
     },
-    quality, workflow,
+    quality, story_architecture, story_index, story_search, workflow,
 };
 
 #[derive(Clone)]
@@ -58,10 +62,9 @@ pub async fn run() -> AppResult<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let state = DevServerState {
-        app: AppState::from_path(db_path.clone())?,
-        db_path,
-    };
+    let app = AppState::from_path(db_path.clone())?;
+    app.start_index_worker();
+    let state = DevServerState { app, db_path };
 
     let port = env::var("BOOK_STUDIO_DEV_API_PORT")
         .ok()
@@ -145,9 +148,11 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
             app.delete_chapter(project_id, chapter_id)?;
             Ok(Value::Null)
         }
-        "update_chapter" => Ok(serde_json::to_value(
-            app.update_chapter(read_required(&payload, "input")?)?,
-        )?),
+        "update_chapter" => {
+            let chapter = app.update_chapter(read_required(&payload, "input")?)?;
+            story_search::refresh_chapter_metadata(app, chapter.project_id, chapter.id)?;
+            Ok(serde_json::to_value(chapter)?)
+        }
         "get_project" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             Ok(serde_json::to_value(app.get_detail(project_id)?)?)
@@ -164,11 +169,48 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
         }
         "save_knowledge_card" => {
             let input: SaveKnowledgeCard = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.save_knowledge_card(input)?)?)
+            let card = app.save_knowledge_card(input)?;
+            let _ = story_search::refresh_knowledge_card(app, card.project_id, card.id).await;
+            Ok(serde_json::to_value(card)?)
         }
         "save_foreshadowing" => {
             let input: SaveForeshadowing = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.save_foreshadowing(input)?)?)
+            let item = app.save_foreshadowing(input)?;
+            let _ = story_search::refresh_foreshadowing(app, item.project_id, item.id).await;
+            Ok(serde_json::to_value(item)?)
+        }
+        "prepare_artifact_adoptions" => {
+            let input: PrepareArtifactAdoptionsRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                adoption::prepare_artifact_adoptions(app, input.project_id, input.artifact_id)
+                    .await?,
+            )?)
+        }
+        "list_adoption_proposals" => {
+            let input: ListAdoptionProposalsRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(adoption::list_adoption_proposals(
+                app,
+                input.project_id,
+                input.artifact_id,
+            )?)?)
+        }
+        "update_adoption_proposal" => {
+            let input: UpdateAdoptionProposalRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(adoption::update_adoption_proposal(
+                app, input,
+            )?)?)
+        }
+        "apply_adoption_proposals" => {
+            let input: DecideAdoptionProposalsRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(adoption::apply_adoption_proposals(
+                app, input,
+            )?)?)
+        }
+        "reject_adoption_proposals" => {
+            let input: DecideAdoptionProposalsRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(adoption::reject_adoption_proposals(
+                app, input,
+            )?)?)
         }
         "test_ai_connection" => {
             let input: Option<TestAiConnectionInput> = read_optional(&payload, "input")?;
@@ -185,17 +227,103 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
                 workflow::run_agent_step(app, input).await?,
             )?)
         }
+        "rebuild_chapter_memory" => {
+            let input: RebuildChapterMemoryRequest = read_required(&payload, "input")?;
+            let settings = app.get_ai_settings()?;
+            let api_key = app
+                .get_api_key_for_base_url(&settings.base_url)?
+                .ok_or_else(|| {
+                    AppError::Validation("请先在设置里为当前供应商保存 AI API Key".to_string())
+                })?;
+            Ok(serde_json::to_value(
+                chapter_memory::rebuild_chapter_memory(
+                    app,
+                    input.project_id,
+                    input.chapter_id,
+                    &settings,
+                    &api_key,
+                    None,
+                )
+                .await?,
+            )?)
+        }
+        "run_story_architect" => {
+            let input: RunStoryArchitectRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                story_architecture::run_story_architect(app, input).await?,
+            )?)
+        }
+        "create_targeted_rework" => {
+            let input: RunStoryArchitectRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                story_architecture::create_targeted_rework(app, input).await?,
+            )?)
+        }
+        "confirm_story_bible" => {
+            let input: ConfirmStoryBibleRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                story_architecture::confirm_story_bible(app, input)?,
+            )?)
+        }
+        "review_story_bible" => {
+            let input: StoryBibleReviewRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                story_architecture::review_story_bible(app, input).await?,
+            )?)
+        }
+        "confirm_story_bible_review" => {
+            let input: ConfirmStoryBibleReviewRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                story_architecture::confirm_story_bible_review(app, input)?,
+            )?)
+        }
+        "list_story_arcs" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
+            Ok(serde_json::to_value(app.list_story_arcs(project_id)?)?)
+        }
+        "preview_agent_context" => {
+            let input: RunAgentRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(workflow::preview_agent_context(
+                app, input,
+            )?)?)
+        }
         "approve_stage" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             let stage = read_string(&payload, &["stage"])?;
             let artifact_id = read_i64(&payload, &["artifactId", "artifact_id"])?;
             let note = read_optional_string(&payload, &["note"])?;
-            Ok(serde_json::to_value(app.approve_stage(
+            let approval = app.approve_stage(
                 project_id,
                 &stage,
                 artifact_id,
                 note.as_deref().unwrap_or(""),
+            )?;
+            app.wake_index_worker();
+            Ok(serde_json::to_value(approval)?)
+        }
+        "retry_index_jobs" => {
+            let input: RetryIndexJobsRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(crate::index_jobs::retry_index_jobs(
+                app, input,
             )?)?)
+        }
+        "rebuild_story_index" => {
+            let input: RebuildStoryIndexRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                story_index::rebuild_story_index(app, input).await?,
+            )?)
+        }
+        "rebuild_story_search_index" => {
+            let input: RebuildStorySearchIndexRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                story_search::rebuild_story_search_index(app, input).await?,
+            )?)
+        }
+        "get_story_search_status" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
+            Ok(serde_json::to_value(
+                story_search::get_story_search_status(app, project_id)?,
+            )?)
         }
         "request_revision" => {
             let input: RevisionRequest = read_required(&payload, "input")?;
@@ -250,6 +378,12 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
             let input: ContinuityReviewRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
                 workflow::review_project_continuity(app, input).await?,
+            )?)
+        }
+        "check_artifact_ledger_continuity" => {
+            let input: LedgerContinuityCheckRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                continuity_ledger::check_artifact_continuity(app, input).await?,
             )?)
         }
         "analyze_chapter_gate" => {
@@ -407,11 +541,11 @@ fn resolve_dev_db_path() -> AppResult<PathBuf> {
         let home = env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| AppError::Validation("cannot resolve HOME for dev api".to_string()))?;
-        return Ok(home
+        Ok(home
             .join("Library")
             .join("Application Support")
             .join("com.xiic.book-studio")
-            .join("book-studio.sqlite3"));
+            .join("book-studio.sqlite3"))
     }
 
     #[cfg(not(target_os = "macos"))]

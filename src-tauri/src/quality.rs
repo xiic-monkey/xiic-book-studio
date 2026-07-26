@@ -36,7 +36,7 @@ pub fn analyze_artifact(artifact: &Artifact) -> QualityReport {
         reveal_overload_count as f64 / (char_count as f64 / 1000.0).max(1.0)
     };
     let opening_momentum = has_opening_momentum(text);
-    let ending_hook = has_ending_hook(text);
+    let ending_progression = has_ending_progression(text);
     let sensory_detail_score = sensory_detail_score(text);
     let professional_detail_score = professional_detail_score(text);
     let has_markdown_title = text
@@ -51,8 +51,8 @@ pub fn analyze_artifact(artifact: &Artifact) -> QualityReport {
     let mut warnings = Vec::new();
 
     if is_body {
-        let narrative_loses_focus = (long_paragraph_count >= 3 && explanation_marker_count >= 3)
-            || (repeated_simile_count >= 3 && explanation_marker_count >= 3)
+        let narrative_loses_focus = (long_paragraph_count >= 3 || repeated_simile_count >= 3)
+            && explanation_marker_count >= 3
             || (reveal_overload_count >= 7 && reveal_density >= 2.8);
         if narrative_loses_focus {
             score -= 8;
@@ -83,15 +83,15 @@ pub fn analyze_artifact(artifact: &Artifact) -> QualityReport {
             score += 5;
         }
 
-        if !ending_hook {
-            score -= 12;
+        if !ending_progression {
+            score -= 6;
             warnings.push(warning(
-                "章末钩子偏弱",
-                "结尾缺少疑问、反转、威胁、发现或明确的下一步追读动力。",
-                "让结尾形成一个具体新问题，而不是只做情绪收束。",
+                "结尾功能不清",
+                "结尾没有清楚落下本章结果、决定、信息变化、关系变化、行动启动或仍在生效的压力。",
+                "按本章模式落稳已经发生的变化；可以安静收束，不需要另加危险或反转。",
             ));
         } else {
-            score += 5;
+            score += 3;
         }
 
         if dialogue_density < 0.12 && paragraph_count >= 8 {
@@ -255,8 +255,8 @@ pub fn analyze_artifact(artifact: &Artifact) -> QualityReport {
                 Some(1.0),
             ),
             metric(
-                "章末钩子",
-                if ending_hook { 1.0 } else { 0.0 },
+                "结尾功能",
+                if ending_progression { 1.0 } else { 0.0 },
                 "bool",
                 Some(1.0),
             ),
@@ -345,7 +345,7 @@ fn count_reveal_overload_signals(text: &str) -> usize {
 }
 
 fn split_sentences(text: &str) -> Vec<&str> {
-    text.split(|ch| matches!(ch, '\n' | '。' | '！' | '？' | '!' | '?'))
+    text.split(['\n', '。', '！', '？', '!', '?'])
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .collect()
@@ -474,7 +474,7 @@ fn has_opening_momentum(text: &str) -> bool {
     ) >= 2
 }
 
-fn has_ending_hook(text: &str) -> bool {
+fn has_ending_progression(text: &str) -> bool {
     let total = text.chars().count();
     let ending: String = text.chars().skip(total.saturating_sub(260)).collect();
     ending.contains('？')
@@ -529,6 +529,33 @@ fn has_ending_hook(text: &str) -> bool {
                 "内门",
                 "铜镜",
                 "令牌",
+                "完成",
+                "成功",
+                "炼成",
+                "练成",
+                "稳住",
+                "恢复",
+                "突破",
+                "拿到",
+                "换到",
+                "保住",
+                "失去",
+                "付出",
+                "欠下",
+                "决定",
+                "选择",
+                "答应",
+                "拒绝",
+                "承诺",
+                "约定",
+                "条件",
+                "交易",
+                "人情",
+                "转身",
+                "收起",
+                "放下",
+                "握紧",
+                "点头",
             ],
         ) >= 2
 }
@@ -641,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn rewards_pressure_and_hook_signals() {
+    fn rewards_pressure_and_progression_signals() {
         let report = analyze_artifact(&artifact(
             "暴雨砸在殡仪馆铁门上，尸袋里的无名男人突然敲了一下冷柜。\n“别烧我。”\n林远的手套还沾着消毒水味，登记表上的编号却自己变成了红色。\n门外警笛逼近，监控屏幕同时黑了。\n最后一格画面里，尸体睁开眼，看向他身后：门外还有一个声音在说，名单上第一个就是林远？",
         ));
@@ -651,6 +678,22 @@ mod tests {
             .metrics
             .iter()
             .any(|metric| metric.label == "开篇驱动力" && metric.value == 1.0));
+    }
+
+    #[test]
+    fn accepts_quiet_growth_ending_without_danger_hook() {
+        let report = analyze_artifact(&artifact(
+            "天亮前，陆烬把最后一枚下品灵石压进炉脚，照着昨夜记下的火候重新运转控火诀。\n经脉的刺痛逼得他三次停手，他便把每次失控的位置刻在竹片上，再从最短的一段重新练起。\n第四次，炉中药液终于不再翻沸。陆烬稳住气息，把这一轮灵力完整送过右臂，先前始终断开的半式终于练成。\n他没有继续贪功，只把剩下的药液封好，收起竹片，决定午后先去换一份更耐火的辅材。",
+        ));
+
+        assert!(report
+            .metrics
+            .iter()
+            .any(|metric| metric.label == "结尾功能" && metric.value == 1.0));
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|warning| warning.title == "结尾功能不清"));
     }
 
     #[test]

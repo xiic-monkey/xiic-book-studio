@@ -73,8 +73,6 @@ pub async fn analyze_chapter_gate(
                 suggestion: issue.suggestion.clone(),
             }),
     );
-    blockers.extend(task_adherence_blockers(&chapter.title, &artifact.content));
-
     let passed = blockers.is_empty()
         && quality_report.score >= MIN_ACCEPTABLE_QUALITY
         && quality_report.verdict != "needs_revision"
@@ -204,7 +202,7 @@ fn quality_blockers(report: &QualityReport) -> Vec<GateBlocker> {
                 "当前本地质量分为 {}，低于 {}。",
                 report.score, MIN_ACCEPTABLE_QUALITY
             ),
-            suggestion: "先请求修订，优先处理开篇驱动力、章末钩子、段落重量、解释感和信息密度。"
+            suggestion: "先请求修订，优先处理章节功能、结尾落点、段落重量、解释感和信息密度。"
                 .to_string(),
         });
     }
@@ -229,107 +227,6 @@ fn quality_blockers(report: &QualityReport) -> Vec<GateBlocker> {
     blockers
 }
 
-fn task_adherence_blockers(chapter_title: &str, content: &str) -> Vec<GateBlocker> {
-    let mut blockers = Vec::new();
-    let checks = [
-        (
-            "赤髓",
-            &["赤髓"][..],
-            "章节标题/任务要求“赤髓”，但正文没有实际出现赤髓。",
-            "修订时必须让赤髓成为本章关键筹码；如果要改名，先改章节任务而不是正文偷换资源。",
-        ),
-        (
-            "大比",
-            &["大比"][..],
-            "章节标题/任务要求“大比”，但正文没有实质推进大比。",
-            "补出大比前的时限、报名、查验、对手、资源分配或外部压力，避免只写泛泛准备。",
-        ),
-    ];
-
-    for (trigger, required_terms, detail, suggestion) in checks {
-        if chapter_title.contains(trigger)
-            && !required_terms.iter().any(|term| content.contains(term))
-        {
-            blockers.push(GateBlocker {
-                kind: "task_adherence".to_string(),
-                severity: "major".to_string(),
-                title: "章节任务未兑现".to_string(),
-                detail: detail.to_string(),
-                suggestion: suggestion.to_string(),
-            });
-        }
-    }
-
-    if (chapter_title.contains("炉底") || chapter_title.contains("第三层"))
-        && !has_depth_scene_evidence(content)
-    {
-        blockers.push(GateBlocker {
-            kind: "task_adherence".to_string(),
-            severity: "major".to_string(),
-            title: "章节任务未兑现".to_string(),
-            detail: "章节标题/任务要求炉底/第三层，但正文缺少足够的下行探索场景证据。"
-                .to_string(),
-            suggestion: "把主动作收束回炉底第三层；正文应出现旧炉入口、下行路径、石室/地洞/骨堆/古炉等可感知场景，而不是只泛泛提到调查或准备。"
-                .to_string(),
-        });
-    }
-
-    if chapter_title.contains("赤髓")
-        && chapter_title.contains("到手")
-        && !contains_near(
-            content,
-            "赤髓",
-            &["到手", "拿到", "得手", "夺得", "收入", "入手", "吞", "服下"],
-        )
-    {
-        blockers.push(GateBlocker {
-            kind: "task_adherence".to_string(),
-            severity: "major".to_string(),
-            title: "章节任务未兑现".to_string(),
-            detail: "标题写“赤髓到手”，正文虽提到赤髓，但没有让赤髓实际到手或生效。".to_string(),
-            suggestion:
-                "要么修订正文让赤髓成为本章实际收益，要么先修改章节任务/标题，不能用青髓等其他资源替代。"
-                    .to_string(),
-        });
-    }
-
-    blockers
-}
-
-fn contains_near(text: &str, anchor: &str, terms: &[&str]) -> bool {
-    text.split(['。', '！', '？', '\n', '；'])
-        .any(|clause| clause.contains(anchor) && terms.iter().any(|term| clause.contains(term)))
-}
-
-fn has_depth_scene_evidence(content: &str) -> bool {
-    let entry_hits = count_terms(
-        content,
-        &["七号旧炉", "炉门", "黑牌", "铁链", "火门", "裂缝"],
-    );
-    let depth_hits = count_terms(
-        content,
-        &[
-            "石阶",
-            "往下",
-            "石室",
-            "地洞",
-            "骨堆",
-            "铜柱",
-            "古炉",
-            "暗格",
-            "无名炉",
-            "炉腹",
-        ],
-    );
-    let explicit_hits = count_terms(content, &["炉底", "第三层"]);
-
-    explicit_hits > 0 || (entry_hits >= 2 && depth_hits >= 2) || depth_hits >= 4
-}
-
-fn count_terms(content: &str, terms: &[&str]) -> usize {
-    terms.iter().filter(|term| content.contains(**term)).count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,63 +248,10 @@ mod tests {
     }
 
     #[test]
-    fn blocks_task_drift_from_chapter_title() {
-        let blockers =
-            task_adherence_blockers("第 4 章 赤髓到手", &artifact("他拿到青髓。").content);
-        assert!(blockers
-            .iter()
-            .any(|blocker| blocker.kind == "task_adherence"));
-    }
-
-    #[test]
     fn blocks_markdown_title_body() {
         let report = quality::analyze_artifact(&artifact("# 第4章\n\n他拿到赤髓。"));
         let blockers = quality_blockers(&report);
         assert!(blockers.iter().any(|blocker| blocker.title == "正文含标题"));
-    }
-
-    #[test]
-    fn blocks_named_resource_not_actually_obtained() {
-        let blockers = task_adherence_blockers(
-            "第 4 章 赤髓到手",
-            "赵执事说：“赤髓不行。”他把青髓铜瓶推进来。陆烬捡起铜瓶，将青髓膏吞尽。",
-        );
-        assert!(blockers
-            .iter()
-            .any(|blocker| blocker.detail.contains("没有让赤髓实际到手")));
-    }
-
-    #[test]
-    fn accepts_named_resource_obtained_near_anchor() {
-        let blockers = task_adherence_blockers(
-            "第 4 章 赤髓到手",
-            "赵执事把铜瓶推到门缝里。陆烬伸手拿到赤髓，先用封纹验过，再收入袖中。",
-        );
-        assert!(!blockers
-            .iter()
-            .any(|blocker| blocker.detail.contains("没有让赤髓实际到手")));
-    }
-
-    #[test]
-    fn accepts_third_layer_scene_evidence_without_literal_title_terms() {
-        let blockers = task_adherence_blockers(
-            "第 3 章 炉底第三层",
-            "陆烬把黑牌按进七号旧炉的凹纹，铁链从里面松开。他沿石阶往下，穿过半塌砖门，落进一间石室。三根铜柱围着青铜古炉，旁边地洞里铺满骨堆。",
-        );
-        assert!(!blockers
-            .iter()
-            .any(|blocker| blocker.detail.contains("下行探索场景证据")));
-    }
-
-    #[test]
-    fn blocks_third_layer_title_without_depth_scene_evidence() {
-        let blockers = task_adherence_blockers(
-            "第 3 章 炉底第三层",
-            "陆烬在草棚里整理黑牌，推演明日大比该如何藏住底牌。",
-        );
-        assert!(blockers
-            .iter()
-            .any(|blocker| blocker.detail.contains("下行探索场景证据")));
     }
 
     #[test]

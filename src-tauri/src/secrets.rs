@@ -16,10 +16,8 @@ fn keyring_user_for_scope(scope: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn set_api_key_with_user(user: &str, api_key: &str) -> AppResult<()> {
-    let _ = Command::new("security")
-        .args(["delete-generic-password", "-s", KEYRING_SERVICE, "-a", user])
-        .output();
-
+    // `-U` updates an existing item or creates it. Deleting first can lose the
+    // working credential when Keychain locks between the two commands.
     let output = Command::new("security")
         .args([
             "add-generic-password",

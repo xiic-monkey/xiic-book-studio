@@ -9,6 +9,10 @@
     "dev:visible": "node scripts/dev-visible.mjs",
     "tauri": "tauri",
     "build": "tsc && vite build",
+    "test": "vitest run",
+    "prepare:local-search": "node scripts/prepare-local-search-resources.mjs",
+    "bundle:prepare": "npm run prepare:local-search",
+    "tauri:build": "npm run bundle:prepare && tauri build",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
@@ -24,6 +28,7 @@
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }

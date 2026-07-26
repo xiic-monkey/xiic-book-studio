@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts","./src/components/adoptiondrawer.tsx","./src/components/newprojectmodal.tsx","./src/components/projecteditormodal.tsx","./src/components/settingsview.tsx"],"version":"5.9.3"}
