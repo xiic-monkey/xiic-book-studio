@@ -16,12 +16,9 @@ use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    adoption, ai,
     application::ApplicationGateway,
-    chapter_memory, context_search, continuity_ledger,
     db::AppState,
     error::{AppError, AppResult},
-    gate,
     models::{
         AgentRunRequest, AiSpanRevisionRequest, ChapterGateRequest, ChapterSplitPlanRequest,
         ClearChapterHistoryRequest, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
@@ -35,7 +32,6 @@ use crate::{
         StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextSearchInput,
         TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
     },
-    quality, story_architecture, story_index, story_search, workflow,
 };
 
 #[derive(Clone)]
@@ -78,11 +74,9 @@ pub async fn run() -> AppResult<()> {
     }
     let app = AppState::from_path(db_path.clone())?;
     app.migrate_legacy_api_keys()?;
-    app.start_index_worker();
-    let state = DevServerState {
-        gateway: ApplicationGateway::new(app),
-        db_path,
-    };
+    let gateway = ApplicationGateway::new(app);
+    gateway.start_background_workers();
+    let state = DevServerState { gateway, db_path };
 
     let port = env::var("BOOK_STUDIO_DEV_API_PORT")
         .ok()
@@ -123,8 +117,8 @@ async fn agent_run_events(
     State(state): State<DevServerState>,
     Query(query): Query<RunEventQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(state.gateway.subscribe_run_events()).filter_map(
-        move |message| {
+    let stream =
+        BroadcastStream::new(state.gateway.subscribe_run_events()).filter_map(move |message| {
             let event = message.ok()?;
             if query
                 .project_id
@@ -135,8 +129,7 @@ async fn agent_run_events(
             }
             let data = serde_json::to_string(&event).ok()?;
             Some(Ok(Event::default().event("run_event").data(data)))
-        },
-    );
+        });
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -174,33 +167,34 @@ async fn dispatch_command(
     command: &str,
     payload: Value,
 ) -> AppResult<Value> {
-    let app = gateway.legacy_state();
     match command {
-        "list_projects" => Ok(serde_json::to_value(app.list_projects()?)?),
+        "list_projects" => Ok(serde_json::to_value(gateway.list_projects()?)?),
         "create_project" => Ok(serde_json::to_value(
-            app.create_project(read_required(&payload, "input")?)?,
+            gateway.create_project(read_required(&payload, "input")?)?,
         )?),
         "update_project" => Ok(serde_json::to_value(
-            app.update_project(read_required(&payload, "input")?)?,
+            gateway.update_project(read_required(&payload, "input")?)?,
         )?),
         "delete_project" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
-            app.delete_project(project_id)?;
+            gateway.delete_project(project_id)?;
             Ok(Value::Null)
         }
         "import_reference_text" => {
             let input: ImportReferenceTextRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.import_reference_text(input)?)?)
+            Ok(serde_json::to_value(gateway.import_reference_text(input)?)?)
         }
         "list_reference_materials" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             Ok(serde_json::to_value(
-                app.list_reference_materials(project_id)?,
+                gateway.list_reference_materials(project_id)?,
             )?)
         }
         "update_reference_material" => {
             let input: UpdateReferenceMaterialRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.update_reference_material(input)?)?)
+            Ok(serde_json::to_value(
+                gateway.update_reference_material(input)?,
+            )?)
         }
         "remove_reference_material" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
@@ -209,324 +203,259 @@ async fn dispatch_command(
                 .or_else(|| payload.get("reference_id"))
                 .and_then(Value::as_u64)
                 .ok_or_else(|| AppError::Validation("missing reference id".to_string()))?;
-            app.remove_reference_material(project_id, reference_id)?;
+            gateway.remove_reference_material(project_id, reference_id)?;
             Ok(Value::Null)
         }
         "create_chapter" => Ok(serde_json::to_value(
-            app.create_chapter(read_required(&payload, "input")?)?,
+            gateway.create_chapter(read_required(&payload, "input")?)?,
         )?),
         "delete_chapter" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             let chapter_id = read_i64(&payload, &["chapterId", "chapter_id"])?;
-            app.delete_chapter(project_id, chapter_id)?;
+            gateway.delete_chapter(project_id, chapter_id)?;
             Ok(Value::Null)
         }
-        "update_chapter" => {
-            let chapter = app.update_chapter(read_required(&payload, "input")?)?;
-            if let Err(error) =
-                story_search::refresh_chapter_metadata(app, chapter.project_id, chapter.id)
-            {
-                eprintln!("chapter search metadata refresh unavailable; queueing project rebuild: {error}");
-                if let Err(queue_error) =
-                    crate::index_jobs::enqueue_project_search_job(app, chapter.project_id)
-                {
-                    eprintln!("unable to queue chapter search rebuild: {queue_error}");
-                }
-            }
-            Ok(serde_json::to_value(chapter)?)
-        }
+        "update_chapter" => Ok(serde_json::to_value(
+            gateway.update_chapter(read_required(&payload, "input")?)?,
+        )?),
         "get_project" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
-            Ok(serde_json::to_value(app.get_detail(project_id)?)?)
+            Ok(serde_json::to_value(
+                gateway.get_project_detail(project_id)?,
+            )?)
         }
-        "get_settings" => Ok(serde_json::to_value(app.get_ai_settings()?)?),
+        "get_settings" => Ok(serde_json::to_value(gateway.get_settings()?)?),
         "save_ai_settings" => {
             let input: SaveAiSettings = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.save_ai_settings(input)?)?)
+            Ok(serde_json::to_value(gateway.save_ai_settings(input)?)?)
         }
-        "list_ai_providers" => Ok(serde_json::to_value(app.list_ai_providers()?)?),
+        "list_ai_providers" => Ok(serde_json::to_value(gateway.list_ai_providers()?)?),
         "save_ai_provider" => {
             let input: SaveAiProvider = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.save_ai_provider(input)?)?)
+            Ok(serde_json::to_value(gateway.save_ai_provider(input)?)?)
         }
         "delete_ai_provider" => {
             let provider_id = read_i64(&payload, &["providerId", "provider_id"])?;
-            app.delete_ai_provider(provider_id)?;
+            gateway.delete_ai_provider(provider_id)?;
             Ok(Value::Null)
         }
-        "list_agents" => Ok(serde_json::to_value(app.list_agents()?)?),
-        "list_agent_tools" => Ok(serde_json::to_value(crate::agent_tools::definitions())?),
+        "list_agents" => Ok(serde_json::to_value(gateway.list_agents()?)?),
+        "list_agent_tools" => Ok(serde_json::to_value(gateway.list_agent_tools())?),
         "save_agent_settings" => {
             let input: SaveAgentSettings = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.save_agent_settings(input)?)?)
+            Ok(serde_json::to_value(gateway.save_agent_settings(input)?)?)
         }
         "reset_agent_prompt" => {
             let agent_id = read_i64(&payload, &["agentId", "agent_id"])?;
             Ok(serde_json::to_value(gateway.reset_agent_prompt(agent_id)?)?)
         }
-        "list_writing_skills" => Ok(serde_json::to_value(app.list_writing_skills()?)?),
+        "list_writing_skills" => Ok(serde_json::to_value(gateway.list_writing_skills()?)?),
         "save_writing_skill" => {
             let input: SaveWritingSkill = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.save_writing_skill(input)?)?)
+            Ok(serde_json::to_value(gateway.save_writing_skill(input)?)?)
         }
         "save_knowledge_card" => {
             let input: SaveKnowledgeCard = read_required(&payload, "input")?;
-            let card = app.save_knowledge_card(input)?;
-            if let Err(error) = crate::index_jobs::enqueue_project_search_job(app, card.project_id)
-            {
-                eprintln!(
-                    "knowledge card search refresh unavailable; queueing project rebuild: {error}"
-                );
-            }
-            Ok(serde_json::to_value(card)?)
+            Ok(serde_json::to_value(gateway.save_knowledge_card(input)?)?)
         }
         "save_foreshadowing" => {
             let input: SaveForeshadowing = read_required(&payload, "input")?;
-            let item = app.save_foreshadowing(input)?;
-            if let Err(error) = crate::index_jobs::enqueue_project_search_job(app, item.project_id)
-            {
-                eprintln!(
-                    "foreshadowing search refresh unavailable; queueing project rebuild: {error}"
-                );
-            }
-            Ok(serde_json::to_value(item)?)
+            Ok(serde_json::to_value(gateway.save_foreshadowing(input)?)?)
         }
         "prepare_artifact_adoptions" => {
             let input: PrepareArtifactAdoptionsRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                adoption::prepare_artifact_adoptions(app, input.project_id, input.artifact_id)
-                    .await?,
+                gateway.prepare_artifact_adoptions(input).await?,
             )?)
         }
         "list_adoption_proposals" => {
             let input: ListAdoptionProposalsRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(adoption::list_adoption_proposals(
-                app,
-                input.project_id,
-                input.artifact_id,
-            )?)?)
+            Ok(serde_json::to_value(
+                gateway.list_adoption_proposals(input)?,
+            )?)
         }
         "update_adoption_proposal" => {
             let input: UpdateAdoptionProposalRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(adoption::update_adoption_proposal(
-                app, input,
-            )?)?)
+            Ok(serde_json::to_value(
+                gateway.update_adoption_proposal(input)?,
+            )?)
         }
         "apply_adoption_proposals" => {
             let input: DecideAdoptionProposalsRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(adoption::apply_adoption_proposals(
-                app, input,
-            )?)?)
+            Ok(serde_json::to_value(
+                gateway.apply_adoption_proposals(input)?,
+            )?)
         }
         "reject_adoption_proposals" => {
             let input: DecideAdoptionProposalsRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(adoption::reject_adoption_proposals(
-                app, input,
-            )?)?)
+            Ok(serde_json::to_value(
+                gateway.reject_adoption_proposals(input)?,
+            )?)
         }
         "test_ai_connection" => {
             let input: Option<TestAiConnectionInput> = read_optional(&payload, "input")?;
-            let result = test_ai_connection_impl(app, input).await?;
+            let result = gateway.test_ai_connection(input).await?;
             Ok(Value::String(result))
         }
         "list_models" => {
             let input: Option<ListModelsInput> = read_optional(&payload, "input")?;
-            Ok(serde_json::to_value(list_models_impl(app, input).await?)?)
+            Ok(serde_json::to_value(gateway.list_models(input).await?)?)
         }
         "run_agent_step" => {
             let input: RunAgentRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(
-                workflow::run_agent_step(app, input).await?,
-            )?)
+            Ok(serde_json::to_value(gateway.run_agent_step(input).await?)?)
         }
         "rebuild_chapter_memory" => {
             let input: RebuildChapterMemoryRequest = read_required(&payload, "input")?;
-            let settings = app.get_ai_settings_for_agent("chapter_memory")?;
-            let api_key = app
-                .get_api_key_for_base_url(&settings.base_url)?
-                .ok_or_else(|| {
-                    AppError::Validation("请先在设置里为当前供应商保存 AI API Key".to_string())
-                })?;
             Ok(serde_json::to_value(
-                chapter_memory::rebuild_chapter_memory(
-                    app,
-                    input.project_id,
-                    input.chapter_id,
-                    &settings,
-                    &api_key,
-                    None,
-                )
-                .await?,
+                gateway.rebuild_chapter_memory(input).await?,
             )?)
         }
         "run_story_architect" => {
             let input: RunStoryArchitectRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                story_architecture::run_story_architect(app, input).await?,
+                gateway.run_story_architect(input).await?,
             )?)
         }
         "create_targeted_rework" => {
             let input: RunStoryArchitectRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                story_architecture::create_targeted_rework(app, input).await?,
+                gateway.create_targeted_rework(input).await?,
             )?)
         }
         "confirm_story_bible" => {
             let input: ConfirmStoryBibleRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(
-                story_architecture::confirm_story_bible(app, input)?,
-            )?)
+            Ok(serde_json::to_value(gateway.confirm_story_bible(input)?)?)
         }
         "review_story_bible" => {
             let input: StoryBibleReviewRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                story_architecture::review_story_bible(app, input).await?,
+                gateway.review_story_bible(input).await?,
             )?)
         }
         "confirm_story_bible_review" => {
             let input: ConfirmStoryBibleReviewRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                story_architecture::confirm_story_bible_review(app, input)?,
+                gateway.confirm_story_bible_review(input)?,
             )?)
         }
         "list_story_arcs" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
-            Ok(serde_json::to_value(app.list_story_arcs(project_id)?)?)
+            Ok(serde_json::to_value(gateway.list_story_arcs(project_id)?)?)
         }
         "preview_agent_context" => {
             let input: RunAgentRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(workflow::preview_agent_context(
-                app, input,
-            )?)?)
+            Ok(serde_json::to_value(gateway.preview_agent_context(input)?)?)
         }
         "approve_stage" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             let stage = read_string(&payload, &["stage"])?;
             let artifact_id = read_i64(&payload, &["artifactId", "artifact_id"])?;
             let note = read_optional_string(&payload, &["note"])?;
-            let approval = app.approve_stage(
+            Ok(serde_json::to_value(gateway.approve_stage(
                 project_id,
                 &stage,
                 artifact_id,
-                note.as_deref().unwrap_or(""),
-            )?;
-            app.wake_index_worker();
-            Ok(serde_json::to_value(approval)?)
+                note.as_deref(),
+            )?)?)
         }
         "retry_index_jobs" => {
             let input: RetryIndexJobsRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(crate::index_jobs::retry_index_jobs(
-                app, input,
-            )?)?)
+            Ok(serde_json::to_value(gateway.retry_index_jobs(input)?)?)
         }
         "rebuild_story_index" => {
             let input: RebuildStoryIndexRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                story_index::rebuild_story_index(app, input).await?,
+                gateway.rebuild_story_index(input).await?,
             )?)
         }
         "rebuild_story_search_index" => {
             let input: RebuildStorySearchIndexRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                story_search::rebuild_story_search_index(app, input).await?,
+                gateway.rebuild_story_search_index(input).await?,
             )?)
         }
         "get_story_search_status" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             Ok(serde_json::to_value(
-                story_search::get_story_search_status(app, project_id)?,
+                gateway.get_story_search_status(project_id)?,
             )?)
         }
         "request_revision" => {
             let input: RevisionRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                workflow::request_revision(app, input).await?,
+                gateway.request_revision(input).await?,
             )?)
         }
         "replace_artifact_span" => {
             let input: SpanReplacementRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(workflow::replace_artifact_span(
-                app, input,
-            )?)?)
+            Ok(serde_json::to_value(gateway.replace_artifact_span(input)?)?)
         }
         "revise_artifact_span_with_ai" => {
             let input: AiSpanRevisionRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                workflow::revise_artifact_span_with_ai(app, input).await?,
+                gateway.revise_artifact_span_with_ai(input).await?,
             )?)
         }
         "delete_artifact" => {
             let input: DeleteArtifactRequest = read_required(&payload, "input")?;
-            app.delete_artifact(input.project_id, input.artifact_id)?;
+            gateway.delete_artifact(input)?;
             Ok(Value::Null)
         }
         "clear_chapter_history" => {
             let input: ClearChapterHistoryRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(app.clear_chapter_history(
-                input.project_id,
-                input.chapter_id,
-                input.keep_artifact_ids.as_deref().unwrap_or(&[]),
-            )?)?)
+            Ok(serde_json::to_value(gateway.clear_chapter_history(input)?)?)
         }
         "list_artifacts" => Ok(serde_json::to_value(
-            app.list_artifacts(read_required(&payload, "filters")?)?,
+            gateway.list_artifacts(read_required(&payload, "filters")?)?,
         )?),
         "export_project" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             let format = read_string(&payload, &["format"])?;
-            match format.as_str() {
-                "markdown" | "md" => Ok(Value::String(workflow::export_markdown(app, project_id)?)),
-                _ => Err(AppError::Validation(
-                    "第一版只支持 Markdown 导出".to_string(),
-                )),
-            }
+            Ok(Value::String(gateway.export_project(project_id, &format)?))
         }
         "analyze_artifact_quality" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             let artifact_id = read_i64(&payload, &["artifactId", "artifact_id"])?;
-            let artifact = app.get_artifact(artifact_id)?;
-            if artifact.project_id != project_id {
-                return Err(AppError::Validation("产物不属于当前项目".to_string()));
-            }
-            Ok(serde_json::to_value(quality::analyze_artifact(&artifact))?)
+            Ok(serde_json::to_value(
+                gateway.analyze_artifact_quality(project_id, artifact_id)?,
+            )?)
         }
         "review_project_continuity" => {
             let input: ContinuityReviewRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                workflow::review_project_continuity(app, input).await?,
+                gateway.review_project_continuity(input).await?,
             )?)
         }
         "check_artifact_ledger_continuity" => {
             let input: LedgerContinuityCheckRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                continuity_ledger::check_artifact_continuity(app, input).await?,
+                gateway.check_artifact_ledger_continuity(input).await?,
             )?)
         }
         "analyze_chapter_gate" => {
             let input: ChapterGateRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                gate::analyze_chapter_gate(app, input).await?,
+                gateway.analyze_chapter_gate(input).await?,
             )?)
         }
         "generate_chapter_split_plan" => {
             let input: ChapterSplitPlanRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                workflow::generate_chapter_split_plan(app, input).await?,
+                gateway.generate_chapter_split_plan(input).await?,
             )?)
         }
         "search_story_context" => {
             let input: StoryContextSearchInput = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(workflow::search_story_context(
-                app, input,
-            )?)?)
+            Ok(serde_json::to_value(gateway.search_story_context(input)?)?)
         }
         "rerank_story_context" => {
             let input: StoryContextRerankRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
-                context_search::rerank_story_context(app, input).await?,
+                gateway.rerank_story_context(input).await?,
             )?)
         }
-        "list_tool_definitions" => Ok(serde_json::to_value(crate::agent_tools::definitions())?),
+        "list_tool_definitions" => Ok(serde_json::to_value(gateway.list_agent_tools())?),
         "preview_agent_run" => {
             let input: AgentRunRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
@@ -628,85 +557,6 @@ async fn dispatch_command(
             "unknown dev command: {command}"
         ))),
     }
-}
-
-async fn test_ai_connection_impl(
-    app: &AppState,
-    input: Option<TestAiConnectionInput>,
-) -> AppResult<String> {
-    let mut settings = app.get_ai_settings()?;
-    let input = input.unwrap_or(TestAiConnectionInput {
-        base_url: None,
-        model: None,
-        temperature: None,
-        thinking_enabled: None,
-        thinking_level: None,
-        api_key: None,
-    });
-
-    if let Some(base_url) = input.base_url.filter(|value| !value.trim().is_empty()) {
-        settings.base_url = base_url;
-    }
-    if let Some(model) = input.model.filter(|value| !value.trim().is_empty()) {
-        settings.model = model;
-    }
-    if let Some(temperature) = input.temperature {
-        settings.temperature = temperature;
-    }
-    if let Some(thinking_enabled) = input.thinking_enabled {
-        settings.thinking_enabled = thinking_enabled;
-    }
-    if let Some(thinking_level) = input.thinking_level.as_deref() {
-        settings.thinking_level = thinking_level.to_string();
-    }
-    settings.thinking_level = crate::models::normalize_thinking_level(
-        settings.thinking_enabled,
-        &settings.thinking_level,
-    )
-    .map_err(AppError::Validation)?;
-
-    if settings.model.trim().is_empty() {
-        return Err(AppError::Validation(
-            "请先填写模型名称，再测试连接".to_string(),
-        ));
-    }
-
-    let api_key = input
-        .api_key
-        .filter(|value| !value.trim().is_empty())
-        .or(app.get_api_key_for_base_url(&settings.base_url)?)
-        .ok_or_else(|| AppError::Validation("请先为当前供应商保存 API Key".to_string()))?;
-    ai::complete_chat(
-        &settings,
-        &api_key,
-        "你是连接测试助手，只回复 OK。",
-        "请回复 OK。",
-        0.0,
-    )
-    .await
-}
-
-async fn list_models_impl(
-    app: &AppState,
-    input: Option<ListModelsInput>,
-) -> AppResult<Vec<crate::models::ModelInfo>> {
-    let mut settings = app.get_ai_settings()?;
-    let input = input.unwrap_or(ListModelsInput {
-        base_url: None,
-        api_key: None,
-    });
-
-    if let Some(base_url) = input.base_url.filter(|value| !value.trim().is_empty()) {
-        settings.base_url = base_url;
-    }
-
-    let api_key = input
-        .api_key
-        .filter(|value| !value.trim().is_empty())
-        .or(app.get_api_key_for_base_url(&settings.base_url)?)
-        .ok_or_else(|| AppError::Validation("请先为当前供应商保存 API Key".to_string()))?;
-
-    ai::list_models(&settings, &api_key).await
 }
 
 fn read_required<T>(payload: &Value, key: &str) -> AppResult<T>

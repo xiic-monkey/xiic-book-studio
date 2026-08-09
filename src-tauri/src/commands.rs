@@ -1,12 +1,8 @@
 use tauri::State;
 
 use crate::{
-    adoption, ai,
     application::ApplicationGateway,
-    chapter_memory, context_search, continuity_ledger,
-    db::AppState,
     error::AppResult,
-    gate, index_jobs,
     models::{
         ActionProposal, ActiveAgentRun, AdoptionBatchResult, AdoptionProposal, Agent,
         AgentRunRequest, AgentRunSummary, AgentStepResult, AgentToolDefinition, AiProvider,
@@ -30,146 +26,150 @@ use crate::{
         TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
         WritingSkill,
     },
-    quality, story_architecture, story_index, story_search, workflow,
 };
 
 #[tauri::command]
-pub fn create_project(state: State<'_, AppState>, input: NewProject) -> AppResult<Project> {
-    state.create_project(input)
+pub fn create_project(
+    gateway: State<'_, ApplicationGateway>,
+    input: NewProject,
+) -> AppResult<Project> {
+    gateway.create_project(input)
 }
 
 #[tauri::command]
-pub fn list_projects(state: State<'_, AppState>) -> AppResult<Vec<Project>> {
-    state.list_projects()
+pub fn list_projects(gateway: State<'_, ApplicationGateway>) -> AppResult<Vec<Project>> {
+    gateway.list_projects()
 }
 
 #[tauri::command]
-pub fn get_project(state: State<'_, AppState>, project_id: i64) -> AppResult<ProjectDetail> {
-    state.get_detail(project_id)
+pub fn get_project(
+    gateway: State<'_, ApplicationGateway>,
+    project_id: i64,
+) -> AppResult<ProjectDetail> {
+    gateway.get_project_detail(project_id)
 }
 
 #[tauri::command]
-pub fn update_project(state: State<'_, AppState>, input: ProjectUpdate) -> AppResult<Project> {
-    state.update_project(input)
+pub fn update_project(
+    gateway: State<'_, ApplicationGateway>,
+    input: ProjectUpdate,
+) -> AppResult<Project> {
+    gateway.update_project(input)
 }
 
 #[tauri::command]
-pub fn delete_project(state: State<'_, AppState>, project_id: i64) -> AppResult<()> {
-    state.delete_project(project_id)
+pub fn delete_project(gateway: State<'_, ApplicationGateway>, project_id: i64) -> AppResult<()> {
+    gateway.delete_project(project_id)
 }
 
 #[tauri::command]
 pub fn import_reference_text(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: ImportReferenceTextRequest,
 ) -> AppResult<ReferenceMaterial> {
-    state.import_reference_text(input)
+    gateway.import_reference_text(input)
 }
 
 #[tauri::command]
 pub fn list_reference_materials(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     project_id: i64,
 ) -> AppResult<Vec<ReferenceMaterial>> {
-    state.list_reference_materials(project_id)
+    gateway.list_reference_materials(project_id)
 }
 
 #[tauri::command]
 pub fn update_reference_material(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: UpdateReferenceMaterialRequest,
 ) -> AppResult<ReferenceMaterial> {
-    state.update_reference_material(input)
+    gateway.update_reference_material(input)
 }
 
 #[tauri::command]
 pub fn remove_reference_material(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     project_id: i64,
     reference_id: u64,
 ) -> AppResult<()> {
-    state.remove_reference_material(project_id, reference_id)
+    gateway.remove_reference_material(project_id, reference_id)
 }
 
 #[tauri::command]
-pub fn create_chapter(state: State<'_, AppState>, input: NewChapter) -> AppResult<Chapter> {
-    state.create_chapter(input)
+pub fn create_chapter(
+    gateway: State<'_, ApplicationGateway>,
+    input: NewChapter,
+) -> AppResult<Chapter> {
+    gateway.create_chapter(input)
 }
 
 #[tauri::command]
 pub fn delete_chapter(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     project_id: i64,
     chapter_id: i64,
 ) -> AppResult<()> {
-    state.delete_chapter(project_id, chapter_id)
+    gateway.delete_chapter(project_id, chapter_id)
 }
 
 #[tauri::command]
-pub async fn update_chapter(
-    state: State<'_, AppState>,
+pub fn update_chapter(
+    gateway: State<'_, ApplicationGateway>,
     input: ChapterUpdate,
 ) -> AppResult<Chapter> {
-    let chapter = state.update_chapter(input)?;
-    if let Err(error) =
-        story_search::refresh_chapter_metadata(&state, chapter.project_id, chapter.id)
-    {
-        eprintln!("chapter search metadata refresh unavailable; queueing project rebuild: {error}");
-        if let Err(queue_error) = index_jobs::enqueue_project_search_job(&state, chapter.project_id)
-        {
-            eprintln!("unable to queue chapter search rebuild: {queue_error}");
-        }
-    }
-    Ok(chapter)
+    gateway.update_chapter(input)
 }
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> AppResult<AiSettings> {
-    state.get_ai_settings()
+pub fn get_settings(gateway: State<'_, ApplicationGateway>) -> AppResult<AiSettings> {
+    gateway.get_settings()
 }
 
 #[tauri::command]
 pub fn save_ai_settings(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: SaveAiSettings,
 ) -> AppResult<AiSettings> {
-    state.save_ai_settings(input)
+    gateway.save_ai_settings(input)
 }
 
 #[tauri::command]
-pub fn list_ai_providers(state: State<'_, AppState>) -> AppResult<Vec<AiProvider>> {
-    state.list_ai_providers()
+pub fn list_ai_providers(gateway: State<'_, ApplicationGateway>) -> AppResult<Vec<AiProvider>> {
+    gateway.list_ai_providers()
 }
 
 #[tauri::command]
 pub fn save_ai_provider(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: SaveAiProvider,
 ) -> AppResult<AiProvider> {
-    state.save_ai_provider(input)
+    gateway.save_ai_provider(input)
 }
 
 #[tauri::command]
-pub fn delete_ai_provider(state: State<'_, AppState>, provider_id: i64) -> AppResult<()> {
-    state.delete_ai_provider(provider_id)
+pub fn delete_ai_provider(
+    gateway: State<'_, ApplicationGateway>,
+    provider_id: i64,
+) -> AppResult<()> {
+    gateway.delete_ai_provider(provider_id)
 }
 
 #[tauri::command]
-pub fn list_agents(state: State<'_, AppState>) -> AppResult<Vec<Agent>> {
-    state.list_agents()
+pub fn list_agents(gateway: State<'_, ApplicationGateway>) -> AppResult<Vec<Agent>> {
+    gateway.list_agents()
 }
 
 #[tauri::command]
-pub fn list_agent_tools() -> Vec<AgentToolDefinition> {
-    crate::agent_tools::definitions()
+pub fn list_agent_tools(gateway: State<'_, ApplicationGateway>) -> Vec<AgentToolDefinition> {
+    gateway.list_agent_tools()
 }
 
 #[tauri::command]
 pub fn save_agent_settings(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: SaveAgentSettings,
 ) -> AppResult<crate::models::Agent> {
-    state.save_agent_settings(input)
+    gateway.save_agent_settings(input)
 }
 
 #[tauri::command]
@@ -181,435 +181,322 @@ pub fn reset_agent_prompt(
 }
 
 #[tauri::command]
-pub fn list_writing_skills(state: State<'_, AppState>) -> AppResult<Vec<WritingSkill>> {
-    state.list_writing_skills()
+pub fn list_writing_skills(gateway: State<'_, ApplicationGateway>) -> AppResult<Vec<WritingSkill>> {
+    gateway.list_writing_skills()
 }
 
 #[tauri::command]
 pub fn save_writing_skill(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: SaveWritingSkill,
 ) -> AppResult<WritingSkill> {
-    state.save_writing_skill(input)
+    gateway.save_writing_skill(input)
 }
 
 #[tauri::command]
 pub fn save_knowledge_card(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: SaveKnowledgeCard,
 ) -> AppResult<KnowledgeCard> {
-    let card = state.save_knowledge_card(input)?;
-    if let Err(error) = index_jobs::enqueue_project_search_job(&state, card.project_id) {
-        eprintln!("knowledge card search refresh unavailable; queueing project rebuild: {error}");
-    }
-    Ok(card)
+    gateway.save_knowledge_card(input)
 }
 
 #[tauri::command]
 pub fn save_foreshadowing(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: SaveForeshadowing,
 ) -> AppResult<Foreshadowing> {
-    let item = state.save_foreshadowing(input)?;
-    if let Err(error) = index_jobs::enqueue_project_search_job(&state, item.project_id) {
-        eprintln!("foreshadowing search refresh unavailable; queueing project rebuild: {error}");
-    }
-    Ok(item)
+    gateway.save_foreshadowing(input)
 }
 
 #[tauri::command]
 pub async fn prepare_artifact_adoptions(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: PrepareArtifactAdoptionsRequest,
 ) -> AppResult<Vec<AdoptionProposal>> {
-    adoption::prepare_artifact_adoptions(&state, input.project_id, input.artifact_id).await
+    gateway.prepare_artifact_adoptions(input).await
 }
 
 #[tauri::command]
 pub fn list_adoption_proposals(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: ListAdoptionProposalsRequest,
 ) -> AppResult<Vec<AdoptionProposal>> {
-    adoption::list_adoption_proposals(&state, input.project_id, input.artifact_id)
+    gateway.list_adoption_proposals(input)
 }
 
 #[tauri::command]
 pub fn update_adoption_proposal(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: UpdateAdoptionProposalRequest,
 ) -> AppResult<AdoptionProposal> {
-    adoption::update_adoption_proposal(&state, input)
+    gateway.update_adoption_proposal(input)
 }
 
 #[tauri::command]
 pub fn apply_adoption_proposals(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: DecideAdoptionProposalsRequest,
 ) -> AppResult<AdoptionBatchResult> {
-    adoption::apply_adoption_proposals(&state, input)
+    gateway.apply_adoption_proposals(input)
 }
 
 #[tauri::command]
 pub fn reject_adoption_proposals(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: DecideAdoptionProposalsRequest,
 ) -> AppResult<AdoptionBatchResult> {
-    adoption::reject_adoption_proposals(&state, input)
+    gateway.reject_adoption_proposals(input)
 }
 
 #[tauri::command]
 pub async fn test_ai_connection(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: Option<TestAiConnectionInput>,
 ) -> AppResult<String> {
-    let mut settings = state.get_ai_settings()?;
-    let input = input.unwrap_or(TestAiConnectionInput {
-        base_url: None,
-        model: None,
-        temperature: None,
-        thinking_enabled: None,
-        thinking_level: None,
-        api_key: None,
-    });
-
-    if let Some(base_url) = input.base_url.filter(|value| !value.trim().is_empty()) {
-        settings.base_url = base_url;
-    }
-    if let Some(model) = input.model.filter(|value| !value.trim().is_empty()) {
-        settings.model = model;
-    }
-    if let Some(temperature) = input.temperature {
-        settings.temperature = temperature;
-    }
-    if let Some(thinking_enabled) = input.thinking_enabled {
-        settings.thinking_enabled = thinking_enabled;
-    }
-    if let Some(thinking_level) = input.thinking_level.as_deref() {
-        settings.thinking_level = thinking_level.to_string();
-    }
-    settings.thinking_level = crate::models::normalize_thinking_level(
-        settings.thinking_enabled,
-        &settings.thinking_level,
-    )
-    .map_err(crate::error::AppError::Validation)?;
-
-    if settings.model.trim().is_empty() {
-        return Err(crate::error::AppError::Validation(
-            "请先填写模型名称，再测试连接".to_string(),
-        ));
-    }
-
-    let api_key = input
-        .api_key
-        .filter(|value| !value.trim().is_empty())
-        .or(state.get_api_key_for_base_url(&settings.base_url)?)
-        .ok_or_else(|| {
-            crate::error::AppError::Validation("请先为当前供应商保存 API Key".to_string())
-        })?;
-    ai::complete_chat(
-        &settings,
-        &api_key,
-        "你是连接测试助手，只回复 OK。",
-        "请回复 OK。",
-        0.0,
-    )
-    .await
+    gateway.test_ai_connection(input).await
 }
 
 #[tauri::command]
 pub async fn list_models(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: Option<ListModelsInput>,
 ) -> AppResult<Vec<crate::models::ModelInfo>> {
-    let mut settings = state.get_ai_settings()?;
-    let input = input.unwrap_or(ListModelsInput {
-        base_url: None,
-        api_key: None,
-    });
-
-    if let Some(base_url) = input.base_url.filter(|value| !value.trim().is_empty()) {
-        settings.base_url = base_url;
-    }
-
-    let api_key = input
-        .api_key
-        .filter(|value| !value.trim().is_empty())
-        .or(state.get_api_key_for_base_url(&settings.base_url)?)
-        .ok_or_else(|| {
-            crate::error::AppError::Validation("请先为当前供应商保存 API Key".to_string())
-        })?;
-
-    ai::list_models(&settings, &api_key).await
+    gateway.list_models(input).await
 }
 
 #[tauri::command]
 pub async fn run_agent_step(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RunAgentRequest,
 ) -> AppResult<AgentStepResult> {
-    workflow::run_agent_step(&state, input).await
+    gateway.run_agent_step(input).await
 }
 
 #[tauri::command]
 pub async fn rebuild_chapter_memory(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RebuildChapterMemoryRequest,
 ) -> AppResult<ChapterMemoryRecord> {
-    let memory_agent = state.get_agent("chapter_memory")?;
-    let settings = memory_agent.ai_settings();
-    let api_key = state
-        .get_api_key_for_base_url(&settings.base_url)?
-        .ok_or_else(|| {
-            crate::error::AppError::Validation(
-                "请先在设置里为当前供应商保存 AI API Key".to_string(),
-            )
-        })?;
-    chapter_memory::rebuild_chapter_memory(
-        &state,
-        input.project_id,
-        input.chapter_id,
-        &settings,
-        &api_key,
-        None,
-    )
-    .await
+    gateway.rebuild_chapter_memory(input).await
 }
 
 #[tauri::command]
 pub async fn run_story_architect(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RunStoryArchitectRequest,
 ) -> AppResult<AgentStepResult> {
-    story_architecture::run_story_architect(&state, input).await
+    gateway.run_story_architect(input).await
 }
 
 #[tauri::command]
 pub async fn create_targeted_rework(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RunStoryArchitectRequest,
 ) -> AppResult<AgentStepResult> {
-    story_architecture::create_targeted_rework(&state, input).await
+    gateway.create_targeted_rework(input).await
 }
 
 #[tauri::command]
 pub fn confirm_story_bible(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: ConfirmStoryBibleRequest,
 ) -> AppResult<StoryBible> {
-    story_architecture::confirm_story_bible(&state, input)
+    gateway.confirm_story_bible(input)
 }
 
 #[tauri::command]
 pub async fn review_story_bible(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: StoryBibleReviewRequest,
 ) -> AppResult<StoryBibleReview> {
-    story_architecture::review_story_bible(&state, input).await
+    gateway.review_story_bible(input).await
 }
 
 #[tauri::command]
 pub fn confirm_story_bible_review(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: ConfirmStoryBibleReviewRequest,
 ) -> AppResult<StoryBibleReview> {
-    story_architecture::confirm_story_bible_review(&state, input)
+    gateway.confirm_story_bible_review(input)
 }
 
 #[tauri::command]
 pub fn list_story_arcs(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     project_id: i64,
 ) -> AppResult<Vec<crate::models::StoryArc>> {
-    state.list_story_arcs(project_id)
+    gateway.list_story_arcs(project_id)
 }
 
 #[tauri::command]
 pub fn preview_agent_context(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RunAgentRequest,
 ) -> AppResult<ContextPreview> {
-    workflow::preview_agent_context(&state, input)
+    gateway.preview_agent_context(input)
 }
 
 #[tauri::command]
-pub async fn approve_stage(
-    state: State<'_, AppState>,
+pub fn approve_stage(
+    gateway: State<'_, ApplicationGateway>,
     project_id: i64,
     stage: String,
     artifact_id: i64,
     note: Option<String>,
 ) -> AppResult<Approval> {
-    let approval = state.approve_stage(
-        project_id,
-        &stage,
-        artifact_id,
-        note.as_deref().unwrap_or(""),
-    )?;
-    state.wake_index_worker();
-    Ok(approval)
+    gateway.approve_stage(project_id, &stage, artifact_id, note.as_deref())
 }
 
 #[tauri::command]
 pub fn retry_index_jobs(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RetryIndexJobsRequest,
 ) -> AppResult<Vec<crate::models::DerivedIndexJob>> {
-    index_jobs::retry_index_jobs(&state, input)
+    gateway.retry_index_jobs(input)
 }
 
 #[tauri::command]
 pub async fn rebuild_story_index(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RebuildStoryIndexRequest,
 ) -> AppResult<Vec<StoryIndexSummary>> {
-    story_index::rebuild_story_index(&state, input).await
+    gateway.rebuild_story_index(input).await
 }
 
 #[tauri::command]
 pub async fn rebuild_story_search_index(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RebuildStorySearchIndexRequest,
 ) -> AppResult<crate::models::StorySearchStatus> {
-    story_search::rebuild_story_search_index(&state, input).await
+    gateway.rebuild_story_search_index(input).await
 }
 
 #[tauri::command]
 pub fn get_story_search_status(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     project_id: i64,
 ) -> AppResult<crate::models::StorySearchStatus> {
-    story_search::get_story_search_status(&state, project_id)
+    gateway.get_story_search_status(project_id)
 }
 
 #[tauri::command]
 pub async fn request_revision(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: RevisionRequest,
 ) -> AppResult<AgentStepResult> {
-    workflow::request_revision(&state, input).await
+    gateway.request_revision(input).await
 }
 
 #[tauri::command]
 pub fn replace_artifact_span(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: SpanReplacementRequest,
 ) -> AppResult<AgentStepResult> {
-    workflow::replace_artifact_span(&state, input)
+    gateway.replace_artifact_span(input)
 }
 
 #[tauri::command]
 pub async fn revise_artifact_span_with_ai(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: AiSpanRevisionRequest,
 ) -> AppResult<AgentStepResult> {
-    workflow::revise_artifact_span_with_ai(&state, input).await
+    gateway.revise_artifact_span_with_ai(input).await
 }
 
 #[tauri::command]
-pub fn delete_artifact(state: State<'_, AppState>, input: DeleteArtifactRequest) -> AppResult<()> {
-    state.delete_artifact(input.project_id, input.artifact_id)
+pub fn delete_artifact(
+    gateway: State<'_, ApplicationGateway>,
+    input: DeleteArtifactRequest,
+) -> AppResult<()> {
+    gateway.delete_artifact(input)
 }
 
 #[tauri::command]
 pub fn clear_chapter_history(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: ClearChapterHistoryRequest,
 ) -> AppResult<HistoryCleanupResult> {
-    state.clear_chapter_history(
-        input.project_id,
-        input.chapter_id,
-        input.keep_artifact_ids.as_deref().unwrap_or(&[]),
-    )
+    gateway.clear_chapter_history(input)
 }
 
 #[tauri::command]
 pub fn list_artifacts(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     filters: ArtifactFilters,
 ) -> AppResult<Vec<Artifact>> {
-    state.list_artifacts(filters)
+    gateway.list_artifacts(filters)
 }
 
 #[tauri::command]
 pub fn export_project(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     project_id: i64,
     format: String,
 ) -> AppResult<String> {
-    match format.as_str() {
-        "markdown" | "md" => workflow::export_markdown(&state, project_id),
-        _ => Err(crate::error::AppError::Validation(
-            "第一版只支持 Markdown 导出".to_string(),
-        )),
-    }
+    gateway.export_project(project_id, &format)
 }
 
 #[tauri::command]
 pub fn analyze_artifact_quality(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     project_id: i64,
     artifact_id: i64,
 ) -> AppResult<QualityReport> {
-    let artifact = state.get_artifact(artifact_id)?;
-    if artifact.project_id != project_id {
-        return Err(crate::error::AppError::Validation(
-            "产物不属于当前项目".to_string(),
-        ));
-    }
-    Ok(quality::analyze_artifact(&artifact))
+    gateway.analyze_artifact_quality(project_id, artifact_id)
 }
 
 #[tauri::command]
 pub async fn review_project_continuity(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: ContinuityReviewRequest,
 ) -> AppResult<ContinuityReport> {
-    workflow::review_project_continuity(&state, input).await
+    gateway.review_project_continuity(input).await
 }
 
 #[tauri::command]
 pub async fn check_artifact_ledger_continuity(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: LedgerContinuityCheckRequest,
 ) -> AppResult<LedgerContinuityReport> {
-    continuity_ledger::check_artifact_continuity(&state, input).await
+    gateway.check_artifact_ledger_continuity(input).await
 }
 
 #[tauri::command]
 pub async fn analyze_chapter_gate(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: ChapterGateRequest,
 ) -> AppResult<ChapterGateReport> {
-    gate::analyze_chapter_gate(&state, input).await
+    gateway.analyze_chapter_gate(input).await
 }
 
 #[tauri::command]
 pub async fn generate_chapter_split_plan(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: ChapterSplitPlanRequest,
 ) -> AppResult<ChapterSplitPlan> {
-    workflow::generate_chapter_split_plan(&state, input).await
+    gateway.generate_chapter_split_plan(input).await
 }
 
 #[tauri::command]
 pub fn search_story_context(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: StoryContextSearchInput,
 ) -> AppResult<Vec<StoryContextSnippet>> {
-    workflow::search_story_context(&state, input)
+    gateway.search_story_context(input)
 }
 
 #[tauri::command]
 pub async fn rerank_story_context(
-    state: State<'_, AppState>,
+    gateway: State<'_, ApplicationGateway>,
     input: StoryContextRerankRequest,
 ) -> AppResult<StoryContextRerankResult> {
-    context_search::rerank_story_context(&state, input).await
+    gateway.rerank_story_context(input).await
 }
 
 #[tauri::command]
-pub fn list_tool_definitions() -> Vec<AgentToolDefinition> {
-    crate::agent_tools::definitions()
+pub fn list_tool_definitions(gateway: State<'_, ApplicationGateway>) -> Vec<AgentToolDefinition> {
+    gateway.list_agent_tools()
 }
 
 #[tauri::command]

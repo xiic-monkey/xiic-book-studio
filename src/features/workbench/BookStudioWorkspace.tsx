@@ -25,6 +25,7 @@ import {
   Sparkles,
   Trash2,
   Users,
+  X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent, PointerEvent } from "react";
@@ -63,6 +64,7 @@ import type {
   ReferenceSelection,
   ReferenceTag,
   ReviewIssue,
+  RunEvent,
   SaveWritingSkill,
   SaveAiProvider,
   SaveForeshadowingInput,
@@ -395,9 +397,16 @@ export function BookStudioWorkspace() {
     let unsubscribe: (() => void) | null = null;
     void api.subscribeRunEvents(selectedProjectId, (event) => {
       if (activeProjectRequestRef.current !== event.project_id) return;
+      if (["completed", "failed", "cancelled"].includes(event.kind)) {
+        setStreamingRun((current) => current?.id === event.run_id ? null : current);
+        void hydrateFinishedAgentRun(event);
+        return;
+      }
       setStreamingRun((current) => {
-        if (["completed", "failed", "cancelled"].includes(event.kind)) {
-          return current?.id === event.run_id ? null : current;
+        if (event.kind === "output_reset") {
+          return current?.id === event.run_id && current
+            ? { ...current, output: "", status: event.status, error: event.error }
+            : current;
         }
         if (event.kind === "started" || event.kind === "output_delta" || event.kind === "cancellation_requested") {
           const sameRun = current?.id === event.run_id;
@@ -966,6 +975,61 @@ export function BookStudioWorkspace() {
       api.getActiveAgentRun(projectId),
     ]);
     if (activeProjectRequestRef.current === projectId) setStreamingRun(activeRun);
+  }
+
+  async function hydrateFinishedAgentRun(event: RunEvent) {
+    if (activeProjectRequestRef.current !== event.project_id) return;
+    if (event.kind === "failed") {
+      setError(event.error ?? "Agent 运行失败");
+    } else if (event.kind === "cancelled") {
+      setNotice("Agent 运行已取消");
+    }
+    try {
+      const summary = await api.getAgentRun(event.run_id);
+      if (activeProjectRequestRef.current !== event.project_id) return;
+      setLastAgentRun(summary);
+      mergeActionProposals(summary.proposals);
+      if (summary.artifact) {
+        setSelectedStage(summary.artifact.stage as Stage);
+        setSelectedArtifactId(summary.artifact.id);
+        await refreshDetailBestEffort(event.project_id, "Agent 运行");
+        if (summary.artifact.stage === "review" && summary.artifact.parent_artifact_id) {
+          try {
+            setLedgerContinuityReport(
+              await api.checkArtifactLedgerContinuity({
+                project_id: event.project_id,
+                artifact_id: summary.artifact.parent_artifact_id,
+              })
+            );
+          } catch {
+            // Trial reading already completed. The ledger is an additional, non-blocking check.
+            setLedgerContinuityReport(null);
+          }
+        }
+        if (event.kind === "completed") {
+          setNotice(`${stageLabel(summary.artifact.stage)}已生成 v${summary.artifact.version}`);
+        }
+      }
+    } catch (error) {
+      if (activeProjectRequestRef.current === event.project_id) {
+        setError(`运行已结束，但详情读取失败：${String(error)}`);
+      }
+    }
+  }
+
+  function showStartedAgentRun(result: AgentRunSummary) {
+    setLastAgentRun(result);
+    setStreamingRun({
+      id: result.run.id,
+      project_id: result.run.project_id,
+      chapter_id: result.run.chapter_id,
+      stage: result.run.stage,
+      output: result.run.output,
+      status: result.run.status,
+      error: result.run.error,
+      elapsed_ms: result.run.elapsed_ms,
+      created_at: result.run.created_at,
+    });
   }
 
   async function refreshDetailBestEffort(projectId: number, operation: string) {
@@ -1610,6 +1674,10 @@ export function BookStudioWorkspace() {
     mode: AgentRunMode = "smart",
   ) {
     if (!detail) return;
+    if (streamingRun) {
+      setNotice("当前已有 Agent 任务正在运行，请先等待或停止它。");
+      return;
+    }
     if (stage === "setting" || stage === "outline" || stage === "characters") {
       return runStoryArchitect(architectModeByStage[stage], mode);
     }
@@ -1631,34 +1699,10 @@ export function BookStudioWorkspace() {
         reference_selection: activeReferenceSelection,
         prepared_context_id: contextPreview?.id ?? null,
       });
-      if (!result.artifact) {
-        throw new Error("Agent 运行已结束，但没有返回候选产物");
-      }
-      setLastAgentRun(result);
-      mergeActionProposals(result.proposals);
-      setSelectedStage(stage);
-      setSelectedArtifactId(result.artifact.id);
+      showStartedAgentRun(result);
       setContextPreview(null);
       setInstruction("");
-      await refreshDetailBestEffort(detail.project.id, "Agent 运行");
-      if (stage === "review" && sourceArtifactId) {
-        try {
-          setLedgerContinuityReport(
-            await api.checkArtifactLedgerContinuity({
-              project_id: detail.project.id,
-              artifact_id: sourceArtifactId,
-            })
-          );
-        } catch {
-          // Trial reading already completed. The ledger is an additional, non-blocking check.
-          setLedgerContinuityReport(null);
-        }
-      }
-      setNotice(
-        mode === "smart" && sourceArtifactId
-          ? `${meta?.label ?? "Agent"}已基于当前版本生成 v${result.artifact.version}`
-          : `${meta?.label ?? "Agent"}已生成 v${result.artifact.version}`
-      );
+      setNotice(`${meta?.label ?? "Agent"}已开始运行`);
     });
   }
 
@@ -1667,6 +1711,10 @@ export function BookStudioWorkspace() {
     runMode: AgentRunMode = "smart",
   ) {
     if (!detail) return;
+    if (streamingRun) {
+      setNotice("当前已有 Agent 任务正在运行，请先等待或停止它。");
+      return;
+    }
     const stage = artifactStageForArchitectMode(architectMode);
     setMainSurface("library");
     await runTask("运行故事架构 Agent", async () => {
@@ -1692,17 +1740,10 @@ export function BookStudioWorkspace() {
         source_artifact_id: sourceArtifactId,
         reference_selection: activeReferenceSelection,
       });
-      if (!result.artifact) {
-        throw new Error("故事架构 Agent 已结束，但没有返回候选产物");
-      }
-      setLastAgentRun(result);
-      mergeActionProposals(result.proposals);
-      setSelectedStage(stage);
-      setSelectedArtifactId(result.artifact.id);
+      showStartedAgentRun(result);
       setExplicitArchitectSourceId(null);
       setInstruction("");
-      await refreshDetailBestEffort(detail.project.id, "故事架构生成");
-      setNotice(`${architectModeLabel[architectMode]}已生成 v${result.artifact.version}`);
+      setNotice(`${architectModeLabel[architectMode]}已开始运行`);
     });
   }
 
@@ -1949,6 +1990,10 @@ export function BookStudioWorkspace() {
 
   async function requestRevision() {
     if (!detail || !selectedArtifact) return;
+    if (streamingRun) {
+      setNotice("当前已有 Agent 任务正在运行，请先等待或停止它。");
+      return;
+    }
     await runTask("请求修订", async () => {
       const result = await api.startRevisionRun({
         project_id: detail.project.id,
@@ -1956,17 +2001,22 @@ export function BookStudioWorkspace() {
         feedback: revisionFeedback,
         reference_selection: activeReferenceSelection,
       });
-      if (!result.artifact) {
-        throw new Error("修订 Agent 已结束，但没有返回候选产物");
-      }
-      setLastAgentRun(result);
-      mergeActionProposals(result.proposals);
-      setSelectedStage("revision");
-      setSelectedArtifactId(result.artifact.id);
+      showStartedAgentRun(result);
       setRevisionFeedback("");
       setReviewIssues([]);
-      await refreshDetailBestEffort(detail.project.id, "修订稿生成");
-      setNotice("修订稿已生成");
+      setNotice("修订 Agent 已开始运行");
+    });
+  }
+
+  async function cancelStreamingAgentRun() {
+    if (!streamingRun) return;
+    await runTask("停止 Agent", async () => {
+      const summary = await api.cancelAgentRun(streamingRun.id);
+      setLastAgentRun(summary);
+      setStreamingRun((current) => current?.id === streamingRun.id
+        ? { ...current, status: summary.run.status, error: summary.run.error }
+        : current);
+      setNotice("已发送停止请求，等待 Agent 收尾");
     });
   }
 
@@ -3417,6 +3467,15 @@ export function BookStudioWorkspace() {
                   <div className="artifact-meta">
                     <strong>{stageLabel(streamingRun.stage)}正在生成</strong>
                     <span>实时草稿，完成后才会形成待人工确认版本</span>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() => void cancelStreamingAgentRun()}
+                      disabled={busy === "停止 Agent" || streamingRun.status === "cancellation_requested"}
+                    >
+                      {busy === "停止 Agent" ? <Loader2 size={14} className="spin" /> : <X size={14} />}
+                      {streamingRun.status === "cancellation_requested" ? "正在停止…" : "停止生成"}
+                    </button>
                   </div>
                   <pre>{streamingRun.output || "正在等待模型返回内容..."}</pre>
                 </>

@@ -35,10 +35,7 @@ impl ApplicationGateway {
         self.state.import_reference_text(input)
     }
 
-    pub fn list_reference_materials(
-        &self,
-        project_id: i64,
-    ) -> AppResult<Vec<ReferenceMaterial>> {
+    pub fn list_reference_materials(&self, project_id: i64) -> AppResult<Vec<ReferenceMaterial>> {
         self.state.list_reference_materials(project_id)
     }
 
@@ -122,7 +119,9 @@ impl ApplicationGateway {
     pub fn save_knowledge_card(&self, input: SaveKnowledgeCard) -> AppResult<KnowledgeCard> {
         let card = self.state.save_knowledge_card(input)?;
         if let Err(error) = index_jobs::enqueue_project_search_job(&self.state, card.project_id) {
-            eprintln!("knowledge card search refresh unavailable; queueing project rebuild: {error}");
+            eprintln!(
+                "knowledge card search refresh unavailable; queueing project rebuild: {error}"
+            );
         }
         Ok(card)
     }
@@ -130,7 +129,9 @@ impl ApplicationGateway {
     pub fn save_foreshadowing(&self, input: SaveForeshadowing) -> AppResult<Foreshadowing> {
         let item = self.state.save_foreshadowing(input)?;
         if let Err(error) = index_jobs::enqueue_project_search_job(&self.state, item.project_id) {
-            eprintln!("foreshadowing search refresh unavailable; queueing project rebuild: {error}");
+            eprintln!(
+                "foreshadowing search refresh unavailable; queueing project rebuild: {error}"
+            );
         }
         Ok(item)
     }
@@ -198,11 +199,9 @@ impl ApplicationGateway {
         if let Some(thinking_level) = input.thinking_level.as_deref() {
             settings.thinking_level = thinking_level.to_string();
         }
-        settings.thinking_level = normalize_thinking_level(
-            settings.thinking_enabled,
-            &settings.thinking_level,
-        )
-        .map_err(AppError::Validation)?;
+        settings.thinking_level =
+            normalize_thinking_level(settings.thinking_enabled, &settings.thinking_level)
+                .map_err(AppError::Validation)?;
         if settings.model.trim().is_empty() {
             return Err(AppError::Validation(
                 "请先填写模型名称，再测试连接".to_string(),
@@ -223,10 +222,7 @@ impl ApplicationGateway {
         .await
     }
 
-    pub async fn list_models(
-        &self,
-        input: Option<ListModelsInput>,
-    ) -> AppResult<Vec<ModelInfo>> {
+    pub async fn list_models(&self, input: Option<ListModelsInput>) -> AppResult<Vec<ModelInfo>> {
         let mut settings = self.state.get_ai_settings()?;
         let input = input.unwrap_or(ListModelsInput {
             base_url: None,
@@ -316,12 +312,9 @@ impl ApplicationGateway {
         artifact_id: i64,
         note: Option<&str>,
     ) -> AppResult<Approval> {
-        let approval = self.state.approve_stage(
-            project_id,
-            stage,
-            artifact_id,
-            note.unwrap_or(""),
-        )?;
+        let approval =
+            self.state
+                .approve_stage(project_id, stage, artifact_id, note.unwrap_or(""))?;
         self.state.wake_index_worker();
         Ok(approval)
     }

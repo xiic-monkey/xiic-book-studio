@@ -58,8 +58,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let state = AppState::new(app.handle())?;
-            state.start_index_worker();
-            let mut run_events = state.subscribe_run_events();
+            let gateway = ApplicationGateway::new(state);
+            gateway.start_background_workers();
+            let mut run_events = gateway.subscribe_run_events();
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -74,8 +75,7 @@ pub fn run() {
                     }
                 }
             });
-            app.manage(ApplicationGateway::new(state.clone()));
-            app.manage(state);
+            app.manage(gateway);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

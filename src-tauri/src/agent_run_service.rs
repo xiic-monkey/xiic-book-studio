@@ -32,53 +32,124 @@ pub async fn start_agent_run(
         prepare_context(state, &request, true).await?
     };
     request.prepared_context_id = Some(prepared.id);
-    let result = workflow::run_agent_step(state, RunAgentRequest::from(request.clone())).await?;
-    state.link_run_prepared_context(result.run.id, prepared.id)?;
+    if state.get_active_agent_run(request.project_id)?.is_some() {
+        return Err(AppError::Validation(
+            "当前项目已有 Agent 任务正在运行".to_string(),
+        ));
+    }
+    let run = state.insert_workflow_run(
+        request.project_id,
+        request.chapter_id,
+        request.stage.as_str(),
+        &prepared.prompt,
+        "",
+        "running",
+        None,
+        0,
+    )?;
+    state.link_run_prepared_context(run.id, prepared.id)?;
+    state.insert_run_event(
+        run.id,
+        request.project_id,
+        request.chapter_id,
+        "started",
+        "",
+        "running",
+        None,
+    )?;
+
+    let worker_state = state.clone();
+    let worker_request = RunAgentRequest::from(request.clone());
+    let worker_run = run.clone();
+    tokio::spawn(async move {
+        match workflow::run_agent_step_from_run(
+            &worker_state,
+            worker_request.clone(),
+            worker_run.clone(),
+        )
+        .await
+        {
+            Ok(result) => {
+                let proposals_error =
+                    prepare_proposals_after_run(&worker_state, &worker_request, &result)
+                        .await
+                        .err();
+                if let Some(error) = proposals_error {
+                    let _ = worker_state.insert_run_event(
+                        result.run.id,
+                        worker_request.project_id,
+                        worker_request.chapter_id,
+                        "proposal_warning",
+                        "",
+                        "success",
+                        Some(&error.to_string()),
+                    );
+                }
+                let _ = worker_state.insert_run_event(
+                    result.run.id,
+                    worker_request.project_id,
+                    worker_request.chapter_id,
+                    "completed",
+                    "",
+                    "success",
+                    None,
+                );
+            }
+            Err(error) => {
+                // The workflow persists and broadcasts the terminal failure/cancel event.
+                eprintln!("Agent run {} ended with an error: {error}", worker_run.id);
+            }
+        }
+    });
+
+    let tool_invocations = tool_invocations_for_run(state, run.id, Some(prepared.id))?;
+    Ok(AgentRunSummary {
+        run,
+        artifact: None,
+        prepared_context_id: Some(prepared.id),
+        tool_invocations,
+        proposals: Vec::new(),
+    })
+}
+
+async fn prepare_proposals_after_run(
+    state: &AppState,
+    request: &RunAgentRequest,
+    result: &crate::models::AgentStepResult,
+) -> AppResult<()> {
     let agent = state.get_agent_for_project_stage(request.project_id, request.stage.as_str())?;
     let mut proposal_agent = agent.clone();
     proposal_agent.enabled_tool_keys.retain(|key| {
         crate::agent_tools::get(key)
             .is_some_and(|definition| definition.kind == crate::models::ToolKind::Proposal)
     });
-    if !proposal_agent.enabled_tool_keys.is_empty() {
-        let proposal_prompt = format!(
-            "# 已完成的 Agent 产物\n阶段：{}\n标题：{}\n\n{}\n\n# 人工原始指令\n{}\n\n只在产物明确需要创建章节、重命名章节、生成资料候选、知识卡或伏笔候选时创建写入提案。不得提议删除、批准或直接应用正文。",
-            request.stage.as_str(),
-            result.artifact.title,
-            result.artifact.content,
-            request.user_instruction.as_deref().unwrap_or("未提供")
-        );
-        let _ = tool_runtime::prepare_tools(
-            ToolExecutionContext {
-                state,
-                agent: &proposal_agent,
-                project_id: request.project_id,
-                chapter_id: request.chapter_id,
-                stage: &request.stage,
-                source_artifact_id: Some(result.artifact.id),
-                user_instruction: request.user_instruction.as_deref(),
-                reference_selection: request.reference_selection.as_ref(),
-                run_id: Some(result.run.id),
-                preview: false,
-            },
-            &proposal_prompt,
-        )
-        .await?;
+    if proposal_agent.enabled_tool_keys.is_empty() {
+        return Ok(());
     }
-
-    let tool_invocations = tool_invocations_for_run(state, result.run.id, Some(prepared.id))?;
-    let proposals = state
-        .list_action_proposals(request.project_id, None)?
-        .into_iter()
-        .filter(|proposal| proposal.source_run_id == Some(result.run.id))
-        .collect();
-    Ok(AgentRunSummary {
-        run: result.run,
-        artifact: Some(result.artifact),
-        prepared_context_id: Some(prepared.id),
-        tool_invocations,
-        proposals,
-    })
+    let proposal_prompt = format!(
+        "# 已完成的 Agent 产物\n阶段：{}\n标题：{}\n\n{}\n\n# 人工原始指令\n{}\n\n只在产物明确需要创建章节、重命名章节、生成资料候选、知识卡或伏笔候选时创建写入提案。不得提议删除、批准或直接应用正文。",
+        request.stage.as_str(),
+        result.artifact.title,
+        result.artifact.content,
+        request.user_instruction.as_deref().unwrap_or("未提供")
+    );
+    tool_runtime::prepare_tools(
+        ToolExecutionContext {
+            state,
+            agent: &proposal_agent,
+            project_id: request.project_id,
+            chapter_id: request.chapter_id,
+            stage: &request.stage,
+            source_artifact_id: Some(result.artifact.id),
+            user_instruction: request.user_instruction.as_deref(),
+            reference_selection: request.reference_selection.as_ref(),
+            run_id: Some(result.run.id),
+            preview: false,
+        },
+        &proposal_prompt,
+    )
+    .await?;
+    Ok(())
 }
 
 pub async fn start_story_architect_run(
@@ -123,6 +194,10 @@ pub async fn start_revision_run(
 pub fn get_agent_run(state: &AppState, run_id: i64) -> AppResult<AgentRunSummary> {
     let run = workflow_run(state, run_id)?;
     let prepared_context_id = state.prepared_context_id_for_run(run_id)?;
+    let artifact = state
+        .artifact_id_for_run(run_id)?
+        .map(|artifact_id| state.get_artifact(artifact_id))
+        .transpose()?;
     let proposals = state
         .list_action_proposals(run.project_id, None)?
         .into_iter()
@@ -130,7 +205,7 @@ pub fn get_agent_run(state: &AppState, run_id: i64) -> AppResult<AgentRunSummary
         .collect();
     Ok(AgentRunSummary {
         run,
-        artifact: None,
+        artifact,
         prepared_context_id,
         tool_invocations: tool_invocations_for_run(state, run_id, prepared_context_id)?,
         proposals,
@@ -458,12 +533,209 @@ fn tool_invocations_for_run(
 
 #[cfg(test)]
 mod tests {
+    use std::{convert::Infallible, time::Duration};
+
+    use axum::{
+        extract::State,
+        response::{
+            sse::{Event, Sse},
+            IntoResponse, Response,
+        },
+        routing::post,
+        Json, Router,
+    };
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+    use tokio::{net::TcpListener, sync::mpsc, time::sleep};
+    use tokio_stream::wrappers::ReceiverStream;
+
     use super::*;
+    use crate::models::{NewProject, SaveAgentSettings, SaveAiSettings, Stage};
+
+    #[derive(Clone)]
+    struct MockAiState {
+        chunk_delay: Duration,
+    }
+
+    async fn mock_chat_completions(
+        State(state): State<MockAiState>,
+        Json(request): Json<Value>,
+    ) -> Response {
+        if request.get("stream").and_then(Value::as_bool) != Some(true) {
+            return Json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "Mock completion"}}]
+            }))
+            .into_response();
+        }
+
+        let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(4);
+        tokio::spawn(async move {
+            for delta in ["Mock ", "streamed setting"] {
+                if sender
+                    .send(Ok(Event::default().data(
+                        json!({
+                            "choices": [{"delta": {"content": delta}}]
+                        })
+                        .to_string(),
+                    )))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                sleep(state.chunk_delay).await;
+            }
+            let _ = sender.send(Ok(Event::default().data("[DONE]"))).await;
+        });
+        Sse::new(ReceiverStream::new(receiver)).into_response()
+    }
+
+    async fn start_mock_ai_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/v1/chat/completions", post(mock_chat_completions))
+            .with_state(MockAiState {
+                chunk_delay: Duration::from_millis(120),
+            });
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}/v1")
+    }
+
+    fn test_state(base_url: &str) -> (TempDir, AppState, crate::models::Project) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = AppState::from_path(temp_dir.path().join("mock-agent.sqlite3")).unwrap();
+        state
+            .save_ai_settings(SaveAiSettings {
+                base_url: base_url.to_string(),
+                model: "mock-model".to_string(),
+                temperature: 0.2,
+                thinking_enabled: false,
+                thinking_level: "off".to_string(),
+                api_key: Some("mock-key".to_string()),
+            })
+            .unwrap();
+        let architect = state.get_agent("story_architect").unwrap();
+        state
+            .save_agent_settings(SaveAgentSettings {
+                agent_id: architect.id,
+                provider_base_url: String::new(),
+                model: String::new(),
+                name: None,
+                role: None,
+                system_prompt: None,
+                temperature: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                uses_global_runtime_settings: Some(true),
+                enabled_tool_keys: Some(Vec::new()),
+                allowed_skill_keys: Some(Vec::new()),
+            })
+            .unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "Mock Agent Run".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "验证后台任务生命周期".to_string(),
+            })
+            .unwrap();
+        (temp_dir, state, project)
+    }
+
+    fn setting_request(project_id: i64) -> AgentRunRequest {
+        AgentRunRequest {
+            project_id,
+            stage: Stage::Setting,
+            chapter_id: None,
+            user_instruction: Some("请生成简短设定".to_string()),
+            source_artifact_id: None,
+            reference_selection: None,
+            prepared_context_id: None,
+        }
+    }
+
+    async fn wait_for_terminal_run(state: &AppState, run_id: i64) -> AgentRunSummary {
+        for _ in 0..100 {
+            let summary = get_agent_run(state, run_id).unwrap();
+            if matches!(
+                summary.run.status.as_str(),
+                "success" | "failed" | "cancelled"
+            ) {
+                return summary;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("Agent run {run_id} did not reach a terminal status");
+    }
+
+    async fn wait_for_event(state: &AppState, run_id: i64, event_type: &str) {
+        for _ in 0..100 {
+            if state
+                .list_run_events(run_id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == event_type)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("Agent run {run_id} did not emit {event_type}");
+    }
 
     #[test]
     fn prompt_segments_keep_heading_boundaries() {
         let segments = split_segments("# 项目\nA\n# Agent 工具执行结果\nB");
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[1].kind, "tool_result");
+    }
+
+    #[tokio::test]
+    async fn mock_streaming_ai_runs_in_background_and_can_be_cancelled() {
+        let base_url = start_mock_ai_server().await;
+        let (_temp_dir, state, project) = test_state(&base_url);
+
+        let started = start_agent_run(&state, setting_request(project.id))
+            .await
+            .unwrap();
+        assert_eq!(started.run.status, "running");
+        assert!(started.artifact.is_none());
+        assert!(state.get_active_agent_run(project.id).unwrap().is_some());
+
+        let completed = wait_for_terminal_run(&state, started.run.id).await;
+        assert_eq!(completed.run.status, "success");
+        assert_eq!(
+            completed
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.content.as_str()),
+            Some("Mock streamed setting")
+        );
+        let completed_events = state.list_run_events(started.run.id, 0).unwrap();
+        assert!(completed_events
+            .iter()
+            .any(|event| event.kind == "output_delta"));
+        assert!(completed_events
+            .iter()
+            .any(|event| event.kind == "completed"));
+
+        let cancelling = start_agent_run(&state, setting_request(project.id))
+            .await
+            .unwrap();
+        wait_for_event(&state, cancelling.run.id, "output_delta").await;
+        let cancellation = cancel_agent_run(&state, cancelling.run.id).unwrap();
+        assert_eq!(cancellation.run.status, "cancellation_requested");
+
+        let cancelled = wait_for_terminal_run(&state, cancelling.run.id).await;
+        assert_eq!(cancelled.run.status, "cancelled");
+        assert!(cancelled.artifact.is_none());
+        assert!(state
+            .list_run_events(cancelling.run.id, 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "cancelled"));
     }
 }

@@ -24,7 +24,7 @@ use crate::{
         ChapterSplitPlanRequest, ContextPreview, ContextPreviewSegment, ContinuityIssue,
         ContinuityReport, ContinuityReviewRequest, Project, ReviewIssue, RevisionRequest,
         RunAgentRequest, SpanReplacementRequest, Stage, StoryContextSearchInput,
-        StoryContextSnippet,
+        StoryContextSnippet, WorkflowRun,
     },
     quality, story_architecture,
 };
@@ -205,6 +205,23 @@ fn normalize_evidence_text(text: &str) -> String {
 pub async fn run_agent_step(
     state: &AppState,
     input: RunAgentRequest,
+) -> AppResult<AgentStepResult> {
+    run_agent_step_impl(state, input, None, true).await
+}
+
+pub(crate) async fn run_agent_step_from_run(
+    state: &AppState,
+    input: RunAgentRequest,
+    existing_run: WorkflowRun,
+) -> AppResult<AgentStepResult> {
+    run_agent_step_impl(state, input, Some(existing_run), false).await
+}
+
+async fn run_agent_step_impl(
+    state: &AppState,
+    input: RunAgentRequest,
+    existing_run: Option<WorkflowRun>,
+    emit_completion: bool,
 ) -> AppResult<AgentStepResult> {
     state.get_project(input.project_id)?;
     let chapter = state.ensure_chapter(input.project_id, input.chapter_id)?;
@@ -459,25 +476,64 @@ pub async fn run_agent_step(
     };
 
     let started = Instant::now();
-    let mut run = state.insert_workflow_run(
-        input.project_id,
-        input.chapter_id,
-        input.stage.as_str(),
-        &prompt,
-        "",
-        "streaming",
-        None,
-        0,
-    )?;
-    state.insert_run_event(
-        run.id,
-        input.project_id,
-        input.chapter_id,
-        "started",
-        "",
-        "streaming",
-        None,
-    )?;
+    let mut run = if let Some(run) = existing_run {
+        if state.run_cancellation_requested(run.id)? {
+            let cancelled =
+                state.update_workflow_run(run.id, "", "cancelled", Some("用户请求取消"), 0)?;
+            state.insert_run_event(
+                cancelled.id,
+                input.project_id,
+                input.chapter_id,
+                "cancelled",
+                "",
+                "cancelled",
+                Some("用户请求取消"),
+            )?;
+            return Err(AppError::Validation("Agent 运行已取消".to_string()));
+        }
+        state.update_workflow_run(run.id, "", "streaming", None, 0)?
+    } else {
+        let run = state.insert_workflow_run(
+            input.project_id,
+            input.chapter_id,
+            input.stage.as_str(),
+            &prompt,
+            "",
+            "streaming",
+            None,
+            0,
+        )?;
+        state.insert_run_event(
+            run.id,
+            input.project_id,
+            input.chapter_id,
+            "started",
+            "",
+            "streaming",
+            None,
+        )?;
+        run
+    };
+    if state.run_cancellation_requested(run.id)? {
+        let message = "Agent 运行已取消";
+        state.update_workflow_run(
+            run.id,
+            "",
+            "cancelled",
+            Some(message),
+            started.elapsed().as_millis() as i64,
+        )?;
+        state.insert_run_event(
+            run.id,
+            input.project_id,
+            input.chapter_id,
+            "cancelled",
+            "",
+            "cancelled",
+            Some(message),
+        )?;
+        return Err(AppError::Validation(message.to_string()));
+    }
     let mut latest_output = String::new();
     let mut last_persisted_chars = 0usize;
     let mut last_event_chars = 0usize;
@@ -508,12 +564,24 @@ pub async fn run_agent_step(
                 last_persisted_chars = chars;
                 last_persisted_at = Instant::now();
             }
+            let output_reset = partial.is_empty() && last_event_chars > 0;
             let delta = if chars >= last_event_chars {
                 partial.chars().skip(last_event_chars).collect::<String>()
             } else {
                 last_event_chars = 0;
                 partial.to_string()
             };
+            if output_reset {
+                state.insert_run_event(
+                    run.id,
+                    input.project_id,
+                    input.chapter_id,
+                    "output_reset",
+                    "",
+                    "streaming",
+                    None,
+                )?;
+            }
             if !delta.is_empty() {
                 state.insert_run_event(
                     run.id,
@@ -581,6 +649,7 @@ pub async fn run_agent_step(
                 None,
                 started.elapsed().as_millis() as i64,
             )?;
+            state.link_run_artifact(run.id, artifact.id)?;
             sync_story_threads_after_generation(state, &artifact)?;
             state.insert_message(
                 input.project_id,
@@ -593,15 +662,17 @@ pub async fn run_agent_step(
                     artifact.title
                 ),
             )?;
-            state.insert_run_event(
-                run.id,
-                input.project_id,
-                input.chapter_id,
-                "completed",
-                "",
-                "success",
-                None,
-            )?;
+            if emit_completion {
+                state.insert_run_event(
+                    run.id,
+                    input.project_id,
+                    input.chapter_id,
+                    "completed",
+                    "",
+                    "success",
+                    None,
+                )?;
+            }
             Ok(AgentStepResult { artifact, run })
         }
         Err(err) => {

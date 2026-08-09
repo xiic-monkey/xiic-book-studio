@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-const V2_SCHEMA_VERSION: i64 = 3;
+const V2_SCHEMA_VERSION: i64 = 4;
 
 pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
@@ -43,6 +43,10 @@ pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
         }
         if current < 3 {
             apply_migration(conn, 3, migrate_v3)?;
+            current = 3;
+        }
+        if current < 4 {
+            apply_migration(conn, 4, migrate_v4)?;
         }
         debug_assert!(V2_SCHEMA_VERSION >= current);
         Ok(())
@@ -199,6 +203,21 @@ fn migrate_v3(conn: &Connection) -> AppResult<()> {
          UPDATE agent_run_events
          SET stage = COALESCE((SELECT stage FROM workflow_runs WHERE id = run_id), '')
          WHERE stage = '';",
+    )?;
+    Ok(())
+}
+
+fn migrate_v4(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_run_artifacts (
+            run_id INTEGER PRIMARY KEY,
+            artifact_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES workflow_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_run_artifacts_artifact
+            ON agent_run_artifacts(artifact_id);",
     )?;
     Ok(())
 }
@@ -490,6 +509,30 @@ impl AppState {
             )
             .optional()?
             .ok_or_else(|| AppError::Validation("Agent 运行不存在".to_string()))
+        })
+    }
+
+    pub fn link_run_artifact(&self, run_id: i64, artifact_id: i64) -> AppResult<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agent_run_artifacts(run_id, artifact_id, created_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(run_id) DO UPDATE SET artifact_id = excluded.artifact_id",
+                params![run_id, artifact_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn artifact_id_for_run(&self, run_id: i64) -> AppResult<Option<i64>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT artifact_id FROM agent_run_artifacts WHERE run_id = ?1",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .optional()?)
         })
     }
 

@@ -31,12 +31,6 @@ impl ApplicationGateway {
         self.state.subscribe_run_events()
     }
 
-    // The browser-only development API still exposes legacy commands while V2 routes are
-    // being migrated into this gateway. Keep that compatibility boundary explicit.
-    pub(crate) fn legacy_state(&self) -> &AppState {
-        &self.state
-    }
-
     pub async fn preview_agent_run(&self, input: AgentRunRequest) -> AppResult<PreparedContext> {
         agent_run_service::preview_agent_run(&self.state, input).await
     }
