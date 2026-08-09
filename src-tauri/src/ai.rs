@@ -6,7 +6,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::{
     error::{AppError, AppResult},
-    models::{AiSettings, ModelInfo, ModelsResponse, ReviewIssue},
+    models::{AgentToolDefinition, AiSettings, ModelInfo, ModelsResponse, ReviewIssue, ToolCall},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,6 +59,29 @@ const AI_REQUEST_TIMEOUT_SECONDS: u64 = 240;
 const AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: u64 = 45;
 const AI_RETRY_DELAY_MILLIS: u64 = 1_000;
 
+#[derive(Debug)]
+pub enum ToolPlanningError {
+    Unsupported(String),
+    Other(AppError),
+}
+
+impl From<AppError> for ToolPlanningError {
+    fn from(value: AppError) -> Self {
+        Self::Other(value)
+    }
+}
+
+impl std::fmt::Display for ToolPlanningError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(message) | Self::Other(AppError::Validation(message)) => {
+                formatter.write_str(message)
+            }
+            Self::Other(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
 pub fn normalize_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -79,13 +102,15 @@ pub fn build_chat_request(
     user_prompt: &str,
     temperature: f64,
 ) -> ChatCompletionRequest {
+    let thinking_enabled =
+        settings.thinking_enabled && !settings.thinking_level.eq_ignore_ascii_case("off");
     ChatCompletionRequest {
         model: settings.model.clone(),
         temperature,
         stream: None,
         max_completion_tokens: provider_max_completion_tokens(&settings.base_url),
-        thinking: provider_thinking_config(&settings.base_url, settings.thinking_enabled),
-        reasoning_split: provider_reasoning_split(&settings.base_url, settings.thinking_enabled),
+        thinking: provider_thinking_config(&settings.base_url, thinking_enabled),
+        reasoning_split: provider_reasoning_split(&settings.base_url, thinking_enabled),
         response_format: None,
         messages: vec![
             ChatMessage {
@@ -134,6 +159,235 @@ pub async fn complete_json_chat(
         true,
     )
     .await
+}
+
+pub async fn plan_tool_calls_native(
+    settings: &AiSettings,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    tools: &[AgentToolDefinition],
+) -> Result<Vec<ToolCall>, ToolPlanningError> {
+    let normalized_base_url = normalize_base_url(&settings.base_url);
+    if normalized_base_url.is_empty() {
+        return Err(AppError::Validation("请先设置 API Base URL".to_string()).into());
+    }
+    if settings.model.trim().is_empty() {
+        return Err(AppError::Validation("请先设置模型名称".to_string()).into());
+    }
+    if tools.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let thinking_enabled =
+        settings.thinking_enabled && !settings.thinking_level.eq_ignore_ascii_case("off");
+    let native_tools = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.key,
+                    "description": tool.description,
+                    "parameters": tool.parameters_schema,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut request = serde_json::json!({
+        "model": settings.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.0,
+        "tools": native_tools,
+        "tool_choice": "auto"
+    });
+    if let Some(tokens) = provider_max_completion_tokens(&settings.base_url) {
+        request["max_completion_tokens"] = serde_json::json!(tokens);
+    }
+    if let Some(config) = provider_thinking_config(&settings.base_url, thinking_enabled) {
+        request["thinking"] = serde_json::to_value(config).map_err(AppError::from)?;
+    }
+    if let Some(split) = provider_reasoning_split(&settings.base_url, thinking_enabled) {
+        request["reasoning_split"] = serde_json::json!(split);
+    }
+
+    let response = timeout(
+        Duration::from_secs(AI_REQUEST_TIMEOUT_SECONDS),
+        build_client()
+            .post(format!("{normalized_base_url}/chat/completions"))
+            .bearer_auth(api_key)
+            .json(&request)
+            .send(),
+    )
+    .await
+    .map_err(|_| {
+        ToolPlanningError::Other(AppError::Validation(format!(
+            "工具规划请求超过 {} 秒仍未完成",
+            AI_REQUEST_TIMEOUT_SECONDS
+        )))
+    })?
+    .map_err(AppError::from)
+    .map_err(ToolPlanningError::Other)?;
+
+    let status = response.status();
+    let body = read_response_text(response)
+        .await
+        .map_err(ToolPlanningError::Other)?;
+    if !status.is_success() {
+        let compact = compact_error_body(&body);
+        if native_tools_unsupported(status.as_u16(), &body) {
+            return Err(ToolPlanningError::Unsupported(format!(
+                "供应商不支持原生工具调用：HTTP {status} {compact}"
+            )));
+        }
+        return Err(ToolPlanningError::Other(AppError::Validation(format!(
+            "工具规划请求失败：HTTP {status} {compact}"
+        ))));
+    }
+
+    parse_native_tool_calls(&body).map_err(ToolPlanningError::Other)
+}
+
+pub async fn plan_tool_calls_structured(
+    settings: &AiSettings,
+    api_key: &str,
+    system_prompt: &str,
+    task_prompt: &str,
+    tools: &[AgentToolDefinition],
+) -> AppResult<Vec<ToolCall>> {
+    if tools.is_empty() {
+        return Ok(Vec::new());
+    }
+    let catalog = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "key": tool.key,
+                "description": tool.description,
+                "parameters_schema": tool.parameters_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    let prompt = format!(
+        "# 当前任务\n{task_prompt}\n\n# 可用工具\n{}\n\n# 输出协议\n只输出 JSON 对象：{{\"calls\":[{{\"call_id\":\"call-1\",\"tool_key\":\"工具 key\",\"arguments\":{{}}}}]}}。只在确实需要外部证据或创建人工提案时调用；无需工具则输出 {{\"calls\":[]}}。不得调用目录之外的工具。",
+        serde_json::to_string_pretty(&catalog)?
+    );
+    let raw = complete_chat(settings, api_key, system_prompt, &prompt, 0.0).await?;
+    parse_structured_tool_calls(&raw)
+}
+
+fn native_tools_unsupported(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 404 | 405 | 415 | 422) {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    [
+        "tool_choice",
+        "tool calls",
+        "tool_calls",
+        "function calling",
+        "function_call",
+        "unknown field `tools`",
+        "unsupported parameter: tools",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn parse_native_tool_calls(raw: &str) -> AppResult<Vec<ToolCall>> {
+    let value: Value = serde_json::from_str(raw)?;
+    let message = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .ok_or_else(|| AppError::Validation("原生工具响应缺少 choices[0].message".to_string()))?;
+    let calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let function = call
+                .get("function")
+                .ok_or_else(|| AppError::Validation("原生工具调用缺少 function".to_string()))?;
+            let tool_key = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| AppError::Validation("原生工具调用缺少 name".to_string()))?;
+            let raw_arguments = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            let arguments = serde_json::from_str(raw_arguments).map_err(|error| {
+                AppError::Validation(format!("工具 {tool_key} 参数不是合法 JSON：{error}"))
+            })?;
+            Ok(ToolCall {
+                call_id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("native-{index}")),
+                tool_key: tool_key.to_string(),
+                arguments,
+                protocol: "native".to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_structured_tool_calls(raw: &str) -> AppResult<Vec<ToolCall>> {
+    let trimmed = trim_code_fence(raw);
+    let value: Value = serde_json::from_str(trimmed).or_else(|_| {
+        let start = trimmed.find('{').ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing JSON object",
+            ))
+        })?;
+        let end = trimmed.rfind('}').ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing JSON object",
+            ))
+        })?;
+        serde_json::from_str(&trimmed[start..=end])
+    })?;
+    let calls = value
+        .get("calls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Validation("结构化工具计划缺少 calls 数组".to_string()))?;
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let tool_key = call
+                .get("tool_key")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| AppError::Validation("工具计划缺少 tool_key".to_string()))?;
+            Ok(ToolCall {
+                call_id: call
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("structured-{index}")),
+                tool_key: tool_key.to_string(),
+                arguments: call
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                protocol: "structured".to_string(),
+            })
+        })
+        .collect()
 }
 
 async fn complete_chat_with_format(
@@ -712,6 +966,7 @@ mod tests {
             model: "model-a".to_string(),
             temperature: 0.7,
             thinking_enabled: false,
+            thinking_level: "off".to_string(),
             has_api_key: true,
         };
         let request = build_chat_request(&settings, "sys", "user", 0.4);
@@ -731,6 +986,7 @@ mod tests {
             model: "MiniMax-M3".to_string(),
             temperature: 0.7,
             thinking_enabled: false,
+            thinking_level: "off".to_string(),
             has_api_key: true,
         };
         let request = build_chat_request(&settings, "sys", "user", 0.4);
@@ -751,6 +1007,7 @@ mod tests {
             model: "MiniMax-M3".to_string(),
             temperature: 0.7,
             thinking_enabled: true,
+            thinking_level: "medium".to_string(),
             has_api_key: true,
         };
         let request = build_chat_request(&settings, "sys", "user", 0.4);
@@ -771,6 +1028,7 @@ mod tests {
             model: "deepseek-v4-pro".to_string(),
             temperature: 0.7,
             thinking_enabled: true,
+            thinking_level: "medium".to_string(),
             has_api_key: true,
         };
         let request = build_chat_request(&settings, "sys", "user", 0.4);
@@ -855,6 +1113,7 @@ mod tests {
             model: "model-a".to_string(),
             temperature: 0.7,
             thinking_enabled: false,
+            thinking_level: "off".to_string(),
             has_api_key: true,
         };
         let mut request = build_chat_request(&settings, "sys", "user", 0.4);
@@ -885,5 +1144,44 @@ mod tests {
             normalize_base_url("https://api.minimaxi.com"),
             "https://api.minimaxi.com/v1"
         );
+    }
+
+    #[test]
+    fn native_tool_fallback_only_accepts_capability_errors() {
+        assert!(native_tools_unsupported(
+            400,
+            r#"{"error":{"message":"unsupported parameter: tools"}}"#
+        ));
+        assert!(!native_tools_unsupported(
+            401,
+            r#"{"error":{"message":"unsupported parameter: tools"}}"#
+        ));
+        assert!(!native_tools_unsupported(
+            429,
+            r#"{"error":{"message":"tool_calls rate limit"}}"#
+        ));
+        assert!(!native_tools_unsupported(
+            500,
+            r#"{"error":{"message":"unknown field `tools`"}}"#
+        ));
+    }
+
+    #[test]
+    fn parses_native_and_structured_tool_calls() {
+        let native = parse_native_tool_calls(
+            r#"{"choices":[{"message":{"tool_calls":[{"id":"call-1","function":{"name":"history_context","arguments":"{\"query\":\"旧线索\"}"}}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(native[0].tool_key, "history_context");
+        assert_eq!(native[0].arguments["query"], "旧线索");
+
+        let structured = parse_structured_tool_calls(
+            r#"```json
+            {"calls":[{"call_id":"s-1","tool_key":"chapter_memory","arguments":{}}]}
+            ```"#,
+        )
+        .unwrap();
+        assert_eq!(structured[0].protocol, "structured");
+        assert_eq!(structured[0].tool_key, "chapter_memory");
     }
 }

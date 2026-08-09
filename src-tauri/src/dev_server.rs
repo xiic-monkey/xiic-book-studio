@@ -1,38 +1,46 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{convert::Infallible, env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    adoption, ai, chapter_memory, continuity_ledger,
+    adoption, ai,
+    application::ApplicationGateway,
+    chapter_memory, context_search, continuity_ledger,
     db::AppState,
     error::{AppError, AppResult},
     gate,
     models::{
-        AiSpanRevisionRequest, ChapterGateRequest, ChapterSplitPlanRequest,
+        AgentRunRequest, AiSpanRevisionRequest, ChapterGateRequest, ChapterSplitPlanRequest,
         ClearChapterHistoryRequest, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
-        ContinuityReviewRequest, DecideAdoptionProposalsRequest, DeleteArtifactRequest,
-        LedgerContinuityCheckRequest, ListAdoptionProposalsRequest, ListModelsInput,
+        ContinuityReviewRequest, DecideActionProposalRequest, DecideAdoptionProposalsRequest,
+        DeleteArtifactRequest, ImportReferenceTextRequest, LedgerContinuityCheckRequest,
+        ListActionProposalsRequest, ListAdoptionProposalsRequest, ListModelsInput,
         PrepareArtifactAdoptionsRequest, RebuildChapterMemoryRequest, RebuildStoryIndexRequest,
         RebuildStorySearchIndexRequest, RetryIndexJobsRequest, RevisionRequest, RunAgentRequest,
-        RunStoryArchitectRequest, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
-        SaveWritingSkill, SpanReplacementRequest, StoryBibleReviewRequest, StoryContextSearchInput,
-        TestAiConnectionInput, UpdateAdoptionProposalRequest,
+        RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider, SaveAiSettings,
+        SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest,
+        StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextSearchInput,
+        TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
     },
     quality, story_architecture, story_index, story_search, workflow,
 };
 
 #[derive(Clone)]
 struct DevServerState {
-    app: AppState,
+    gateway: ApplicationGateway,
     db_path: PathBuf,
 }
 
@@ -57,14 +65,24 @@ struct ErrorEnvelope {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RunEventQuery {
+    project_id: Option<i64>,
+    run_id: Option<i64>,
+}
+
 pub async fn run() -> AppResult<()> {
     let db_path = resolve_dev_db_path()?;
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let app = AppState::from_path(db_path.clone())?;
+    app.migrate_legacy_api_keys()?;
     app.start_index_worker();
-    let state = DevServerState { app, db_path };
+    let state = DevServerState {
+        gateway: ApplicationGateway::new(app),
+        db_path,
+    };
 
     let port = env::var("BOOK_STUDIO_DEV_API_PORT")
         .ok()
@@ -75,6 +93,7 @@ pub async fn run() -> AppResult<()> {
     let router = Router::new()
         .route("/health", get(health))
         .route("/meta", get(meta))
+        .route("/events/agent-runs", get(agent_run_events))
         .route("/commands/{command}", post(run_command))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -100,12 +119,37 @@ async fn meta(State(state): State<DevServerState>) -> impl IntoResponse {
     })
 }
 
+async fn agent_run_events(
+    State(state): State<DevServerState>,
+    Query(query): Query<RunEventQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(state.gateway.subscribe_run_events()).filter_map(
+        move |message| {
+            let event = message.ok()?;
+            if query
+                .project_id
+                .is_some_and(|project_id| event.project_id != project_id)
+                || query.run_id.is_some_and(|run_id| event.run_id != run_id)
+            {
+                return None;
+            }
+            let data = serde_json::to_string(&event).ok()?;
+            Some(Ok(Event::default().event("run_event").data(data)))
+        },
+    );
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
 async fn run_command(
     Path(command): Path<String>,
     State(state): State<DevServerState>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    match dispatch_command(&state.app, &command, payload).await {
+    match dispatch_command(&state.gateway, &command, payload).await {
         Ok(value) => (
             StatusCode::OK,
             Json(CommandEnvelope {
@@ -125,7 +169,12 @@ async fn run_command(
     }
 }
 
-async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppResult<Value> {
+async fn dispatch_command(
+    gateway: &ApplicationGateway,
+    command: &str,
+    payload: Value,
+) -> AppResult<Value> {
+    let app = gateway.legacy_state();
     match command {
         "list_projects" => Ok(serde_json::to_value(app.list_projects()?)?),
         "create_project" => Ok(serde_json::to_value(
@@ -139,6 +188,30 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
             app.delete_project(project_id)?;
             Ok(Value::Null)
         }
+        "import_reference_text" => {
+            let input: ImportReferenceTextRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(app.import_reference_text(input)?)?)
+        }
+        "list_reference_materials" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
+            Ok(serde_json::to_value(
+                app.list_reference_materials(project_id)?,
+            )?)
+        }
+        "update_reference_material" => {
+            let input: UpdateReferenceMaterialRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(app.update_reference_material(input)?)?)
+        }
+        "remove_reference_material" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
+            let reference_id = payload
+                .get("referenceId")
+                .or_else(|| payload.get("reference_id"))
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AppError::Validation("missing reference id".to_string()))?;
+            app.remove_reference_material(project_id, reference_id)?;
+            Ok(Value::Null)
+        }
         "create_chapter" => Ok(serde_json::to_value(
             app.create_chapter(read_required(&payload, "input")?)?,
         )?),
@@ -150,7 +223,16 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
         }
         "update_chapter" => {
             let chapter = app.update_chapter(read_required(&payload, "input")?)?;
-            story_search::refresh_chapter_metadata(app, chapter.project_id, chapter.id)?;
+            if let Err(error) =
+                story_search::refresh_chapter_metadata(app, chapter.project_id, chapter.id)
+            {
+                eprintln!("chapter search metadata refresh unavailable; queueing project rebuild: {error}");
+                if let Err(queue_error) =
+                    crate::index_jobs::enqueue_project_search_job(app, chapter.project_id)
+                {
+                    eprintln!("unable to queue chapter search rebuild: {queue_error}");
+                }
+            }
             Ok(serde_json::to_value(chapter)?)
         }
         "get_project" => {
@@ -162,6 +244,26 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
             let input: SaveAiSettings = read_required(&payload, "input")?;
             Ok(serde_json::to_value(app.save_ai_settings(input)?)?)
         }
+        "list_ai_providers" => Ok(serde_json::to_value(app.list_ai_providers()?)?),
+        "save_ai_provider" => {
+            let input: SaveAiProvider = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(app.save_ai_provider(input)?)?)
+        }
+        "delete_ai_provider" => {
+            let provider_id = read_i64(&payload, &["providerId", "provider_id"])?;
+            app.delete_ai_provider(provider_id)?;
+            Ok(Value::Null)
+        }
+        "list_agents" => Ok(serde_json::to_value(app.list_agents()?)?),
+        "list_agent_tools" => Ok(serde_json::to_value(crate::agent_tools::definitions())?),
+        "save_agent_settings" => {
+            let input: SaveAgentSettings = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(app.save_agent_settings(input)?)?)
+        }
+        "reset_agent_prompt" => {
+            let agent_id = read_i64(&payload, &["agentId", "agent_id"])?;
+            Ok(serde_json::to_value(gateway.reset_agent_prompt(agent_id)?)?)
+        }
         "list_writing_skills" => Ok(serde_json::to_value(app.list_writing_skills()?)?),
         "save_writing_skill" => {
             let input: SaveWritingSkill = read_required(&payload, "input")?;
@@ -170,13 +272,23 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
         "save_knowledge_card" => {
             let input: SaveKnowledgeCard = read_required(&payload, "input")?;
             let card = app.save_knowledge_card(input)?;
-            let _ = story_search::refresh_knowledge_card(app, card.project_id, card.id).await;
+            if let Err(error) = crate::index_jobs::enqueue_project_search_job(app, card.project_id)
+            {
+                eprintln!(
+                    "knowledge card search refresh unavailable; queueing project rebuild: {error}"
+                );
+            }
             Ok(serde_json::to_value(card)?)
         }
         "save_foreshadowing" => {
             let input: SaveForeshadowing = read_required(&payload, "input")?;
             let item = app.save_foreshadowing(input)?;
-            let _ = story_search::refresh_foreshadowing(app, item.project_id, item.id).await;
+            if let Err(error) = crate::index_jobs::enqueue_project_search_job(app, item.project_id)
+            {
+                eprintln!(
+                    "foreshadowing search refresh unavailable; queueing project rebuild: {error}"
+                );
+            }
             Ok(serde_json::to_value(item)?)
         }
         "prepare_artifact_adoptions" => {
@@ -229,7 +341,7 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
         }
         "rebuild_chapter_memory" => {
             let input: RebuildChapterMemoryRequest = read_required(&payload, "input")?;
-            let settings = app.get_ai_settings()?;
+            let settings = app.get_ai_settings_for_agent("chapter_memory")?;
             let api_key = app
                 .get_api_key_for_base_url(&settings.base_url)?
                 .ok_or_else(|| {
@@ -370,8 +482,12 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
             }
         }
         "analyze_artifact_quality" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             let artifact_id = read_i64(&payload, &["artifactId", "artifact_id"])?;
             let artifact = app.get_artifact(artifact_id)?;
+            if artifact.project_id != project_id {
+                return Err(AppError::Validation("产物不属于当前项目".to_string()));
+            }
             Ok(serde_json::to_value(quality::analyze_artifact(&artifact))?)
         }
         "review_project_continuity" => {
@@ -404,6 +520,110 @@ async fn dispatch_command(app: &AppState, command: &str, payload: Value) -> AppR
                 app, input,
             )?)?)
         }
+        "rerank_story_context" => {
+            let input: StoryContextRerankRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                context_search::rerank_story_context(app, input).await?,
+            )?)
+        }
+        "list_tool_definitions" => Ok(serde_json::to_value(crate::agent_tools::definitions())?),
+        "preview_agent_run" => {
+            let input: AgentRunRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                gateway.preview_agent_run(input).await?,
+            )?)
+        }
+        "start_agent_run" => {
+            let input: AgentRunRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(gateway.start_agent_run(input).await?)?)
+        }
+        "start_story_architect_run" => {
+            let input: RunStoryArchitectRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                gateway.start_story_architect_run(input).await?,
+            )?)
+        }
+        "start_revision_run" => {
+            let input: RevisionRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                gateway.start_revision_run(input).await?,
+            )?)
+        }
+        "cancel_agent_run" => {
+            let run_id = read_i64(&payload, &["runId", "run_id"])?;
+            Ok(serde_json::to_value(gateway.cancel_agent_run(run_id)?)?)
+        }
+        "get_agent_run" => {
+            let run_id = read_i64(&payload, &["runId", "run_id"])?;
+            Ok(serde_json::to_value(gateway.get_agent_run(run_id)?)?)
+        }
+        "list_run_events" => {
+            let run_id = read_i64(&payload, &["runId", "run_id"])?;
+            let after_sequence = payload
+                .get("afterSequence")
+                .or_else(|| payload.get("after_sequence"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            Ok(serde_json::to_value(
+                gateway.list_run_events(run_id, after_sequence)?,
+            )?)
+        }
+        "get_active_agent_run" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
+            Ok(serde_json::to_value(
+                gateway.get_active_agent_run(project_id)?,
+            )?)
+        }
+        "get_project_workspace" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
+            Ok(serde_json::to_value(
+                gateway.get_project_workspace(project_id)?,
+            )?)
+        }
+        "get_artifact_v2" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
+            let artifact_id = read_i64(&payload, &["artifactId", "artifact_id"])?;
+            Ok(serde_json::to_value(
+                gateway.get_artifact(project_id, artifact_id)?,
+            )?)
+        }
+        "list_artifact_summaries" => {
+            let filters = read_required(&payload, "filters")?;
+            Ok(serde_json::to_value(
+                gateway.list_artifact_summaries(filters)?,
+            )?)
+        }
+        "list_index_jobs" => {
+            let project_id = read_i64(&payload, &["projectId", "project_id"])?;
+            Ok(serde_json::to_value(gateway.list_index_jobs(project_id)?)?)
+        }
+        "list_legacy_agent_prompts" => {
+            Ok(serde_json::to_value(gateway.list_legacy_agent_prompts()?)?)
+        }
+        "get_provider_capabilities" => {
+            let provider_base_url = payload
+                .get("providerBaseUrl")
+                .or_else(|| payload.get("provider_base_url"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::Validation("missing provider base URL".to_string()))?;
+            Ok(serde_json::to_value(
+                gateway.get_provider_capabilities(provider_base_url)?,
+            )?)
+        }
+        "list_action_proposals_v2" => {
+            let input: ListActionProposalsRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(gateway.list_action_proposals(input)?)?)
+        }
+        "apply_action_proposal" => {
+            let input: DecideActionProposalRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(gateway.apply_action_proposal(input)?)?)
+        }
+        "reject_action_proposal" => {
+            let input: DecideActionProposalRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                gateway.reject_action_proposal(input)?,
+            )?)
+        }
         _ => Err(AppError::Validation(format!(
             "unknown dev command: {command}"
         ))),
@@ -420,6 +640,7 @@ async fn test_ai_connection_impl(
         model: None,
         temperature: None,
         thinking_enabled: None,
+        thinking_level: None,
         api_key: None,
     });
 
@@ -435,6 +656,14 @@ async fn test_ai_connection_impl(
     if let Some(thinking_enabled) = input.thinking_enabled {
         settings.thinking_enabled = thinking_enabled;
     }
+    if let Some(thinking_level) = input.thinking_level.as_deref() {
+        settings.thinking_level = thinking_level.to_string();
+    }
+    settings.thinking_level = crate::models::normalize_thinking_level(
+        settings.thinking_enabled,
+        &settings.thinking_level,
+    )
+    .map_err(AppError::Validation)?;
 
     if settings.model.trim().is_empty() {
         return Err(AppError::Validation(
@@ -545,11 +774,11 @@ fn resolve_dev_db_path() -> AppResult<PathBuf> {
             .join("Library")
             .join("Application Support")
             .join("com.xiic.book-studio")
-            .join("book-studio.sqlite3"))
+            .join("book-studio-v2.sqlite3"))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        Ok(env::current_dir()?.join(".book-studio-dev.sqlite3"))
+        Ok(env::current_dir()?.join(".book-studio-dev-v2.sqlite3"))
     }
 }

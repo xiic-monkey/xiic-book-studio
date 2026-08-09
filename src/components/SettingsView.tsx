@@ -15,64 +15,60 @@ import {
   RefreshCcw,
   Trash2,
 } from "lucide-react";
-import { useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Select } from "./Select";
 import type {
   Agent,
+  AiProvider,
   AiSettings,
+  AgentToolDefinition,
   GenreAgentProfile,
+  LegacyAgentPrompt,
   ModelInfo,
+  ProviderCapabilities,
+  SaveAiProvider,
   SaveWritingSkill,
   StorySearchStatus,
+  ThinkingLevel,
+  ToolProtocol,
   WritingSkill,
 } from "../types";
 
 type SettingsCategory = "ai" | "agents" | "skills" | "editor" | "data" | "appearance";
 
-type ProviderConfig = {
-  id: string;
-  label: string;
-  baseUrl: string;
+type ProviderConfig = AiProvider;
+
+type AgentDraft = {
+  name: string;
+  role: string;
+  system_prompt: string;
+  provider_base_url: string;
   model: string;
   temperature: number;
-  thinkingEnabled: boolean;
+  thinking_enabled: boolean;
+  thinking_level: ThinkingLevel;
+  uses_global_runtime_settings: boolean;
+  enabled_tool_keys: string[];
+  allowed_skill_keys: string[];
 };
 
-const PROVIDER_STORAGE_KEY = "xiic-book-studio.ai-providers.v1";
-const defaultProviderConfigs: ProviderConfig[] = [
-  {
-    id: "deepseek",
-    label: "DeepSeek",
-    baseUrl: "https://api.deepseek.com",
-    model: "deepseek-v4-pro",
-    temperature: 0.75,
-    thinkingEnabled: false,
-  },
-  {
-    id: "minimax",
-    label: "MiniMax",
-    baseUrl: "https://api.minimaxi.com/v1",
-    model: "MiniMax-M3",
-    temperature: 0.72,
-    thinkingEnabled: true,
-  },
-];
-
-function makeProviderId(seed: string) {
-  const normalized = seed
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return normalized || `provider-${Date.now()}`;
+function agentDraftFromAgent(agent: Agent): AgentDraft {
+  return {
+    name: agent.name,
+    role: agent.editable_role,
+    system_prompt: agent.editable_system_prompt,
+    provider_base_url: agent.provider_base_url,
+    model: agent.model,
+    temperature: agent.temperature,
+    thinking_enabled: agent.thinking_enabled,
+    thinking_level: agent.thinking_level,
+    uses_global_runtime_settings: agent.uses_global_runtime_settings,
+    enabled_tool_keys: [...agent.enabled_tool_keys],
+    allowed_skill_keys: [...agent.allowed_skill_keys],
+  };
 }
 
-function guessProviderLabel(baseUrl: string) {
-  const normalized = baseUrl.toLowerCase();
-  if (normalized.includes("deepseek")) return "DeepSeek";
-  if (normalized.includes("minimax") || normalized.includes("minimaxi")) return "MiniMax";
-  if (normalized.includes("openai")) return "OpenAI";
-  return "自定义供应商";
-}
+const LEGACY_PROVIDER_STORAGE_KEY = "xiic-book-studio.ai-providers.v1";
 
 function normalizeBaseUrl(baseUrl: string) {
   return baseUrl.trim();
@@ -80,23 +76,43 @@ function normalizeBaseUrl(baseUrl: string) {
 
 function normalizeProvider(provider: Partial<ProviderConfig>, index: number): ProviderConfig {
   return {
-    id: provider.id?.trim() || `provider-${index + 1}`,
+    id: typeof provider.id === "number" ? provider.id : -(index + 1),
     label: provider.label?.trim() || `供应商 ${index + 1}`,
-    baseUrl: normalizeBaseUrl(provider.baseUrl ?? ""),
+    base_url: normalizeBaseUrl(provider.base_url ?? ""),
     model: provider.model?.trim() || "",
     temperature: Number.isFinite(provider.temperature) ? Number(provider.temperature) : 0.75,
-    thinkingEnabled: Boolean(provider.thinkingEnabled),
+    thinking_enabled: Boolean(provider.thinking_enabled),
+    thinking_level: provider.thinking_level ?? (provider.thinking_enabled ? "medium" : "off"),
+    tool_protocol: provider.tool_protocol ?? "auto",
+    has_api_key: Boolean(provider.has_api_key),
   };
 }
 
-function readStoredProviders() {
+function readLegacyProviders(): SaveAiProvider[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(PROVIDER_STORAGE_KEY);
+    const raw = window.localStorage.getItem(LEGACY_PROVIDER_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.map((provider, index) => normalizeProvider(provider, index));
+    return parsed
+      .map((provider) => ({
+        id: null,
+        label: typeof provider?.label === "string" ? provider.label.trim() : "",
+        base_url: typeof provider?.baseUrl === "string" ? provider.baseUrl.trim() : "",
+        model: typeof provider?.model === "string" ? provider.model.trim() : "",
+        temperature: Number(provider?.temperature),
+        thinking_enabled: Boolean(provider?.thinkingEnabled),
+        thinking_level: (Boolean(provider?.thinkingEnabled) ? "medium" : "off") as ThinkingLevel,
+        tool_protocol: "auto" as ToolProtocol,
+      }))
+      .filter(
+        (provider) =>
+          provider.label &&
+          provider.base_url &&
+          provider.model &&
+          Number.isFinite(provider.temperature)
+      );
   } catch {
     return [];
   }
@@ -104,16 +120,16 @@ function readStoredProviders() {
 
 function buildProviderFromSettings(settings: AiSettings): ProviderConfig {
   const baseUrl = normalizeBaseUrl(settings.base_url);
-  const preset = defaultProviderConfigs.find(
-    (provider) => provider.baseUrl.trim() === baseUrl
-  );
   return {
-    id: preset?.id ?? makeProviderId(baseUrl || guessProviderLabel(baseUrl)),
-    label: preset?.label ?? guessProviderLabel(settings.base_url),
-    baseUrl,
+    id: -1,
+    label: "当前配置",
+    base_url: baseUrl,
     model: settings.model,
     temperature: settings.temperature,
-    thinkingEnabled: settings.thinking_enabled,
+    thinking_enabled: settings.thinking_enabled,
+    thinking_level: settings.thinking_level,
+    tool_protocol: "auto",
+    has_api_key: settings.has_api_key,
   };
 }
 
@@ -124,24 +140,23 @@ function normalizeAiSettings(settings: AiSettings): AiSettings {
   };
 }
 
-function buildProviderState(settings: AiSettings) {
+function buildProviderState(settings: AiSettings, storedProviders: AiProvider[]) {
   const normalizedSettings = normalizeAiSettings(settings);
-  const storedProviders = readStoredProviders();
-  const baseProviders = (storedProviders.length > 0 ? storedProviders : defaultProviderConfigs).map(
-    (provider, index) => normalizeProvider(provider, index)
-  );
+  const baseProviders = storedProviders.map((provider, index) => normalizeProvider(provider, index));
   const activeBaseUrl = normalizedSettings.base_url.trim();
-  const matchedProvider = baseProviders.find((provider) => provider.baseUrl.trim() === activeBaseUrl);
+  const matchedProvider = baseProviders.find((provider) => provider.base_url.trim() === activeBaseUrl);
 
   if (matchedProvider) {
     const providers = baseProviders.map((provider) =>
       provider.id === matchedProvider.id
           ? {
             ...provider,
-            baseUrl: normalizedSettings.base_url,
+            base_url: normalizedSettings.base_url,
             model: normalizedSettings.model,
             temperature: normalizedSettings.temperature,
-            thinkingEnabled: normalizedSettings.thinking_enabled,
+            thinking_enabled: normalizedSettings.thinking_enabled,
+            thinking_level: normalizedSettings.thinking_level,
+            has_api_key: normalizedSettings.has_api_key,
           }
         : provider
     );
@@ -166,18 +181,39 @@ const categories: { id: SettingsCategory; label: string; icon: React.ReactNode }
 
 interface SettingsViewProps {
   settings: AiSettings;
+  providers: AiProvider[];
   projectId?: number | null;
   storySearchStatus?: StorySearchStatus | null;
   apiKey: string;
   settingsCategory: SettingsCategory;
   onSettingsCategoryChange: (cat: SettingsCategory) => void;
   onBack: () => void;
-  onSaveSettings: (settings: AiSettings, key: string) => Promise<void>;
+  onSaveSettings: (settings: AiSettings, key: string) => Promise<boolean>;
+  onSaveProvider: (input: SaveAiProvider) => Promise<AiProvider | null>;
+  onDeleteProvider: (providerId: number) => Promise<boolean>;
+  onGetProviderCapabilities: (providerBaseUrl: string) => Promise<ProviderCapabilities>;
+  onSaveAgentSettings: (input: {
+    agent_id: number;
+    provider_base_url: string;
+    model: string;
+    name?: string | null;
+    role?: string | null;
+    system_prompt?: string | null;
+    temperature?: number | null;
+    thinking_enabled: boolean;
+    thinking_level?: string | null;
+    uses_global_runtime_settings?: boolean | null;
+    enabled_tool_keys?: string[] | null;
+    allowed_skill_keys?: string[] | null;
+  }) => Promise<Agent | null>;
+  onResetAgentPrompt: (agentId: number) => Promise<Agent | null>;
   onTestConnection: (settings: AiSettings, key: string) => Promise<void>;
   onRefreshModels: (input?: { base_url?: string | null; api_key?: string | null }) => Promise<ModelInfo[]>;
   onRefreshStorySearchStatus: (projectId?: number | null) => Promise<StorySearchStatus | null>;
   onRebuildStorySearch: () => Promise<void>;
   agents: Agent[];
+  agentTools: AgentToolDefinition[];
+  legacyAgentPrompts: LegacyAgentPrompt[];
   genreAgent?: GenreAgentProfile | null;
   writingSkills: WritingSkill[];
   onSaveWritingSkill: (input: SaveWritingSkill) => Promise<void>;
@@ -189,6 +225,7 @@ interface SettingsViewProps {
 
 export function SettingsView({
   settings,
+  providers: savedProviders,
   projectId,
   storySearchStatus,
   apiKey,
@@ -196,11 +233,18 @@ export function SettingsView({
   onSettingsCategoryChange,
   onBack,
   onSaveSettings,
+  onSaveProvider,
+  onDeleteProvider,
+  onGetProviderCapabilities,
+  onSaveAgentSettings,
+  onResetAgentPrompt,
   onTestConnection,
   onRefreshModels,
   onRefreshStorySearchStatus,
   onRebuildStorySearch,
   agents,
+  agentTools,
+  legacyAgentPrompts,
   genreAgent,
   writingSkills,
   onSaveWritingSkill,
@@ -208,14 +252,24 @@ export function SettingsView({
   notice,
   error,
 }: SettingsViewProps) {
-  const initialProviderState = buildProviderState(settings);
+  const initialProviderState = buildProviderState(settings, savedProviders);
   const [aiSettings, setAiSettings] = useState<AiSettings>(settings);
   const [localApiKey, setLocalApiKey] = useState(apiKey);
   const [providers, setProviders] = useState<ProviderConfig[]>(initialProviderState.providers);
   const [selectedProviderId, setSelectedProviderId] = useState(initialProviderState.selectedProviderId);
+  const providerCatalogInitialized = useRef(savedProviders.length > 0);
+  const legacyMigrationStarted = useRef(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
+  const [providerCapabilities, setProviderCapabilities] = useState<ProviderCapabilities | null>(null);
+  const [providerCapabilitiesError, setProviderCapabilitiesError] = useState<string | null>(null);
+  const [loadingProviderCapabilities, setLoadingProviderCapabilities] = useState(false);
+  const [agentDrafts, setAgentDrafts] = useState<Record<number, AgentDraft>>({});
+  const [agentModels, setAgentModels] = useState<Record<number, ModelInfo[]>>({});
+  const [loadingAgentModels, setLoadingAgentModels] = useState<number | null>(null);
+  const [agentModelError, setAgentModelError] = useState<string | null>(null);
+  const [selectedAgentId, setSelectedAgentId] = useState<number | null>(null);
   const [selectedSkillKey, setSelectedSkillKey] = useState("");
   const [skillDraft, setSkillDraft] = useState<SaveWritingSkill | null>(null);
   const [localStorySearchStatus, setLocalStorySearchStatus] = useState<StorySearchStatus | null>(
@@ -223,7 +277,7 @@ export function SettingsView({
   );
 
   useEffect(() => {
-    const nextProviderState = buildProviderState(settings);
+    const nextProviderState = buildProviderState(settings, savedProviders);
     setAiSettings(normalizeAiSettings(settings));
     setLocalApiKey(apiKey);
     setProviders(nextProviderState.providers);
@@ -233,8 +287,32 @@ export function SettingsView({
   }, [settings, apiKey]);
 
   useEffect(() => {
+    if (providerCatalogInitialized.current || savedProviders.length === 0) return;
+    providerCatalogInitialized.current = true;
+    const nextProviderState = buildProviderState(settings, savedProviders);
+    setProviders(nextProviderState.providers);
+    setSelectedProviderId(nextProviderState.selectedProviderId);
+  }, [savedProviders, settings]);
+
+  useEffect(() => {
     setLocalStorySearchStatus(storySearchStatus ?? null);
   }, [storySearchStatus]);
+
+  useEffect(() => {
+    setAgentDrafts((current) => {
+      const next: typeof current = {};
+      for (const agent of agents) {
+        next[agent.id] = current[agent.id] ?? agentDraftFromAgent(agent);
+      }
+      return next;
+    });
+  }, [agents]);
+
+  useEffect(() => {
+    setSelectedAgentId((current) =>
+      agents.some((agent) => agent.id === current) ? current : agents[0]?.id ?? null
+    );
+  }, [agents]);
 
   useEffect(() => {
     if (!projectId) {
@@ -247,9 +325,29 @@ export function SettingsView({
   }, [projectId]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(PROVIDER_STORAGE_KEY, JSON.stringify(providers));
-  }, [providers]);
+    if (typeof window === "undefined" || legacyMigrationStarted.current || savedProviders.length === 0) return;
+    const legacyProviders = readLegacyProviders();
+    legacyMigrationStarted.current = true;
+    if (legacyProviders.length === 0) {
+      window.localStorage.removeItem(LEGACY_PROVIDER_STORAGE_KEY);
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      for (const provider of legacyProviders) {
+        if (cancelled) return;
+        const saved = await onSaveProvider(provider);
+        if (!saved) return;
+      }
+      if (!cancelled) {
+        window.localStorage.removeItem(LEGACY_PROVIDER_STORAGE_KEY);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [onSaveProvider, savedProviders.length]);
 
   useEffect(() => {
     if (writingSkills.length === 0) {
@@ -261,6 +359,7 @@ export function SettingsView({
       writingSkills.find((skill) => skill.skill_key === selectedSkillKey) ?? writingSkills[0];
     setSelectedSkillKey(selected.skill_key);
     setSkillDraft({
+      id: selected.id,
       skill_key: selected.skill_key,
       name: selected.name,
       category: selected.category,
@@ -273,9 +372,67 @@ export function SettingsView({
   const currentProvider =
     providers.find((provider) => provider.id === selectedProviderId) ?? providers[0] ?? null;
 
+  useEffect(() => {
+    const providerBaseUrl = currentProvider?.base_url.trim();
+    if (!providerBaseUrl) {
+      setProviderCapabilities(null);
+      setProviderCapabilitiesError(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadingProviderCapabilities(true);
+    setProviderCapabilitiesError(null);
+    void onGetProviderCapabilities(providerBaseUrl)
+      .then((capabilities) => {
+        if (!cancelled) setProviderCapabilities(capabilities);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setProviderCapabilities(null);
+          setProviderCapabilitiesError(String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingProviderCapabilities(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentProvider?.base_url, onGetProviderCapabilities]);
+
   const handleSaveAi = async () => {
-    await onSaveSettings(aiSettings, localApiKey);
-    setLocalApiKey("");
+    if (!currentProvider) return;
+    const savedProvider = await onSaveProvider({
+      id: currentProvider.id > 0 ? currentProvider.id : null,
+      label: currentProvider.label,
+      base_url: aiSettings.base_url,
+      model: aiSettings.model,
+      temperature: aiSettings.temperature,
+      thinking_enabled: aiSettings.thinking_enabled,
+      thinking_level: aiSettings.thinking_level,
+      tool_protocol: currentProvider.tool_protocol,
+    });
+    if (!savedProvider) return;
+
+    setProviders((current) =>
+      current.map((provider) =>
+        provider.id === currentProvider.id ? savedProvider : provider
+      )
+    );
+    setSelectedProviderId(savedProvider.id);
+    const succeeded = await onSaveSettings(
+      {
+        ...aiSettings,
+        base_url: savedProvider.base_url,
+        model: savedProvider.model,
+        temperature: savedProvider.temperature,
+        thinking_enabled: savedProvider.thinking_enabled,
+        thinking_level: savedProvider.thinking_level,
+        has_api_key: savedProvider.has_api_key,
+      },
+      localApiKey
+    );
+    if (succeeded) setLocalApiKey("");
   };
 
   const handleTestConnection = async () => {
@@ -304,6 +461,57 @@ export function SettingsView({
     await onSaveWritingSkill(skillDraft);
   };
 
+  const updateAgentDraft = (agent: Agent, patch: Partial<AgentDraft>) => {
+    setAgentDrafts((current) => ({
+      ...current,
+      [agent.id]: {
+        name: current[agent.id]?.name ?? agent.name,
+        role: current[agent.id]?.role ?? agent.editable_role,
+        system_prompt: current[agent.id]?.system_prompt ?? agent.editable_system_prompt,
+        provider_base_url: current[agent.id]?.provider_base_url ?? agent.provider_base_url,
+        model: current[agent.id]?.model ?? agent.model,
+        temperature: current[agent.id]?.temperature ?? agent.temperature,
+        thinking_enabled: current[agent.id]?.thinking_enabled ?? agent.thinking_enabled,
+        thinking_level: current[agent.id]?.thinking_level ?? agent.thinking_level,
+        uses_global_runtime_settings:
+          current[agent.id]?.uses_global_runtime_settings ?? agent.uses_global_runtime_settings,
+        enabled_tool_keys: current[agent.id]?.enabled_tool_keys ?? [...agent.enabled_tool_keys],
+        allowed_skill_keys: current[agent.id]?.allowed_skill_keys ?? [...agent.allowed_skill_keys],
+        ...patch,
+      },
+    }));
+  };
+
+  const saveAgentDraft = async (agent: Agent) => {
+    const draft = agentDrafts[agent.id] ?? agentDraftFromAgent(agent);
+    const saved = await onSaveAgentSettings({ agent_id: agent.id, ...draft });
+    if (saved) {
+      setAgentDrafts((current) => ({ ...current, [agent.id]: agentDraftFromAgent(saved) }));
+    }
+  };
+
+  const resetAgentPrompt = async (agent: Agent) => {
+    if (!window.confirm(`恢复“${agent.name}”的 V2 默认系统提示词？当前自定义内容将被替换。`)) return;
+    const saved = await onResetAgentPrompt(agent.id);
+    if (saved) {
+      setAgentDrafts((current) => ({ ...current, [agent.id]: agentDraftFromAgent(saved) }));
+    }
+  };
+
+  const refreshAgentModels = async (agent: Agent) => {
+    const draft = agentDrafts[agent.id] ?? agent;
+    setLoadingAgentModels(agent.id);
+    setAgentModelError(null);
+    try {
+      const result = await onRefreshModels({ base_url: draft.provider_base_url });
+      setAgentModels((current) => ({ ...current, [agent.id]: result }));
+    } catch (err) {
+      setAgentModelError(`${agent.name}：${String(err)}`);
+    } finally {
+      setLoadingAgentModels(null);
+    }
+  };
+
   const handleRebuildStorySearch = async () => {
     await onRebuildStorySearch();
     const status = await onRefreshStorySearchStatus(projectId);
@@ -320,17 +528,18 @@ export function SettingsView({
     );
   };
 
-  const selectProvider = (providerId: string) => {
+  const selectProvider = (providerId: number) => {
     const provider = providers.find((item) => item.id === providerId);
     if (!provider) return;
     setSelectedProviderId(providerId);
     setAiSettings((current) => ({
       ...current,
-      base_url: provider.baseUrl,
+      base_url: provider.base_url,
       model: provider.model,
       temperature: provider.temperature,
-      thinking_enabled: provider.thinkingEnabled,
-      has_api_key: current.base_url.trim() === provider.baseUrl.trim() ? current.has_api_key : false,
+      thinking_enabled: provider.thinking_enabled,
+      thinking_level: provider.thinking_level,
+      has_api_key: provider.has_api_key,
     }));
     setLocalApiKey("");
     setModels([]);
@@ -340,21 +549,25 @@ export function SettingsView({
   const addProvider = () => {
     const nextIndex = providers.length + 1;
     const provider: ProviderConfig = {
-      id: `provider-${Date.now()}`,
+      id: -Date.now(),
       label: `自定义供应商 ${nextIndex}`,
-      baseUrl: "",
+      base_url: "",
       model: "",
       temperature: aiSettings.temperature,
-      thinkingEnabled: aiSettings.thinking_enabled,
+      thinking_enabled: aiSettings.thinking_enabled,
+      thinking_level: aiSettings.thinking_level,
+      tool_protocol: "auto",
+      has_api_key: false,
     };
     setProviders((current) => [...current, provider]);
     setSelectedProviderId(provider.id);
     setAiSettings((current) => ({
       ...current,
-      base_url: provider.baseUrl,
+      base_url: provider.base_url,
       model: provider.model,
       temperature: provider.temperature,
-      thinking_enabled: provider.thinkingEnabled,
+      thinking_enabled: provider.thinking_enabled,
+      thinking_level: provider.thinking_level,
       has_api_key: false,
     }));
     setLocalApiKey("");
@@ -362,8 +575,9 @@ export function SettingsView({
     setModelError(null);
   };
 
-  const removeProvider = (providerId: string) => {
+  const removeProvider = async (providerId: number) => {
     if (providers.length <= 1) return;
+    if (providerId > 0 && !(await onDeleteProvider(providerId))) return;
     const nextProviders = providers.filter((provider) => provider.id !== providerId);
     setProviders(nextProviders);
     if (selectedProviderId !== providerId) return;
@@ -372,16 +586,40 @@ export function SettingsView({
     setSelectedProviderId(fallbackProvider.id);
     setAiSettings((current) => ({
       ...current,
-      base_url: fallbackProvider.baseUrl,
+      base_url: fallbackProvider.base_url,
       model: fallbackProvider.model,
       temperature: fallbackProvider.temperature,
-      thinking_enabled: fallbackProvider.thinkingEnabled,
-      has_api_key: false,
+      thinking_enabled: fallbackProvider.thinking_enabled,
+      thinking_level: fallbackProvider.thinking_level,
+      has_api_key: fallbackProvider.has_api_key,
     }));
     setLocalApiKey("");
     setModels([]);
     setModelError(null);
   };
+
+  const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) ?? agents[0] ?? null;
+  const selectedAgentDraft = selectedAgent
+    ? agentDrafts[selectedAgent.id] ?? agentDraftFromAgent(selectedAgent)
+    : null;
+  const selectedAgentProviderOptions = selectedAgent && selectedAgentDraft
+    ? (providers.some((provider) => provider.base_url.trim() === selectedAgentDraft.provider_base_url.trim())
+        ? providers
+        : [
+            ...providers,
+            {
+              id: -selectedAgent.id,
+              label: selectedAgentDraft.provider_base_url || "当前 Agent 供应商",
+              base_url: selectedAgentDraft.provider_base_url,
+              model: selectedAgentDraft.model,
+              temperature: selectedAgent.temperature,
+              thinking_enabled: selectedAgentDraft.thinking_enabled,
+              thinking_level: selectedAgentDraft.thinking_level,
+              tool_protocol: "auto" as ToolProtocol,
+              has_api_key: false,
+            },
+          ])
+    : [];
 
   const renderCategoryContent = () => {
     switch (settingsCategory) {
@@ -409,7 +647,7 @@ export function SettingsView({
                         <button
                           type="button"
                           className="provider-pill-remove"
-                          onClick={() => removeProvider(provider.id)}
+                          onClick={() => void removeProvider(provider.id)}
                           aria-label={`删除 ${provider.label}`}
                         >
                           <Trash2 size={12} />
@@ -432,7 +670,7 @@ export function SettingsView({
                   type="text"
                   value={currentProvider?.label ?? ""}
                   onChange={(e) => updateCurrentProvider({ label: e.target.value })}
-                  placeholder="例如：DeepSeek / MiniMax / 自定义"
+                  placeholder="例如：官方服务 / 自定义服务"
                 />
               </div>
               <div className="form-field">
@@ -444,35 +682,33 @@ export function SettingsView({
                   onChange={(e) => {
                     const value = e.target.value;
                     setAiSettings({ ...aiSettings, base_url: value });
-                    updateCurrentProvider({ baseUrl: value });
+                    updateCurrentProvider({ base_url: value });
                   }}
-                  placeholder="https://api.deepseek.com"
+                  placeholder="https://api.example.com/v1"
                 />
               </div>
               <div className="form-field">
                 <label htmlFor="model">模型名称</label>
                 <div className="model-picker">
                   <div className="model-picker-row">
-                    <select
+                    <Select
                       id="model"
                       value={aiSettings.model}
-                      onChange={(e) => {
-                        const value = e.target.value;
+                      onChange={(value) => {
                         setAiSettings({ ...aiSettings, model: value });
                         updateCurrentProvider({ model: value });
                       }}
-                    >
-                      <option value="">手动输入模型名</option>
-                      {(aiSettings.model && !models.some((model) => model.id === aiSettings.model)
-                        ? [{ id: aiSettings.model, owned_by: null }, ...models]
-                        : models
-                      ).map((model) => (
-                        <option key={model.id} value={model.id}>
-                          {model.id}
-                          {model.owned_by ? ` · ${model.owned_by}` : ""}
-                        </option>
-                      ))}
-                    </select>
+                      options={[
+                        { value: "", label: "手动输入模型名" },
+                        ...(aiSettings.model && !models.some((model) => model.id === aiSettings.model)
+                          ? [{ id: aiSettings.model, owned_by: null }, ...models]
+                          : models
+                        ).map((model) => ({
+                          value: model.id,
+                          label: `${model.id}${model.owned_by ? ` · ${model.owned_by}` : ""}`,
+                        })),
+                      ]}
+                    />
                     <button type="button" onClick={handleRefreshModels} disabled={loadingModels || Boolean(busy)}>
                       {loadingModels ? <Loader2 size={14} className="spin" /> : <ChevronDown size={14} />}
                       刷新
@@ -521,14 +757,78 @@ export function SettingsView({
                     checked={aiSettings.thinking_enabled}
                     onChange={(e) => {
                       const value = e.target.checked;
-                      setAiSettings({ ...aiSettings, thinking_enabled: value });
-                      updateCurrentProvider({ thinkingEnabled: value });
+                      const thinking_level = value
+                        ? (aiSettings.thinking_level === "off" ? "medium" : aiSettings.thinking_level)
+                        : "off";
+                      setAiSettings({ ...aiSettings, thinking_enabled: value, thinking_level });
+                      updateCurrentProvider({ thinking_enabled: value, thinking_level });
                     }}
                   />
                   <span>开启供应商支持的思考能力</span>
                 </label>
+                <div className="form-field">
+                  <label htmlFor="thinking_level">思考强度</label>
+                  <Select
+                    id="thinking_level"
+                    value={aiSettings.thinking_level}
+                    disabled={!aiSettings.thinking_enabled}
+                    onChange={(value) => {
+                      const thinking_level = value as AiSettings["thinking_level"];
+                      setAiSettings({
+                        ...aiSettings,
+                        thinking_level,
+                        thinking_enabled: thinking_level !== "off",
+                      });
+                      updateCurrentProvider({
+                        thinking_level,
+                        thinking_enabled: thinking_level !== "off",
+                      });
+                    }}
+                    options={[
+                      { value: "off", label: "关闭" },
+                      { value: "low", label: "低" },
+                      { value: "medium", label: "中" },
+                      { value: "high", label: "高" },
+                    ]}
+                  />
+                </div>
                 <div className="settings-hint-row">
-                  <span>DeepSeek 与 MiniMax 会自动使用各自协议；未知供应商默认不发送思考参数。</span>
+                  <span>不同供应商对思考强度的支持不同；不支持分级时会降级为开启/关闭。</span>
+                </div>
+              </div>
+              <div className="form-field">
+                <label htmlFor="tool_protocol">工具调用协议</label>
+                <Select
+                  id="tool_protocol"
+                  value={currentProvider?.tool_protocol ?? "auto"}
+                  onChange={(value) => updateCurrentProvider({ tool_protocol: value as ToolProtocol })}
+                  options={[
+                    { value: "auto", label: "自动（原生优先，明确不支持时回退）" },
+                    { value: "native", label: "仅原生 tool calling" },
+                    { value: "structured", label: "仅结构化 JSON 计划" },
+                  ]}
+                />
+                <div className="settings-hint-row">
+                  <span>认证、限流、超时或服务端错误不会触发自动回退。</span>
+                </div>
+                <div className="settings-hint-row">
+                  {loadingProviderCapabilities && <span>正在读取运行时能力状态…</span>}
+                  {!loadingProviderCapabilities && providerCapabilities && (
+                    <span>
+                      实际探测：{providerCapabilities.detected_protocol === "native"
+                        ? "原生 tool calling"
+                        : providerCapabilities.detected_protocol === "structured"
+                          ? "结构化 JSON"
+                          : "尚未探测"}
+                      {providerCapabilities.updated_at ? ` · ${providerCapabilities.updated_at}` : ""}
+                    </span>
+                  )}
+                  {providerCapabilities?.last_error && (
+                    <span className="settings-error">最近能力探测：{providerCapabilities.last_error}</span>
+                  )}
+                  {providerCapabilitiesError && (
+                    <span className="settings-error">能力状态读取失败：{providerCapabilitiesError}</span>
+                  )}
                 </div>
               </div>
               <div className="form-field">
@@ -541,7 +841,7 @@ export function SettingsView({
                   onChange={(e) => setLocalApiKey(e.target.value)}
                 />
                 <div className="settings-hint-row">
-                  <span>API Key 会按供应商单独保存，MiniMax 和 DeepSeek 不会再串用。</span>
+                  <span>API Key 会按供应商地址直接保存在本地 SQLite 中。</span>
                 </div>
               </div>
               <div className="button-row">
@@ -560,8 +860,8 @@ export function SettingsView({
         return (
           <div className="settings-content wide">
             <div className="settings-intro">
-              <p>每本书持久绑定一个题材专属 Agent；故事架构、写作、试读和修订是它的工作模式。</p>
-              <span>专属 Agent 只能加载白名单 Skill，技能库中的其他题材规则不会进入上下文。</span>
+              <p>这里统一管理每个 Agent 的身份、模型参数、思考强度、工具和 Skill 白名单。</p>
+              <span>供应商、模型和思考模式可以继承全局服务配置；Temperature、工具和辅助 Skill 按 Agent 单独保存。</span>
             </div>
             {genreAgent && (
               <section className="agent-prompt-card agent-profile-card">
@@ -579,29 +879,309 @@ export function SettingsView({
                 <p>{genreAgent.allowed_skill_keys.join(" · ")}</p>
               </section>
             )}
-            <div className="agent-prompt-list">
-              {agents.map((agent) => (
-                <section className="agent-prompt-card" key={agent.id}>
-                  <header>
-                    <div>
-                      <strong>{agent.name}</strong>
-                      <span>{agent.stage}</span>
+            <p className="settings-hint agent-settings-note">
+              题材 Agent 是当前项目共享的身份层；每个运行 Agent 下面的配置都会直接影响实际工作流。
+            </p>
+            {agentModelError && <p className="settings-error">{agentModelError}</p>}
+            <div className="agent-settings-layout">
+              <nav className="agent-list" aria-label="Agent 列表">
+                {agents.map((agent) => {
+                  const draft = agentDrafts[agent.id] ?? agentDraftFromAgent(agent);
+                  const selected = agent.id === selectedAgent?.id;
+                  return (
+                    <button
+                      key={agent.id}
+                      type="button"
+                      className={selected ? "agent-list-item active" : "agent-list-item"}
+                      onClick={() => setSelectedAgentId(agent.id)}
+                      aria-current={selected ? "true" : undefined}
+                    >
+                      <span className="agent-list-item-title">{draft.name || agent.name}</span>
+                      <span className="agent-list-item-meta">{agent.stage} · {draft.uses_global_runtime_settings ? "继承全局" : draft.model || "未设模型"}</span>
+                    </button>
+                  );
+                })}
+              </nav>
+              <div className="agent-editor-pane">
+              {selectedAgent && selectedAgentDraft && (() => {
+                const agent = selectedAgent;
+                const draft = selectedAgentDraft;
+                const agentProviderOptions = selectedAgentProviderOptions;
+                const availableModels = agentModels[agent.id] ?? [];
+                return (
+                  <section className="agent-prompt-card" key={agent.id}>
+                    <header>
+                      <div>
+                        <strong>{draft.name || agent.name}</strong>
+                        <span>{agent.stage}</span>
+                      </div>
+                      <small>Temperature {draft.temperature.toFixed(2)}</small>
+                    </header>
+                    <div className="agent-edit-grid">
+                      <div className="form-field">
+                        <label htmlFor={"agent-name-" + agent.id}>名称</label>
+                        <input
+                          id={"agent-name-" + agent.id}
+                          value={draft.name}
+                          onChange={(event) => updateAgentDraft(agent, { name: event.target.value })}
+                          placeholder="Agent 名称"
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label htmlFor={"agent-role-" + agent.id}>职责</label>
+                        <input
+                          id={"agent-role-" + agent.id}
+                          value={draft.role}
+                          onChange={(event) => updateAgentDraft(agent, { role: event.target.value })}
+                          placeholder="Agent 职责"
+                        />
+                      </div>
                     </div>
-                    <small>Temperature {agent.temperature}</small>
-                  </header>
-                  <p>{agent.role}</p>
-                  <label htmlFor={`agent-prompt-${agent.id}`}>系统提示词</label>
-                  <textarea
-                    id={`agent-prompt-${agent.id}`}
-                    className="agent-prompt-textarea"
-                    readOnly
-                    value={agent.system_prompt}
-                    spellCheck={false}
-                  />
-                </section>
-              ))}
-              {agents.length === 0 && <p className="settings-hint">选择一个书籍项目后查看 Agent 配置。</p>}
+                    <label className="checkbox-field agent-global-toggle">
+                      <input
+                        type="checkbox"
+                        checked={draft.uses_global_runtime_settings}
+                        onChange={(event) =>
+                          updateAgentDraft(agent, {
+                            uses_global_runtime_settings: event.target.checked,
+                          })
+                        }
+                      />
+                      继承全局供应商、模型和思考配置
+                    </label>
+                    {draft.uses_global_runtime_settings && (
+                      <p className="agent-inherited-summary">
+                        当前生效：{aiSettings.model || "未设置模型"} · 思考{aiSettings.thinking_enabled ? ({ low: "低", medium: "中", high: "高", off: "关闭" }[aiSettings.thinking_level]) : "关闭"}
+                      </p>
+                    )}
+                    <div className="agent-runtime-grid">
+                      <div className="form-field">
+                        <label htmlFor={`agent-provider-${agent.id}`}>供应商</label>
+                        <Select
+                          id={`agent-provider-${agent.id}`}
+                          value={draft.provider_base_url}
+                          disabled={draft.uses_global_runtime_settings}
+                          onChange={(value) => {
+                            const provider = agentProviderOptions.find(
+                              (item) => item.base_url === value
+                            );
+                            updateAgentDraft(agent, {
+                              provider_base_url: value,
+                              model: provider?.model || draft.model,
+                            });
+                          }}
+                          options={agentProviderOptions.map((provider) => ({
+                            value: provider.base_url,
+                            label: `${provider.label} · ${provider.base_url || "未填写地址"}`,
+                          }))}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label htmlFor={`agent-model-${agent.id}`}>模型</label>
+                        <div className="model-picker-row">
+                          <input
+                            id={`agent-model-${agent.id}`}
+                            value={draft.model}
+                            disabled={draft.uses_global_runtime_settings}
+                            onChange={(event) => updateAgentDraft(agent, { model: event.target.value })}
+                            placeholder="模型名称"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void refreshAgentModels(agent)}
+                            disabled={
+                              loadingAgentModels === agent.id ||
+                              !draft.provider_base_url.trim() ||
+                              draft.uses_global_runtime_settings
+                            }
+                            title="刷新该供应商的模型列表"
+                          >
+                            <RefreshCcw size={14} className={loadingAgentModels === agent.id ? "spin" : undefined} />
+                          </button>
+                        </div>
+                        {availableModels.length > 0 && (
+                          <Select
+                            className="agent-model-select"
+                            value={draft.model}
+                            disabled={draft.uses_global_runtime_settings}
+                            placeholder="从已获取的模型中选择"
+                            onChange={(model) => updateAgentDraft(agent, { model })}
+                            options={availableModels.map((model) => ({
+                              value: model.id,
+                              label: `${model.id}${model.owned_by ? ` · ${model.owned_by}` : ""}`,
+                            }))}
+                          />
+                        )}
+                      </div>
+                    </div>
+                    <label className="checkbox-field agent-thinking-toggle">
+                      <input
+                        type="checkbox"
+                        checked={draft.thinking_enabled}
+                        disabled={draft.uses_global_runtime_settings}
+                        onChange={(event) => {
+                          const thinking_enabled = event.target.checked;
+                          updateAgentDraft(agent, {
+                            thinking_enabled,
+                            thinking_level: thinking_enabled
+                              ? (draft.thinking_level === "off" ? "medium" : draft.thinking_level)
+                              : "off",
+                          });
+                        }}
+                      />
+                      启用深度思考
+                    </label>
+                    <div className="agent-runtime-grid">
+                      <div className="form-field">
+                        <label htmlFor={"agent-temperature-" + agent.id}>Temperature</label>
+                        <input
+                          id={"agent-temperature-" + agent.id}
+                          type="number"
+                          min="0"
+                          max="2"
+                          step="0.05"
+                          value={draft.temperature}
+                          onChange={(event) =>
+                            updateAgentDraft(agent, { temperature: Number(event.target.value) })
+                          }
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label htmlFor={"agent-thinking-level-" + agent.id}>思考强度</label>
+                        <Select
+                          id={"agent-thinking-level-" + agent.id}
+                          value={draft.thinking_enabled ? draft.thinking_level : "off"}
+                          disabled={!draft.thinking_enabled || draft.uses_global_runtime_settings}
+                          onChange={(value) =>
+                            updateAgentDraft(agent, {
+                              thinking_level: value as ThinkingLevel,
+                            })
+                          }
+                          options={[
+                            { value: "off", label: "关闭" },
+                            { value: "low", label: "低" },
+                            { value: "medium", label: "中" },
+                            { value: "high", label: "高" },
+                          ]}
+                        />
+                      </div>
+                    </div>
+                    <div className="agent-allowlist-grid">
+                      <div>
+                        <label>可用工具</label>
+                        <div className="agent-checkbox-list">
+                          {agentTools.map((tool) => (
+                            <label className="checkbox-field" key={tool.key} title={tool.description}>
+                              <input
+                                type="checkbox"
+                                checked={draft.enabled_tool_keys.includes(tool.key)}
+                                onChange={(event) =>
+                                  updateAgentDraft(agent, {
+                                    enabled_tool_keys: event.target.checked
+                                      ? [...new Set([...draft.enabled_tool_keys, tool.key])]
+                                      : draft.enabled_tool_keys.filter((key) => key !== tool.key),
+                                  })
+                                }
+                              />
+                              <span>
+                                {tool.name}
+                                <small>{tool.category}</small>
+                              </span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                      <div>
+                        <label>辅助 Skill</label>
+                        <div className="agent-checkbox-list">
+                          {writingSkills
+                            .filter((skill) => skill.enabled)
+                            .map((skill) => (
+                              <label className="checkbox-field" key={skill.skill_key} title={skill.description}>
+                                <input
+                                  type="checkbox"
+                                  checked={draft.allowed_skill_keys.includes(skill.skill_key)}
+                                  onChange={(event) =>
+                                    updateAgentDraft(agent, {
+                                      allowed_skill_keys: event.target.checked
+                                        ? [...new Set([...draft.allowed_skill_keys, skill.skill_key])]
+                                        : draft.allowed_skill_keys.filter((key) => key !== skill.skill_key),
+                                    })
+                                  }
+                                />
+                                <span>
+                                  {skill.name}
+                                  <small>{skill.skill_key}</small>
+                                </span>
+                              </label>
+                            ))}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="button-row agent-settings-actions">
+                      <button
+                        type="button"
+                        onClick={() => void saveAgentDraft(agent)}
+                        disabled={
+                          Boolean(busy) ||
+                          !draft.name.trim() ||
+                          !draft.role.trim() ||
+                          !draft.system_prompt.trim() ||
+                          !Number.isFinite(draft.temperature) ||
+                          draft.temperature < 0 ||
+                          draft.temperature > 2 ||
+                          (!draft.uses_global_runtime_settings &&
+                            (!draft.provider_base_url.trim() || !draft.model.trim()))
+                        }
+                        className="btn-primary"
+                      >
+                        {busy === "保存 Agent 配置" ? <Loader2 size={14} className="spin" /> : <><Check size={14} /> 保存 Agent 配置</>}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void resetAgentPrompt(agent)}
+                        disabled={Boolean(busy)}
+                      >
+                        <RefreshCcw size={14} /> 恢复 V2 默认 Prompt
+                      </button>
+                    </div>
+                    <label htmlFor={`agent-prompt-${agent.id}`}>系统提示词</label>
+                    <textarea
+                      id={`agent-prompt-${agent.id}`}
+                      className="agent-prompt-textarea"
+                      value={draft.system_prompt}
+                      onChange={(event) => updateAgentDraft(agent, { system_prompt: event.target.value })}
+                      spellCheck={false}
+                    />
+                  </section>
+                );
+              })()}
+              {!selectedAgent && <p className="settings-hint">选择一个书籍项目后查看 Agent 配置。</p>}
+              </div>
             </div>
+            {legacyAgentPrompts.length > 0 && (
+              <section className="settings-section legacy-prompt-archive">
+                <h3>旧版 Prompt 归档</h3>
+                <p className="settings-hint">这些 Prompt 仅供查看和手动复制，不会参与 V2 Agent 运行。</p>
+                {legacyAgentPrompts.map((prompt) => (
+                  <details key={prompt.id} className="context-preview-section">
+                    <summary>
+                      <span>{prompt.name} · {prompt.stage}</span>
+                      <small>{prompt.imported_at}</small>
+                    </summary>
+                    <pre>{prompt.system_prompt}</pre>
+                    <div className="button-row legacy-prompt-actions">
+                      <button
+                        type="button"
+                        onClick={() => void navigator.clipboard.writeText(prompt.system_prompt)}
+                      >
+                        复制 Prompt
+                      </button>
+                    </div>
+                  </details>
+                ))}
+              </section>
+            )}
           </div>
         );
 
@@ -651,7 +1231,7 @@ export function SettingsView({
                         <input
                           id="skill_key"
                           value={skillDraft.skill_key}
-                          onChange={(e) => setSkillDraft({ ...skillDraft, skill_key: e.target.value })}
+                          readOnly
                         />
                       </div>
                     </div>

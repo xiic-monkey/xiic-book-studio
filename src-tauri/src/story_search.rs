@@ -27,6 +27,7 @@ const VECTOR_DIMENSIONS: usize = 512;
 const RRF_K: f64 = 60.0;
 const FTS_LIMIT: usize = 30;
 const VECTOR_LIMIT: usize = 30;
+const SHORT_EXACT_TERM_LENGTH: usize = 2;
 
 #[derive(Clone)]
 struct SearchSourcePayload {
@@ -338,6 +339,11 @@ pub fn search_story_context(
     }
 
     let limit = input.limit.unwrap_or(6).clamp(1, 12);
+    let per_source_limit = if query.chars().count() == SHORT_EXACT_TERM_LENGTH {
+        1
+    } else {
+        2
+    };
     let mut per_source = HashMap::<(String, i64), usize>::new();
     let mut ranked = ranks
         .into_values()
@@ -355,7 +361,7 @@ pub fn search_story_context(
     for (state, document) in ranked {
         let source_key = (document.source_kind.clone(), document.source_id);
         let used = per_source.entry(source_key).or_default();
-        if *used >= 2
+        if *used >= per_source_limit
             || output.iter().any(|snippet: &StoryContextSnippet| {
                 same_content(&snippet.content, &document.content)
             })
@@ -567,11 +573,13 @@ fn replace_source(
                         timestamp
                     ],
                 )?;
+                let document_id = conn.last_insert_rowid();
+                insert_short_exact_terms(conn, payload.project_id, document_id, &search_text)?;
 
                 if let Some(vectors) = embeddings.as_ref() {
                     conn.execute(
                         "INSERT INTO story_search_embeddings(rowid, embedding) VALUES (?1, ?2)",
-                        params![conn.last_insert_rowid(), serde_json::to_string(&vectors[index])?],
+                        params![document_id, serde_json::to_string(&vectors[index])?],
                     )?;
                 }
             }
@@ -889,6 +897,7 @@ fn fts_candidates(
     query: &str,
 ) -> AppResult<Vec<SearchDocument>> {
     state.with_conn(|conn| {
+        ensure_short_exact_term_index(conn)?;
         let mut documents = Vec::new();
 
         if query.chars().count() >= 3 {
@@ -905,27 +914,75 @@ fn fts_candidates(
             )?;
             let rows = stmt.query_map(params![phrase, project_id, upper_bound, FTS_LIMIT as i64], map_document)?;
             documents.extend(rows.collect::<Result<Vec<_>, _>>()?);
-        }
-
-        let mut stmt = conn.prepare(
-            "SELECT id, source_kind, source_id, chapter_no_sort, title, content, search_text
-             FROM story_search_documents
-             WHERE project_id = ?1
-               AND (chapter_no_sort IS NULL OR ?2 IS NULL OR chapter_no_sort <= ?2)
-               AND instr(search_text, ?3) > 0
-             ORDER BY chapter_no_sort DESC, id DESC
-             LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(params![project_id, upper_bound, query, FTS_LIMIT as i64], map_document)?;
-        for document in rows.collect::<Result<Vec<_>, _>>()? {
-            if !documents.iter().any(|existing| existing.id == document.id) {
-                documents.push(document);
-            }
+        } else if query.chars().count() == SHORT_EXACT_TERM_LENGTH {
+            let mut stmt = conn.prepare(
+                "WITH ranked AS (
+                     SELECT d.id, d.source_kind, d.source_id, d.chapter_no_sort, d.title, d.content, d.search_text,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY d.source_kind, d.source_id
+                                ORDER BY CASE WHEN d.title = ?2 THEN 0 ELSE 1 END, d.id DESC
+                            ) AS source_rank
+                     FROM story_search_document_terms t
+                     INNER JOIN story_search_documents d ON d.id = t.document_id
+                     WHERE t.project_id = ?1
+                       AND t.term = ?2
+                       AND d.project_id = ?1
+                       AND (d.chapter_no_sort IS NULL OR ?3 IS NULL OR d.chapter_no_sort <= ?3)
+                 )
+                 SELECT id, source_kind, source_id, chapter_no_sort, title, content, search_text
+                 FROM ranked
+                 WHERE source_rank <= 2
+                 ORDER BY chapter_no_sort DESC, id DESC
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(params![project_id, query, upper_bound, FTS_LIMIT as i64], map_document)?;
+            documents.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
 
         documents.truncate(FTS_LIMIT);
         Ok(documents)
     })
+}
+
+fn ensure_short_exact_term_index(conn: &Connection) -> AppResult<()> {
+    let missing_documents: Vec<(i64, i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.project_id, d.search_text
+             FROM story_search_documents d
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM story_search_document_terms t WHERE t.document_id = d.id
+             )",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (document_id, project_id, search_text) in missing_documents {
+        insert_short_exact_terms(conn, project_id, document_id, &search_text)?;
+    }
+    Ok(())
+}
+
+fn insert_short_exact_terms(
+    conn: &Connection,
+    project_id: i64,
+    document_id: i64,
+    search_text: &str,
+) -> AppResult<()> {
+    let normalized = normalize_text(search_text);
+    let chars = normalized.chars().collect::<Vec<_>>();
+    let mut terms = std::collections::HashSet::new();
+    for window in chars.windows(SHORT_EXACT_TERM_LENGTH) {
+        terms.insert(window.iter().collect::<String>());
+    }
+    for term in terms {
+        conn.execute(
+            "INSERT OR IGNORE INTO story_search_document_terms(project_id, document_id, term)
+             VALUES (?1, ?2, ?3)",
+            params![project_id, document_id, term],
+        )?;
+    }
+    Ok(())
 }
 
 fn vector_candidates(
@@ -1002,12 +1059,11 @@ fn search_upper_bound(
         .into_iter()
         .find(|chapter| chapter.id == chapter_id)
         .map(|chapter| chapter.chapter_no);
-    Ok(chapter_no.map(|no| {
-        if include_immediate_previous {
-            no.saturating_sub(1)
-        } else {
-            no.saturating_sub(2)
-        }
+    let chapter_no = chapter_no.ok_or_else(|| AppError::Validation("章节不存在".to_string()))?;
+    Ok(Some(if include_immediate_previous {
+        chapter_no.saturating_sub(1)
+    } else {
+        chapter_no.saturating_sub(2)
     }))
 }
 
@@ -1029,6 +1085,10 @@ fn source_hash(title: &str, content: &str) -> String {
     hasher.update(b"\n");
     hasher.update(normalize_text(content));
     format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn chapter_source_hash(title: &str, content: &str) -> String {
+    source_hash(title, content)
 }
 
 fn normalize_text(value: &str) -> String {
@@ -1310,7 +1370,12 @@ impl EmbeddingRuntime {
 }
 
 fn embedding_device() -> Device {
-    Device::new_metal(0).unwrap_or(Device::Cpu)
+    // Candle's Metal backend can panic during device creation on unsupported or
+    // partially initialized environments. Local search must remain available via CPU.
+    match std::panic::catch_unwind(|| Device::new_metal(0)) {
+        Ok(Ok(device)) => device,
+        Ok(Err(_)) | Err(_) => Device::Cpu,
+    }
 }
 
 fn model_directory(state: &AppState) -> AppResult<PathBuf> {
@@ -1480,6 +1545,37 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].content.contains("黑石矿场"));
         assert!(!rows[0].content.contains("交给了林月"));
+    }
+
+    #[test]
+    fn short_exact_terms_keep_older_chapter_candidates() {
+        let (_dir, state, project_id, chapter_ids) = seeded_state();
+        insert_document(&state, project_id, chapter_ids[0], 1, 101, "第一章出现黑牌");
+        insert_document(&state, project_id, chapter_ids[1], 2, 102, "第二章出现黑牌");
+        state
+            .with_conn(|conn| {
+                for _ in 0..32 {
+                    conn.execute(
+                        "INSERT INTO story_search_documents
+                         (project_id, source_kind, source_id, chapter_id, chapter_no_sort, stage, title,
+                          content, search_text, chunk_no, chunk_start, chunk_end,
+                          visibility_cutoff_chapter_no, source_text_hash, normalization_version, updated_at)
+                         VALUES (?1, 'chapter', 303, ?2, 3, 'draft', '第三章',
+                                 '后续章节重复出现黑牌', '后续章节重复出现黑牌', 0, 0, 10, 3, 'hash', ?3, 'now')",
+                        params![project_id, chapter_ids[2], NORMALIZATION_VERSION],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let candidates = super::fts_candidates(&state, project_id, Some(3), "黑牌").unwrap();
+        assert!(candidates
+            .iter()
+            .any(|document| document.chapter_no_sort == Some(1)));
+        assert!(candidates
+            .iter()
+            .any(|document| document.chapter_no_sort == Some(2)));
     }
 
     #[test]
@@ -1656,6 +1752,7 @@ mod tests {
 
         state
             .update_chapter(crate::models::ChapterUpdate {
+                project_id: project.id,
                 id: chapter.id,
                 title: "新标题".to_string(),
                 status: "approved".to_string(),
@@ -1707,6 +1804,26 @@ mod tests {
         assert!(
             status.sqlite_vec_status.starts_with("unavailable:")
                 || status.sqlite_vec_status.starts_with('v')
+        );
+    }
+
+    #[test]
+    fn local_search_rejects_an_unknown_chapter_id() {
+        let (_dir, state, project_id, _) = seeded_state();
+        let error = search_story_context(
+            &state,
+            &StoryContextSearchInput {
+                project_id,
+                chapter_id: Some(999_999),
+                query: "未知章节".to_string(),
+                limit: Some(6),
+                include_immediate_previous: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, crate::error::AppError::Validation(message) if message == "章节不存在")
         );
     }
 

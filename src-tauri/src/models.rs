@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Setting,
@@ -65,7 +66,7 @@ impl StoryArchitectMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Project {
     pub id: i64,
     pub title: String,
@@ -103,6 +104,7 @@ pub struct ProjectUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChapterUpdate {
+    pub project_id: i64,
     pub id: i64,
     pub title: String,
     pub status: String,
@@ -114,11 +116,97 @@ pub struct Agent {
     pub stage: String,
     pub name: String,
     pub role: String,
+    pub editable_role: String,
     pub system_prompt: String,
+    pub editable_system_prompt: String,
     pub temperature: f64,
+    pub provider_base_url: String,
+    pub model: String,
+    pub thinking_enabled: bool,
+    pub thinking_level: String,
+    pub uses_global_runtime_settings: bool,
+    pub enabled_tool_keys: Vec<String>,
+    pub allowed_skill_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Agent {
+    pub fn ai_settings(&self) -> AiSettings {
+        AiSettings {
+            base_url: self.provider_base_url.clone(),
+            model: self.model.clone(),
+            temperature: self.temperature,
+            thinking_enabled: self.thinking_enabled,
+            thinking_level: self.thinking_level.clone(),
+            has_api_key: false,
+        }
+    }
+
+    pub fn has_tool(&self, key: &str) -> bool {
+        crate::agent_tools::has_tool(&self.enabled_tool_keys, key)
+    }
+
+    pub fn has_skill(&self, key: &str) -> bool {
+        self.allowed_skill_keys.iter().any(|item| item == key)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Read,
+    Proposal,
+}
+
+impl ToolKind {
+    pub fn parse(value: &str) -> Self {
+        if value == "proposal" {
+            Self::Proposal
+        } else {
+            Self::Read
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+pub struct AgentToolDefinition {
+    pub key: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub kind: ToolKind,
+    pub supported_stages: Vec<String>,
+    pub previewable: bool,
+    #[ts(type = "Record<string, unknown>")]
+    pub parameters_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolProtocol {
+    Auto,
+    Native,
+    Structured,
+}
+
+impl ToolProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Native => "native",
+            Self::Structured => "structured",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "native" => Self::Native,
+            "structured" => Self::Structured,
+            _ => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct GenreAgentProfile {
     pub agent_key: String,
     pub name: String,
@@ -128,7 +216,7 @@ pub struct GenreAgentProfile {
     pub allowed_skill_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Chapter {
     pub id: i64,
     pub project_id: i64,
@@ -140,11 +228,12 @@ pub struct Chapter {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Artifact {
     pub id: i64,
     pub project_id: i64,
     pub chapter_id: Option<i64>,
+    #[ts(type = "Stage")]
     pub stage: String,
     pub title: String,
     pub content: String,
@@ -154,7 +243,7 @@ pub struct Artifact {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Approval {
     pub id: i64,
     pub project_id: i64,
@@ -165,7 +254,7 @@ pub struct Approval {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Message {
     pub id: i64,
     pub project_id: i64,
@@ -175,7 +264,7 @@ pub struct Message {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct WorkflowRun {
     pub id: i64,
     pub project_id: i64,
@@ -186,6 +275,19 @@ pub struct WorkflowRun {
     pub status: String,
     pub error: Option<String>,
     pub elapsed_ms: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct WorkflowRunSummary {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub stage: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub elapsed_ms: i64,
+    pub output_chars: usize,
     pub created_at: String,
 }
 
@@ -202,7 +304,7 @@ pub struct ChapterMemoryRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryThread {
     pub id: i64,
     pub project_id: i64,
@@ -218,7 +320,7 @@ pub struct StoryThread {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct KnowledgeCard {
     pub id: i64,
     pub project_id: i64,
@@ -244,7 +346,7 @@ pub struct SaveKnowledgeCard {
     pub source_chapter_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Foreshadowing {
     pub id: i64,
     pub project_id: i64,
@@ -261,7 +363,7 @@ pub struct Foreshadowing {
 
 /// A named story-world entity. This is an identity registry, not a mutable
 /// character sheet: changing facts are stored separately with source evidence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryEntity {
     pub id: i64,
     pub project_id: i64,
@@ -275,7 +377,7 @@ pub struct StoryEntity {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryEvent {
     pub id: i64,
     pub project_id: i64,
@@ -291,7 +393,7 @@ pub struct StoryEvent {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryEventParticipant {
     pub event_id: i64,
     pub entity_id: i64,
@@ -302,7 +404,7 @@ pub struct StoryEventParticipant {
 /// An immutable, evidence-backed assertion extracted from approved formal text.
 /// `status` and `supersedes_fact_id` make a later change traceable rather than
 /// silently overwriting earlier text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryFact {
     pub id: i64,
     pub project_id: i64,
@@ -322,7 +424,7 @@ pub struct StoryFact {
 /// The derived-index result for one approved formal chapter. This is exposed
 /// separately from creative approval so the UI can distinguish a valid chapter
 /// from an index that merely needs a retry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryIndexSource {
     pub project_id: i64,
     pub chapter_id: i64,
@@ -349,7 +451,7 @@ pub struct StoryIndexSummary {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StorySearchSource {
     pub project_id: i64,
     pub source_kind: String,
@@ -365,7 +467,7 @@ pub struct StorySearchSource {
     pub indexed_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct DerivedIndexJob {
     pub id: i64,
     pub project_id: i64,
@@ -409,7 +511,7 @@ pub struct RebuildStorySearchIndexRequest {
     pub project_id: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryBible {
     pub id: i64,
     pub project_id: i64,
@@ -425,7 +527,7 @@ pub struct StoryBible {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryArc {
     pub id: i64,
     pub project_id: i64,
@@ -444,7 +546,7 @@ pub struct StoryArc {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct CanonIssue {
     pub domain: String,
     pub severity: String,
@@ -457,7 +559,7 @@ pub struct CanonIssue {
     pub evidence_quotes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryBibleReview {
     pub id: i64,
     pub project_id: i64,
@@ -478,6 +580,68 @@ pub struct RunStoryArchitectRequest {
     pub arc_id: Option<i64>,
     pub user_instruction: Option<String>,
     pub source_artifact_id: Option<i64>,
+    #[serde(default)]
+    pub reference_selection: Option<ReferenceSelection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceTag {
+    Style,
+    Structure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ReferenceSelection {
+    #[serde(default = "default_reference_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub source_ids: Option<Vec<u64>>,
+    #[serde(default)]
+    pub tags: Option<Vec<ReferenceTag>>,
+}
+
+impl Default for ReferenceSelection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            source_ids: None,
+            tags: None,
+        }
+    }
+}
+
+fn default_reference_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceMaterial {
+    pub id: u64,
+    pub project_id: i64,
+    pub file_name: String,
+    pub char_count: usize,
+    pub tags: Vec<ReferenceTag>,
+    pub enabled: bool,
+    pub chunk_count: usize,
+    pub imported_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportReferenceTextRequest {
+    pub project_id: i64,
+    pub file_name: String,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<ReferenceTag>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateReferenceMaterialRequest {
+    pub project_id: i64,
+    pub reference_id: u64,
+    pub enabled: Option<bool>,
+    pub tags: Option<Vec<ReferenceTag>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,7 +662,7 @@ pub struct ConfirmStoryBibleReviewRequest {
     pub note: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AdoptionProposal {
     pub id: i64,
     pub project_id: i64,
@@ -506,6 +670,7 @@ pub struct AdoptionProposal {
     pub target_kind: String,
     pub target_id: Option<i64>,
     pub operation: String,
+    #[ts(type = "Record<string, unknown>")]
     pub data: serde_json::Value,
     pub evidence_quote: String,
     pub target_snapshot: Option<String>,
@@ -530,6 +695,7 @@ pub struct ListAdoptionProposalsRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateAdoptionProposalRequest {
+    pub project_id: i64,
     pub proposal_id: i64,
     pub data: serde_json::Value,
 }
@@ -574,6 +740,8 @@ pub struct WritingSkill {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveWritingSkill {
+    #[serde(default)]
+    pub id: Option<i64>,
     pub skill_key: String,
     pub name: String,
     pub category: String,
@@ -606,16 +774,80 @@ pub struct ProjectDetail {
     pub story_bible: Option<StoryBible>,
     pub story_arcs: Vec<StoryArc>,
     pub story_bible_review: Option<StoryBibleReview>,
+    pub canonical_fingerprint: String,
     pub settings: AiSettings,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// V2 project workspace payload. It intentionally excludes artifact bodies and
+/// workflow inputs/outputs; those are loaded through dedicated detail queries.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ProjectWorkspace {
+    pub project: Project,
+    pub genre_agent: GenreAgentProfile,
+    pub chapters: Vec<Chapter>,
+    pub artifacts: Vec<ArtifactSummary>,
+    pub approvals: Vec<Approval>,
+    pub messages: Vec<Message>,
+    pub workflow_runs: Vec<WorkflowRunSummary>,
+    pub story_threads: Vec<StoryThread>,
+    pub knowledge_cards: Vec<KnowledgeCard>,
+    pub foreshadowings: Vec<Foreshadowing>,
+    pub story_entities: Vec<StoryEntity>,
+    pub story_events: Vec<StoryEvent>,
+    pub story_event_participants: Vec<StoryEventParticipant>,
+    pub story_facts: Vec<StoryFact>,
+    pub story_index_sources: Vec<StoryIndexSource>,
+    pub story_search_sources: Vec<StorySearchSource>,
+    pub index_jobs: Vec<DerivedIndexJob>,
+    pub adoption_proposals: Vec<AdoptionProposal>,
+    pub story_bible: Option<StoryBible>,
+    pub story_arcs: Vec<StoryArc>,
+    pub story_bible_review: Option<StoryBibleReview>,
+    pub canonical_fingerprint: String,
+    pub settings: AiSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AiSettings {
     pub base_url: String,
     pub model: String,
     pub temperature: f64,
     pub thinking_enabled: bool,
+    #[ts(type = "\"off\" | \"low\" | \"medium\" | \"high\"")]
+    pub thinking_level: String,
     pub has_api_key: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiProvider {
+    pub id: i64,
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: f64,
+    pub thinking_enabled: bool,
+    pub thinking_level: String,
+    pub tool_protocol: ToolProtocol,
+    pub has_api_key: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveAiProvider {
+    pub id: Option<i64>,
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: f64,
+    #[serde(default)]
+    pub thinking_enabled: bool,
+    #[serde(default = "default_thinking_level")]
+    pub thinking_level: String,
+    #[serde(default = "default_tool_protocol")]
+    pub tool_protocol: ToolProtocol,
+}
+
+fn default_tool_protocol() -> ToolProtocol {
+    ToolProtocol::Auto
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,6 +873,7 @@ pub struct TestAiConnectionInput {
     pub model: Option<String>,
     pub temperature: Option<f64>,
     pub thinking_enabled: Option<bool>,
+    pub thinking_level: Option<String>,
     pub api_key: Option<String>,
 }
 
@@ -651,6 +884,7 @@ impl Default for AiSettings {
             model: "deepseek-v4-pro".to_string(),
             temperature: 0.75,
             thinking_enabled: false,
+            thinking_level: "off".to_string(),
             has_api_key: false,
         }
     }
@@ -663,7 +897,50 @@ pub struct SaveAiSettings {
     pub temperature: f64,
     #[serde(default)]
     pub thinking_enabled: bool,
+    #[serde(default = "default_thinking_level")]
+    pub thinking_level: String,
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveAgentSettings {
+    pub agent_id: i64,
+    pub provider_base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub thinking_enabled: bool,
+    #[serde(default)]
+    pub thinking_level: Option<String>,
+    #[serde(default)]
+    pub uses_global_runtime_settings: Option<bool>,
+    #[serde(default)]
+    pub enabled_tool_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_skill_keys: Option<Vec<String>>,
+}
+
+fn default_thinking_level() -> String {
+    "off".to_string()
+}
+
+pub fn normalize_thinking_level(enabled: bool, value: &str) -> Result<String, String> {
+    if !enabled {
+        return Ok("off".to_string());
+    }
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "off" => Ok("medium".to_string()),
+        "low" | "medium" | "high" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err("思考强度只能是 low、medium 或 high".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -673,6 +950,10 @@ pub struct RunAgentRequest {
     pub chapter_id: Option<i64>,
     pub user_instruction: Option<String>,
     pub source_artifact_id: Option<i64>,
+    #[serde(default)]
+    pub reference_selection: Option<ReferenceSelection>,
+    #[serde(default)]
+    pub prepared_context_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -699,11 +980,249 @@ pub struct ContextPreview {
     pub estimated_tokens: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct AgentRunRequest {
+    pub project_id: i64,
+    pub stage: Stage,
+    pub chapter_id: Option<i64>,
+    pub user_instruction: Option<String>,
+    pub source_artifact_id: Option<i64>,
+    #[serde(default)]
+    pub reference_selection: Option<ReferenceSelection>,
+    #[serde(default)]
+    pub prepared_context_id: Option<i64>,
+}
+
+impl From<AgentRunRequest> for RunAgentRequest {
+    fn from(value: AgentRunRequest) -> Self {
+        Self {
+            project_id: value.project_id,
+            stage: value.stage,
+            chapter_id: value.chapter_id,
+            user_instruction: value.user_instruction,
+            source_artifact_id: value.source_artifact_id,
+            reference_selection: value.reference_selection,
+            prepared_context_id: value.prepared_context_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ContextSegment {
+    pub kind: String,
+    pub label: String,
+    pub source: String,
+    pub content: String,
+    pub chars: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct PreparedContext {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub stage: String,
+    pub fingerprint: String,
+    pub system_prompt: String,
+    pub prompt: String,
+    pub segments: Vec<ContextSegment>,
+    pub tool_invocation_ids: Vec<i64>,
+    pub total_chars: usize,
+    pub estimated_tokens: usize,
+    pub expires_at: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub tool_key: String,
+    #[serde(default)]
+    #[ts(type = "Record<string, unknown>")]
+    pub arguments: serde_json::Value,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub tool_key: String,
+    pub status: String,
+    #[serde(default)]
+    #[ts(type = "Record<string, unknown>")]
+    pub data: serde_json::Value,
+    #[serde(default)]
+    pub citations: Vec<String>,
+    pub error: Option<String>,
+    pub elapsed_ms: i64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ToolInvocation {
+    pub id: i64,
+    pub run_id: Option<i64>,
+    pub prepared_context_id: Option<i64>,
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub stage: String,
+    pub tool_key: String,
+    pub protocol: String,
+    #[ts(type = "Record<string, unknown>")]
+    pub arguments: serde_json::Value,
+    #[ts(type = "Record<string, unknown>")]
+    pub result: serde_json::Value,
+    pub status: String,
+    pub error: Option<String>,
+    pub elapsed_ms: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    Pending,
+    Applied,
+    Rejected,
+    Expired,
+}
+
+impl ProposalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "applied" => Self::Applied,
+            "rejected" => Self::Rejected,
+            "expired" => Self::Expired,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ActionProposal {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub source_run_id: Option<i64>,
+    pub proposal_type: String,
+    pub summary: String,
+    #[ts(type = "Record<string, unknown>")]
+    pub payload: serde_json::Value,
+    pub expected_version: Option<String>,
+    pub status: ProposalStatus,
+    pub decision_note: String,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct LegacyAgentPrompt {
+    pub id: i64,
+    pub legacy_agent_id: Option<i64>,
+    pub stage: String,
+    pub name: String,
+    pub role: String,
+    pub system_prompt: String,
+    pub imported_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListActionProposalsRequest {
+    pub project_id: i64,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideActionProposalRequest {
+    pub project_id: i64,
+    pub proposal_id: i64,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ProposalApplyResult {
+    pub proposal: ActionProposal,
+    pub entity_kind: String,
+    pub entity_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ProviderCapabilities {
+    pub provider_base_url: String,
+    pub configured_protocol: ToolProtocol,
+    pub detected_protocol: Option<ToolProtocol>,
+    pub last_error: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct AgentRunSummary {
+    pub run: WorkflowRun,
+    pub artifact: Option<Artifact>,
+    pub prepared_context_id: Option<i64>,
+    pub tool_invocations: Vec<ToolInvocation>,
+    pub proposals: Vec<ActionProposal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct RunEvent {
+    pub run_id: i64,
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub stage: String,
+    pub sequence: i64,
+    pub kind: String,
+    pub delta: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ActiveAgentRun {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub stage: String,
+    pub output: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub elapsed_ms: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ArtifactSummary {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    #[ts(type = "Stage")]
+    pub stage: String,
+    pub title: String,
+    pub version: i64,
+    pub status: String,
+    pub parent_artifact_id: Option<i64>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevisionRequest {
     pub project_id: i64,
     pub artifact_id: i64,
     pub feedback: String,
+    #[serde(default)]
+    pub reference_selection: Option<ReferenceSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -772,6 +1291,38 @@ pub struct StoryContextSearchInput {
     pub limit: Option<usize>,
     #[serde(default)]
     pub include_immediate_previous: bool,
+}
+
+/// Server-owned reranking request. The client supplies only the search intent;
+/// candidates are always retrieved again by the application before the model sees them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryContextRerankRequest {
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub query: String,
+    #[serde(default)]
+    pub include_immediate_previous: bool,
+    pub stage: Option<Stage>,
+    pub task_context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryContextRerankedSnippet {
+    pub candidate_id: usize,
+    pub source_label: String,
+    pub matched_term: String,
+    pub content: String,
+    pub score: usize,
+    pub category: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryContextRerankResult {
+    pub candidates: Vec<StoryContextSnippet>,
+    pub selected: Vec<StoryContextRerankedSnippet>,
+    pub status: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

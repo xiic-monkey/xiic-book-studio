@@ -9,6 +9,7 @@ use crate::{
     ai,
     db::AppState,
     error::{AppError, AppResult},
+    index_jobs,
     models::{
         AdoptionBatchResult, AdoptionProposal, Artifact, DecideAdoptionProposalsRequest,
         Foreshadowing, KnowledgeCard, SaveForeshadowing, SaveKnowledgeCard,
@@ -53,7 +54,8 @@ pub async fn prepare_artifact_adoptions(
     artifact_id: i64,
 ) -> AppResult<Vec<AdoptionProposal>> {
     let artifact = approved_source_artifact(state, project_id, artifact_id)?;
-    let settings = state.get_ai_settings()?;
+    let agent = state.get_agent("adoption")?;
+    let settings = agent.ai_settings();
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| AppError::Validation("请先为当前供应商保存 API Key".to_string()))?;
@@ -79,30 +81,14 @@ pub async fn prepare_artifact_adoptions(
         artifact.title,
         artifact.content
     );
-    let system_prompt = r#"你是小说资料整理 Agent。你只从已经人工批准的来源产物中提取值得进入长期资料库的明确事实，不能续写、推断或补齐。
-
-只输出 JSON 数组，不要 Markdown。每项结构：
-{
-  "target_kind": "knowledge_card" | "foreshadowing",
-  "target_id": number | null,
-  "operation": "create" | "update",
-  "data": object,
-  "evidence_quote": "来源产物中的逐字连续引文"
-}
-
-knowledge_card.data 只允许：category、title、content、source_chapter_id。
-category 只能是 world、cultivation、map、faction、taboo、item、outline、character、other。
-foreshadowing.data 只允许：title、content、planted_chapter_id、planned_payoff_chapter_id、planned_payoff_note。
-
-规则：
-1. evidence_quote 必须逐字存在于来源产物，不能改写。
-2. 只提取会影响后续连续性、角色行为、规则、路线或伏笔回收的内容；普通场景描写不要入库。
-3. 当前资料已有同一对象时使用 update 并填写 target_id；不得换标题制造重复卡片。
-4. 正文只是出现异常、猜测、误导或角色主观判断时，不得写成正式设定；可以不输出。
-5. 伏笔必须是来源中已经埋下或明确计划回收的内容，不能凭空设计新伏笔。
-6. 没有可靠候选时输出 []。"#;
-
-    let output = ai::complete_chat(&settings, &api_key, system_prompt, &user_prompt, 0.1).await?;
+    let output = ai::complete_chat(
+        &settings,
+        &api_key,
+        &agent.system_prompt,
+        &user_prompt,
+        agent.temperature,
+    )
+    .await?;
     let extracted = parse_extracted_candidates(&output)?;
     replace_pending_proposals(state, &artifact, extracted)
 }
@@ -150,7 +136,11 @@ pub fn update_adoption_proposal(
     state: &AppState,
     input: UpdateAdoptionProposalRequest,
 ) -> AppResult<AdoptionProposal> {
+    state.get_project(input.project_id)?;
     let existing = get_proposal(state, input.proposal_id)?;
+    if existing.project_id != input.project_id {
+        return Err(AppError::Validation("候选不属于当前项目".to_string()));
+    }
     if existing.status != PENDING {
         return Err(AppError::Validation("只有待确认候选可以编辑".to_string()));
     }
@@ -248,6 +238,7 @@ pub fn apply_adoption_proposals(
     }
 
     state.mark_story_bible_changed(input.project_id)?;
+    index_jobs::enqueue_project_search_job(state, input.project_id)?;
 
     Ok(AdoptionBatchResult {
         proposals: ids
@@ -297,17 +288,6 @@ pub fn save_human_knowledge_card(
     input: SaveKnowledgeCard,
 ) -> AppResult<KnowledgeCard> {
     state.get_project(input.project_id)?;
-    let was_canonical = input
-        .id
-        .and_then(|id| {
-            state
-                .list_knowledge_cards(input.project_id)
-                .ok()?
-                .into_iter()
-                .find(|card| card.id == id)
-                .map(|card| card.status == "approved")
-        })
-        .unwrap_or(false);
     validate_optional_chapter(state, input.project_id, input.source_chapter_id)?;
     validate_optional_artifact(state, input.project_id, input.source_artifact_id)?;
     let data = normalize_data(
@@ -328,9 +308,21 @@ pub fn save_human_knowledge_card(
     let content = string_field(&data, "content")?;
     let source_chapter_id = optional_i64_field(&data, "source_chapter_id")?;
     let now = now();
-    let card = state.with_conn(|conn| {
+    state.with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let was_canonical = if let Some(id) = input.id {
+            tx.query_row(
+                "SELECT status FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                params![id, input.project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|value| value == "approved")
+        } else {
+            false
+        };
         let id = if let Some(id) = input.id {
-            let changed = conn.execute(
+            let changed = tx.execute(
                 "UPDATE knowledge_cards SET category = ?1, title = ?2, content = ?3,
                     status = ?4, source_artifact_id = ?5, source_chapter_id = ?6, updated_at = ?7
                  WHERE id = ?8 AND project_id = ?9",
@@ -341,22 +333,25 @@ pub fn save_human_knowledge_card(
             }
             id
         } else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO knowledge_cards
                     (project_id, category, title, content, status, source_artifact_id, source_chapter_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                 params![input.project_id, category, title, content, status, input.source_artifact_id, source_chapter_id, now],
             )?;
-            conn.last_insert_rowid()
+            tx.last_insert_rowid()
         };
-        query_knowledge_card(conn, id)
-    })?;
-
-    if was_canonical || status == "approved" {
-        state.mark_story_bible_changed(input.project_id)?;
-    }
-
-    Ok(card)
+        tx.execute(
+            "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+            params![now, input.project_id],
+        )?;
+        if was_canonical || status == "approved" {
+            crate::db::mark_story_bible_changed_tx(&tx, input.project_id, &now)?;
+        }
+        let card = query_knowledge_card(&tx, id)?;
+        tx.commit()?;
+        Ok(card)
+    })
 }
 
 pub fn save_human_foreshadowing(
@@ -364,17 +359,6 @@ pub fn save_human_foreshadowing(
     input: SaveForeshadowing,
 ) -> AppResult<Foreshadowing> {
     state.get_project(input.project_id)?;
-    let was_canonical = input
-        .id
-        .and_then(|id| {
-            state
-                .list_foreshadowings(input.project_id)
-                .ok()?
-                .into_iter()
-                .find(|item| item.id == id)
-                .map(|item| is_canonical_foreshadowing_status(&item.status))
-        })
-        .unwrap_or(false);
     validate_optional_chapter(state, input.project_id, input.planted_chapter_id)?;
     validate_optional_chapter(state, input.project_id, input.planned_payoff_chapter_id)?;
     validate_optional_artifact(state, input.project_id, input.source_artifact_id)?;
@@ -400,9 +384,21 @@ pub fn save_human_foreshadowing(
     let payoff = optional_i64_field(&data, "planned_payoff_chapter_id")?;
     let payoff_note = string_field(&data, "planned_payoff_note")?;
     let now = now();
-    let foreshadowing = state.with_conn(|conn| {
+    state.with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let was_canonical = if let Some(id) = input.id {
+            tx.query_row(
+                "SELECT status FROM foreshadowings WHERE id = ?1 AND project_id = ?2",
+                params![id, input.project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|value| is_canonical_foreshadowing_status(&value))
+        } else {
+            false
+        };
         let id = if let Some(id) = input.id {
-            let changed = conn.execute(
+            let changed = tx.execute(
                 "UPDATE foreshadowings SET title = ?1, content = ?2, status = ?3,
                     planted_chapter_id = ?4, planned_payoff_chapter_id = ?5,
                     planned_payoff_note = ?6, source_artifact_id = ?7, updated_at = ?8
@@ -414,23 +410,26 @@ pub fn save_human_foreshadowing(
             }
             id
         } else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO foreshadowings
                     (project_id, title, content, status, planted_chapter_id, planned_payoff_chapter_id,
                      planned_payoff_note, source_artifact_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
                 params![input.project_id, title, content, status, planted, payoff, payoff_note, input.source_artifact_id, now],
             )?;
-            conn.last_insert_rowid()
+            tx.last_insert_rowid()
         };
-        query_foreshadowing(conn, id)
-    })?;
-
-    if was_canonical || is_canonical_foreshadowing_status(status) {
-        state.mark_story_bible_changed(input.project_id)?;
-    }
-
-    Ok(foreshadowing)
+        tx.execute(
+            "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+            params![now, input.project_id],
+        )?;
+        if was_canonical || is_canonical_foreshadowing_status(status) {
+            crate::db::mark_story_bible_changed_tx(&tx, input.project_id, &now)?;
+        }
+        let foreshadowing = query_foreshadowing(&tx, id)?;
+        tx.commit()?;
+        Ok(foreshadowing)
+    })
 }
 
 fn is_canonical_foreshadowing_status(status: &str) -> bool {

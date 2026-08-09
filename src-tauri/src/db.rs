@@ -10,32 +10,65 @@ use std::{
 };
 
 use chrono::Utc;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::{AppHandle, Manager};
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 use crate::{
+    agent_tools,
     error::{AppError, AppResult},
     genre_agent, genre_skill,
     models::{
-        Agent, AiSettings, Approval, Artifact, ArtifactFilters, Chapter, ChapterMemoryRecord,
-        ChapterUpdate, ContinuityLedgerEntry, DerivedIndexJob, Foreshadowing, GenreAgentProfile,
-        KnowledgeCard, Message, NewChapter, NewProject, Project, ProjectDetail, ProjectUpdate,
-        SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill, StoryArc,
-        StoryBible, StoryBibleReview, StoryEntity, StoryEvent, StoryEventParticipant, StoryFact,
-        StoryIndexSource, StorySearchSource, StoryThread, WorkflowRun, WritingSkill,
+        Agent, AiProvider, AiSettings, Approval, Artifact, ArtifactFilters, Chapter,
+        ChapterMemoryRecord, ChapterUpdate, ContinuityLedgerEntry, DerivedIndexJob, Foreshadowing,
+        GenreAgentProfile, ImportReferenceTextRequest, KnowledgeCard, Message, NewChapter,
+        NewProject, Project, ProjectDetail, ProjectUpdate, ReferenceMaterial, RunEvent,
+        SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
+        SaveWritingSkill, StoryArc, StoryBible, StoryBibleReview, StoryEntity, StoryEvent,
+        StoryEventParticipant, StoryFact, StoryIndexSource, StorySearchSource, StoryThread,
+        UpdateReferenceMaterialRequest, WorkflowRun, WritingSkill,
     },
-    secrets, workflow,
+    reference::ReferenceStore,
+    workflow,
 };
 
 mod lifecycle;
 
+// Every AI-capable role resolves to one row. Empty per-agent values inherit the
+// global settings, which keeps existing databases and projects working.
+const AGENT_SELECT_SQL: &str = r#"SELECT a.id, a.stage, a.name, a.role, a.system_prompt, a.temperature,
+    COALESCE(NULLIF(a.provider_base_url, ''), (SELECT value FROM settings WHERE key = 'ai.base_url'), '') AS provider_base_url,
+    COALESCE(NULLIF(a.model, ''), (SELECT value FROM settings WHERE key = 'ai.model'), '') AS model,
+    CASE
+        WHEN NULLIF(a.provider_base_url, '') IS NULL AND NULLIF(a.model, '') IS NULL THEN
+            CASE WHEN COALESCE((SELECT value FROM settings WHERE key = 'ai.thinking_enabled'), 'false') IN ('true', '1')
+                 THEN 1 ELSE 0 END
+        ELSE a.thinking_enabled
+    END AS thinking_enabled,
+    CASE
+        WHEN NULLIF(a.provider_base_url, '') IS NULL AND NULLIF(a.model, '') IS NULL THEN
+            COALESCE((SELECT value FROM settings WHERE key = 'ai.thinking_level'), 'off')
+        WHEN a.thinking_enabled = 1 THEN COALESCE(NULLIF(a.thinking_level, ''), 'medium')
+        ELSE 'off'
+    END AS thinking_level,
+    CASE
+        WHEN NULLIF(a.provider_base_url, '') IS NULL AND NULLIF(a.model, '') IS NULL THEN 1
+        ELSE 0
+    END AS uses_global_runtime_settings,
+    COALESCE(NULLIF(a.enabled_tool_keys, ''), '["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]') AS enabled_tool_keys,
+    COALESCE(NULLIF(a.allowed_skill_keys, ''), '["continuity_and_agency"]') AS allowed_skill_keys
+    FROM agents a"#;
+
 #[derive(Clone)]
 pub struct AppState {
-    conn: Arc<Mutex<Connection>>,
+    pool: Arc<Pool<SqliteConnectionManager>>,
     resource_roots: Arc<Vec<PathBuf>>,
+    reference_store: Arc<Mutex<ReferenceStore>>,
     index_worker_started: Arc<AtomicBool>,
     index_worker_notify: Arc<Notify>,
+    pub(crate) run_event_tx: broadcast::Sender<RunEvent>,
 }
 
 impl AppState {
@@ -49,11 +82,39 @@ impl AppState {
         if let Ok(resource_dir) = app.path().resource_dir() {
             resource_roots.push(resource_dir);
         }
-        Self::from_path_with_resources(data_dir.join("book-studio.sqlite3"), resource_roots)
+        let legacy_path = data_dir.join("book-studio.sqlite3");
+        let v2_path = data_dir.join("book-studio-v2.sqlite3");
+        let first_v2_start = !v2_path.exists();
+        if first_v2_start && legacy_path.is_file() {
+            crate::v2_storage::backup_legacy_database(&legacy_path)?;
+        }
+        let state = match Self::from_path_with_resources(v2_path.clone(), resource_roots) {
+            Ok(state) => state,
+            Err(error) => {
+                if first_v2_start {
+                    crate::v2_storage::remove_new_database_files(&v2_path);
+                }
+                return Err(error);
+            }
+        };
+        if first_v2_start && legacy_path.is_file() {
+            if let Err(error) = crate::v2_storage::import_legacy_configuration(&state, &legacy_path)
+            {
+                drop(state);
+                crate::v2_storage::remove_new_database_files(&v2_path);
+                return Err(error);
+            }
+        }
+        state.migrate_legacy_api_keys()?;
+        Ok(state)
     }
 
     pub fn from_path(path: PathBuf) -> AppResult<Self> {
         Self::from_path_with_resources(path, Vec::new())
+    }
+
+    pub fn migrate_legacy_api_keys(&self) -> AppResult<()> {
+        lifecycle::migrate_legacy_api_keys(self)
     }
 
     fn from_path_with_resources(
@@ -61,19 +122,38 @@ impl AppState {
         mut resource_roots: Vec<PathBuf>,
     ) -> AppResult<Self> {
         resource_roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"));
-        let conn = Connection::open(path)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+            conn.busy_timeout(Duration::from_secs(5))?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            Ok(())
+        });
+        let pool = Pool::builder()
+            .max_size(6)
+            .connection_timeout(Duration::from_secs(5))
+            .build(manager)
+            .map_err(|error| {
+                AppError::Validation(format!("cannot create SQLite connection pool: {error}"))
+            })?;
+        let (run_event_tx, _) = broadcast::channel(512);
         let state = Self {
-            conn: Arc::new(Mutex::new(conn)),
+            pool: Arc::new(pool),
             resource_roots: Arc::new(resource_roots),
+            reference_store: Arc::new(Mutex::new(ReferenceStore::default())),
             index_worker_started: Arc::new(AtomicBool::new(false)),
             index_worker_notify: Arc::new(Notify::new()),
+            run_event_tx,
         };
         lifecycle::initialize(&state)?;
         Ok(state)
     }
 
     pub(crate) fn story_search_resource_roots(&self) -> &[PathBuf] {
+        self.resource_roots.as_slice()
+    }
+
+    pub(crate) fn bundled_resource_roots(&self) -> &[PathBuf] {
         self.resource_roots.as_slice()
     }
 
@@ -92,12 +172,65 @@ impl AppState {
         self.index_worker_notify.notified().await;
     }
 
+    pub fn subscribe_run_events(&self) -> broadcast::Receiver<RunEvent> {
+        self.run_event_tx.subscribe()
+    }
+
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> AppResult<T>) -> AppResult<T> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| AppError::Validation("database connection lock poisoned".to_string()))?;
+        let conn = self.pool.get().map_err(|error| {
+            AppError::Validation(format!("cannot acquire SQLite connection: {error}"))
+        })?;
+        crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, &conn)?;
         f(&conn)
+    }
+
+    pub(crate) fn with_reference_store<T>(
+        &self,
+        f: impl FnOnce(&mut ReferenceStore) -> AppResult<T>,
+    ) -> AppResult<T> {
+        let mut store = self
+            .reference_store
+            .lock()
+            .map_err(|_| AppError::Validation("临时参考资料状态锁已损坏".to_string()))?;
+        f(&mut store)
+    }
+
+    pub fn import_reference_text(
+        &self,
+        input: ImportReferenceTextRequest,
+    ) -> AppResult<ReferenceMaterial> {
+        crate::reference::import_reference_text(
+            self,
+            input.project_id,
+            &input.file_name,
+            &input.content,
+            input.tags,
+        )
+    }
+
+    pub fn list_reference_materials(&self, project_id: i64) -> AppResult<Vec<ReferenceMaterial>> {
+        crate::reference::list_reference_materials(self, project_id)
+    }
+
+    pub fn update_reference_material(
+        &self,
+        input: UpdateReferenceMaterialRequest,
+    ) -> AppResult<ReferenceMaterial> {
+        crate::reference::update_reference_material(
+            self,
+            input.project_id,
+            input.reference_id,
+            input.enabled,
+            input.tags,
+        )
+    }
+
+    pub fn remove_reference_material(&self, project_id: i64, reference_id: u64) -> AppResult<()> {
+        crate::reference::remove_reference_material(self, project_id, reference_id)
+    }
+
+    pub fn clear_reference_materials(&self, project_id: i64) {
+        crate::reference::clear_project(self, project_id);
     }
 
     pub(super) fn migrate(&self) -> AppResult<()> {
@@ -121,7 +254,13 @@ impl AppState {
                     name TEXT NOT NULL,
                     role TEXT NOT NULL,
                     system_prompt TEXT NOT NULL,
-                    temperature REAL NOT NULL DEFAULT 0.75
+                    temperature REAL NOT NULL DEFAULT 0.75,
+                    provider_base_url TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    thinking_enabled INTEGER NOT NULL DEFAULT 0,
+                    thinking_level TEXT NOT NULL DEFAULT 'off',
+                    enabled_tool_keys TEXT NOT NULL DEFAULT '["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]',
+                    allowed_skill_keys TEXT NOT NULL DEFAULT '["continuity_and_agency"]'
                 );
 
                 CREATE TABLE IF NOT EXISTS chapters (
@@ -196,6 +335,19 @@ impl AppState {
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_providers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT NOT NULL,
+                    base_url TEXT NOT NULL UNIQUE,
+                    model TEXT NOT NULL,
+                    temperature REAL NOT NULL DEFAULT 0.75,
+                    thinking_enabled INTEGER NOT NULL DEFAULT 0,
+                    thinking_level TEXT NOT NULL DEFAULT 'off',
+                    api_key TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS story_threads (
@@ -431,6 +583,16 @@ impl AppState {
                 CREATE INDEX IF NOT EXISTS idx_story_search_documents_chapter
                     ON story_search_documents(project_id, chapter_no_sort, source_kind);
 
+                CREATE TABLE IF NOT EXISTS story_search_document_terms (
+                    project_id INTEGER NOT NULL,
+                    document_id INTEGER NOT NULL,
+                    term TEXT NOT NULL,
+                    PRIMARY KEY(project_id, term, document_id),
+                    FOREIGN KEY(document_id) REFERENCES story_search_documents(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_story_search_document_terms_document
+                    ON story_search_document_terms(document_id);
+
                 CREATE VIRTUAL TABLE IF NOT EXISTS story_search_documents_fts
                     USING fts5(search_text, content='story_search_documents', content_rowid='id', tokenize='trigram');
 
@@ -584,15 +746,47 @@ impl AppState {
                     params![stage, name, role, prompt, temperature],
                 )?;
             }
-            patch_default_agent_prompts(conn)?;
+            for (stage, name, role, prompt, temperature) in default_background_agents() {
+                conn.execute(
+                    "INSERT INTO agents (stage, name, role, system_prompt, temperature)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(stage) DO NOTHING",
+                    params![stage, name, role, prompt, temperature],
+                )?;
+            }
             backfill_project_genre_agents(conn)?;
 
             set_default_setting(conn, "ai.base_url", "https://api.deepseek.com")?;
             set_default_setting(conn, "ai.model", "deepseek-v4-pro")?;
             set_default_setting(conn, "ai.temperature", "0.75")?;
             set_default_setting(conn, "ai.thinking_enabled", "false")?;
+            set_default_setting(conn, "ai.thinking_level", "off")?;
+            set_default_setting(
+                conn,
+                "prompts.default_version",
+                crate::prompt_templates::DEFAULT_PROMPT_VERSION,
+            )?;
 
             let now = now();
+            for (label, base_url, model, temperature, thinking_enabled, thinking_level) in
+                default_ai_providers()
+            {
+                conn.execute(
+                    "INSERT INTO ai_providers
+                        (label, base_url, model, temperature, thinking_enabled, thinking_level, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                     ON CONFLICT(base_url) DO NOTHING",
+                    params![
+                        label,
+                        base_url,
+                        model,
+                        temperature,
+                        thinking_enabled as i64,
+                        thinking_level,
+                        now
+                    ],
+                )?;
+            }
             for skill in genre_skill::default_writing_skills() {
                 conn.execute(
                     "INSERT OR IGNORE INTO writing_skills
@@ -618,32 +812,51 @@ impl AppState {
         if input.title.trim().is_empty() {
             return Err(AppError::Validation("项目标题不能为空".to_string()));
         }
+        if input.genre.trim().is_empty() {
+            return Err(AppError::Validation("项目题材不能为空".to_string()));
+        }
+        if input.target_words <= 0 {
+            return Err(AppError::Validation("预计总字数必须大于 0".to_string()));
+        }
         let now = now();
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO projects (title, genre, target_words, premise, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)",
-                params![
-                    input.title.trim(),
-                    input.genre.trim(),
-                    input.target_words.max(1),
-                    input.premise.trim(),
-                    now
-                ],
-            )?;
-            let project_id = conn.last_insert_rowid();
-            let genre_agent = genre_agent::detect_genre_agent(input.genre.trim());
-            conn.execute(
-                "INSERT INTO project_genre_agents (project_id, agent_key, assigned_at)
-                 VALUES (?1, ?2, ?3)",
-                params![project_id, genre_agent.agent_key, now],
-            )?;
-            conn.execute(
-                "INSERT INTO chapters (project_id, chapter_no, title, status, created_at, updated_at)
-                 VALUES (?1, 1, '第 1 章', 'planning', ?2, ?2)",
-                params![project_id, now],
-            )?;
-            query_project_by_id(conn, project_id)
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "INSERT INTO projects (title, genre, target_words, premise, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)",
+                    params![
+                        input.title.trim(),
+                        input.genre.trim(),
+                        input.target_words,
+                        input.premise.trim(),
+                        &now
+                    ],
+                )?;
+                let project_id = conn.last_insert_rowid();
+                let genre_agent = genre_agent::detect_genre_agent(input.genre.trim());
+                conn.execute(
+                    "INSERT INTO project_genre_agents (project_id, agent_key, assigned_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![project_id, genre_agent.agent_key, &now],
+                )?;
+                conn.execute(
+                    "INSERT INTO chapters (project_id, chapter_no, title, status, created_at, updated_at)
+                     VALUES (?1, 1, '第 1 章', 'planning', ?2, ?2)",
+                    params![project_id, &now],
+                )?;
+                query_project_by_id(conn, project_id)
+            })();
+            match result {
+                Ok(project) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(project)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -675,28 +888,53 @@ impl AppState {
         if input.title.trim().is_empty() {
             return Err(AppError::Validation("项目标题不能为空".to_string()));
         }
+        if input.genre.trim().is_empty() {
+            return Err(AppError::Validation("项目题材不能为空".to_string()));
+        }
+        if input.target_words <= 0 {
+            return Err(AppError::Validation("预计总字数必须大于 0".to_string()));
+        }
+        if !matches!(input.status.trim(), "active" | "paused" | "archived") {
+            return Err(AppError::Validation("项目状态无效".to_string()));
+        }
         let now = now();
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE projects
-                 SET title = ?1, genre = ?2, target_words = ?3, premise = ?4, status = ?5, updated_at = ?6
-                 WHERE id = ?7",
-                params![
-                    input.title.trim(),
-                    input.genre.trim(),
-                    input.target_words.max(1),
-                    input.premise.trim(),
-                    input.status,
-                    now,
-                    input.id
-                ],
-            )?;
-            query_project_by_id(conn, input.id)
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let changed = conn.execute(
+                    "UPDATE projects
+                     SET title = ?1, genre = ?2, target_words = ?3, premise = ?4, status = ?5, updated_at = ?6
+                     WHERE id = ?7",
+                    params![
+                        input.title.trim(),
+                        input.genre.trim(),
+                        input.target_words,
+                        input.premise.trim(),
+                        input.status.trim(),
+                        &now,
+                        input.id
+                    ],
+                )?;
+                if changed == 0 {
+                    return Err(AppError::Validation("项目不存在".to_string()));
+                }
+                query_project_by_id(conn, input.id)
+            })();
+            match result {
+                Ok(project) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(project)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
         })
     }
 
     pub fn delete_project(&self, id: i64) -> AppResult<()> {
-        self.with_conn(|conn| {
+        let result = self.with_conn(|conn| {
             crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, conn)?;
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| {
@@ -721,7 +959,11 @@ impl AppState {
                     Err(error)
                 }
             }
-        })
+        });
+        if result.is_ok() {
+            self.clear_reference_materials(id);
+        }
+        result
     }
 
     pub fn get_detail(&self, project_id: i64) -> AppResult<ProjectDetail> {
@@ -752,25 +994,17 @@ impl AppState {
             story_bible: self.get_story_bible(project_id)?,
             story_arcs: self.list_story_arcs(project_id)?,
             story_bible_review: self.latest_story_bible_review(project_id)?,
+            canonical_fingerprint: crate::story_architecture::canonical_fingerprint(
+                self, project_id,
+            )?,
             settings: self.get_ai_settings()?,
         })
     }
 
     pub fn list_agents(&self) -> AppResult<Vec<Agent>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, stage, name, role, system_prompt, temperature FROM agents ORDER BY id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok(Agent {
-                    id: row.get(0)?,
-                    stage: row.get(1)?,
-                    name: row.get(2)?,
-                    role: row.get(3)?,
-                    system_prompt: row.get(4)?,
-                    temperature: row.get(5)?,
-                })
-            })?;
+            let mut stmt = conn.prepare(AGENT_SELECT_SQL)?;
+            let rows = stmt.query_map([], map_agent)?;
             collect_rows(rows)
         })
     }
@@ -778,21 +1012,176 @@ impl AppState {
     pub fn get_agent(&self, stage: &str) -> AppResult<Agent> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT id, stage, name, role, system_prompt, temperature FROM agents WHERE stage = ?1",
+                &format!("{} WHERE a.stage = ?1", AGENT_SELECT_SQL),
                 params![stage],
-                |row| {
-                    Ok(Agent {
-                        id: row.get(0)?,
-                        stage: row.get(1)?,
-                        name: row.get(2)?,
-                        role: row.get(3)?,
-                        system_prompt: row.get(4)?,
-                        temperature: row.get(5)?,
-                    })
-                },
+                map_agent,
             )
             .optional()?
             .ok_or_else(|| AppError::Validation("Agent 不存在".to_string()))
+        })
+    }
+
+    pub fn get_agent_by_id(&self, agent_id: i64) -> AppResult<Agent> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                &format!("{} WHERE a.id = ?1", AGENT_SELECT_SQL),
+                params![agent_id],
+                map_agent,
+            )
+            .optional()?
+            .ok_or_else(|| AppError::Validation("Agent 不存在".to_string()))
+        })
+    }
+
+    pub fn replace_agent_prompt(&self, agent_id: i64, prompt: &str) -> AppResult<Agent> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(AppError::Validation("Agent Prompt 不能为空".to_string()));
+        }
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE agents SET system_prompt = ?1 WHERE id = ?2",
+                params![prompt, agent_id],
+            )?;
+            if changed == 0 {
+                return Err(AppError::Validation("Agent 不存在".to_string()));
+            }
+            conn.query_row(
+                &format!("{} WHERE a.id = ?1", AGENT_SELECT_SQL),
+                params![agent_id],
+                map_agent,
+            )
+            .map_err(AppError::from)
+        })
+    }
+
+    pub fn save_agent_settings(&self, input: SaveAgentSettings) -> AppResult<Agent> {
+        self.with_conn(|conn| {
+            let current = conn
+                .query_row(
+                    "SELECT name, role, system_prompt, temperature, thinking_enabled,
+                            thinking_level, enabled_tool_keys, allowed_skill_keys
+                     FROM agents WHERE id = ?1",
+                    params![input.agent_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, f64>(3)?,
+                            row.get::<_, i64>(4)? != 0,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("Agent 不存在".to_string()))?;
+
+            let uses_global = input.uses_global_runtime_settings.unwrap_or(false);
+            let provider_base_url = if uses_global {
+                String::new()
+            } else {
+                input.provider_base_url.trim().to_string()
+            };
+            let model = if uses_global {
+                String::new()
+            } else {
+                input.model.trim().to_string()
+            };
+            if !uses_global && provider_base_url.is_empty() {
+                return Err(AppError::Validation("Agent 供应商地址不能为空".to_string()));
+            }
+            if !uses_global && model.is_empty() {
+                return Err(AppError::Validation("Agent 模型名称不能为空".to_string()));
+            }
+
+            let name = input
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(current.0.as_str())
+                .to_string();
+            let role = input
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(current.1.as_str())
+                .to_string();
+            let system_prompt = input
+                .system_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(current.2.as_str())
+                .to_string();
+            let temperature = input.temperature.unwrap_or(current.3);
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                return Err(AppError::Validation(
+                    "Agent Temperature 必须在 0 到 2 之间".to_string(),
+                ));
+            }
+
+            let thinking_enabled = if uses_global {
+                false
+            } else {
+                input.thinking_enabled
+            };
+            let thinking_level = if uses_global {
+                "off".to_string()
+            } else {
+                crate::models::normalize_thinking_level(
+                    thinking_enabled,
+                    input
+                        .thinking_level
+                        .as_deref()
+                        .unwrap_or(current.5.as_str()),
+                )
+                .map_err(AppError::Validation)?
+            };
+            let enabled_tool_keys = input
+                .enabled_tool_keys
+                .as_deref()
+                .map(agent_tools::normalize_keys)
+                .unwrap_or_else(|| parse_agent_keys(&current.6, true));
+            let allowed_skill_keys = input
+                .allowed_skill_keys
+                .as_deref()
+                .map(normalize_skill_keys)
+                .unwrap_or_else(|| parse_agent_keys(&current.7, false));
+
+            let changed = conn.execute(
+                "UPDATE agents
+                 SET name = ?1, role = ?2, system_prompt = ?3, temperature = ?4,
+                     provider_base_url = ?5, model = ?6, thinking_enabled = ?7,
+                     thinking_level = ?8, enabled_tool_keys = ?9, allowed_skill_keys = ?10
+                 WHERE id = ?11",
+                params![
+                    name,
+                    role,
+                    system_prompt,
+                    temperature,
+                    provider_base_url,
+                    model,
+                    thinking_enabled as i64,
+                    thinking_level,
+                    serde_json::to_string(&enabled_tool_keys)?,
+                    serde_json::to_string(&allowed_skill_keys)?,
+                    input.agent_id,
+                ],
+            )?;
+            if changed == 0 {
+                return Err(AppError::Validation("Agent 不存在".to_string()));
+            }
+            conn.query_row(
+                &format!("{} WHERE a.id = ?1", AGENT_SELECT_SQL),
+                params![input.agent_id],
+                map_agent,
+            )
+            .map_err(AppError::from)
         })
     }
 
@@ -802,6 +1191,243 @@ impl AppState {
             other => other,
         };
         self.get_agent(key)
+    }
+
+    pub fn get_ai_settings_for_agent(&self, agent_key: &str) -> AppResult<AiSettings> {
+        let agent = self.get_agent(agent_key)?;
+        let mut settings = agent.ai_settings();
+        settings.has_api_key = self.get_api_key_for_base_url(&settings.base_url)?.is_some();
+        Ok(settings)
+    }
+
+    pub fn list_ai_providers(&self) -> AppResult<Vec<AiProvider>> {
+        let providers = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, label, base_url, model, temperature, thinking_enabled, thinking_level, tool_protocol
+                 FROM ai_providers ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], map_ai_provider)?;
+            collect_rows(rows)
+        })?;
+
+        providers
+            .into_iter()
+            .map(|mut provider| {
+                provider.has_api_key = self.get_api_key_for_base_url(&provider.base_url)?.is_some();
+                Ok(provider)
+            })
+            .collect()
+    }
+
+    fn get_ai_provider(&self, provider_id: i64) -> AppResult<AiProvider> {
+        let mut provider = self
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT id, label, base_url, model, temperature, thinking_enabled, thinking_level, tool_protocol
+                 FROM ai_providers WHERE id = ?1",
+                    params![provider_id],
+                    map_ai_provider,
+                )
+                .optional()
+                .map_err(AppError::from)
+            })?
+            .ok_or_else(|| AppError::Validation("供应商不存在".to_string()))?;
+        provider.has_api_key = self.get_api_key_for_base_url(&provider.base_url)?.is_some();
+        Ok(provider)
+    }
+
+    pub fn save_ai_provider(&self, input: SaveAiProvider) -> AppResult<AiProvider> {
+        let label = input.label.trim().to_string();
+        let base_url = input.base_url.trim().to_string();
+        let model = input.model.trim().to_string();
+        if label.is_empty() {
+            return Err(AppError::Validation("供应商名称不能为空".to_string()));
+        }
+        if base_url.is_empty() {
+            return Err(AppError::Validation("供应商地址不能为空".to_string()));
+        }
+        if model.is_empty() {
+            return Err(AppError::Validation("供应商模型不能为空".to_string()));
+        }
+        if !input.temperature.is_finite() || !(0.0..=2.0).contains(&input.temperature) {
+            return Err(AppError::Validation(
+                "供应商 Temperature 必须在 0 到 2 之间".to_string(),
+            ));
+        }
+        let thinking_level =
+            crate::models::normalize_thinking_level(input.thinking_enabled, &input.thinking_level)
+                .map_err(AppError::Validation)?;
+        let tool_protocol = input.tool_protocol.as_str();
+
+        let updated_at = now();
+        let provider_id = self.with_conn(|conn| {
+            let existing_id = conn
+                .query_row(
+                    "SELECT id FROM ai_providers WHERE base_url = ?1",
+                    params![base_url],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+
+            let id = match input.id {
+                Some(id) => {
+                    if existing_id.is_some_and(|existing| existing != id) {
+                        return Err(AppError::Validation(
+                            "供应商地址已被其他配置使用".to_string(),
+                        ));
+                    }
+                    let changed = conn.execute(
+                        "UPDATE ai_providers
+                         SET label = ?1, base_url = ?2, model = ?3, temperature = ?4,
+                             thinking_enabled = ?5, thinking_level = ?6, tool_protocol = ?7,
+                             api_key = CASE WHEN base_url = ?2 THEN api_key ELSE '' END,
+                             detected_tool_protocol = NULL, tool_capability_error = NULL,
+                             tool_capability_updated_at = NULL, updated_at = ?8
+                         WHERE id = ?9",
+                        params![
+                            label,
+                            base_url,
+                            model,
+                            input.temperature,
+                            input.thinking_enabled as i64,
+                            thinking_level,
+                            tool_protocol,
+                            updated_at,
+                            id
+                        ],
+                    )?;
+                    if changed == 0 {
+                        return Err(AppError::Validation("供应商不存在".to_string()));
+                    }
+                    id
+                }
+                None => {
+                    if let Some(id) = existing_id {
+                        conn.execute(
+                            "UPDATE ai_providers
+                             SET label = ?1, model = ?2, temperature = ?3,
+                                 thinking_enabled = ?4, thinking_level = ?5, tool_protocol = ?6,
+                                 detected_tool_protocol = NULL, tool_capability_error = NULL,
+                                 tool_capability_updated_at = NULL, updated_at = ?7
+                             WHERE id = ?8",
+                            params![
+                                label,
+                                model,
+                                input.temperature,
+                                input.thinking_enabled as i64,
+                                thinking_level,
+                                tool_protocol,
+                                updated_at,
+                                id
+                            ],
+                        )?;
+                        id
+                    } else {
+                        conn.execute(
+                            "INSERT INTO ai_providers
+                            (label, base_url, model, temperature, thinking_enabled, thinking_level,
+                             tool_protocol, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                            params![
+                                label,
+                                base_url,
+                                model,
+                                input.temperature,
+                                input.thinking_enabled as i64,
+                                thinking_level,
+                                tool_protocol,
+                                updated_at
+                            ],
+                        )?;
+                        conn.last_insert_rowid()
+                    }
+                }
+            };
+            Ok(id)
+        })?;
+
+        self.get_ai_provider(provider_id)
+    }
+
+    pub fn delete_ai_provider(&self, provider_id: i64) -> AppResult<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let base_url = conn
+                    .query_row(
+                        "SELECT base_url FROM ai_providers WHERE id = ?1",
+                        params![provider_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| AppError::Validation("供应商不存在".to_string()))?;
+                let provider_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM ai_providers", [], |row| row.get(0))?;
+                if provider_count <= 1 {
+                    return Err(AppError::Validation("至少保留一个供应商".to_string()));
+                }
+
+                conn.execute(
+                    "DELETE FROM ai_providers WHERE id = ?1",
+                    params![provider_id],
+                )?;
+
+                let active_base_url = get_setting(conn, "ai.base_url")?;
+                if active_base_url
+                    .as_deref()
+                    .is_some_and(|value| value.trim() == base_url)
+                {
+                    let fallback = conn
+                        .query_row(
+                            "SELECT base_url, model, temperature, thinking_enabled, thinking_level
+                             FROM ai_providers ORDER BY id ASC LIMIT 1",
+                            [],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, f64>(2)?,
+                                    row.get::<_, i64>(3)? != 0,
+                                    row.get::<_, String>(4)?,
+                                ))
+                            },
+                        )
+                        .optional()?;
+                    let (
+                        fallback_base_url,
+                        fallback_model,
+                        fallback_temperature,
+                        fallback_thinking,
+                        fallback_thinking_level,
+                    ) = fallback.ok_or_else(|| {
+                        AppError::Validation("删除供应商后没有可用的备用配置".to_string())
+                    })?;
+                    upsert_setting(conn, "ai.base_url", &fallback_base_url)?;
+                    upsert_setting(conn, "ai.model", &fallback_model)?;
+                    upsert_setting(conn, "ai.temperature", &fallback_temperature.to_string())?;
+                    upsert_setting(
+                        conn,
+                        "ai.thinking_enabled",
+                        if fallback_thinking { "true" } else { "false" },
+                    )?;
+                    upsert_setting(conn, "ai.thinking_level", &fallback_thinking_level)?;
+                }
+
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })?;
+
+        Ok(())
     }
 
     pub fn get_genre_agent_for_project(&self, project_id: i64) -> AppResult<GenreAgentProfile> {
@@ -840,34 +1466,52 @@ impl AppState {
         if input.project_id <= 0 {
             return Err(AppError::Validation("项目不存在".to_string()));
         }
+        self.get_project(input.project_id)?;
         let now = now();
         self.with_conn(|conn| {
-            let next_no: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(chapter_no), 0) + 1 FROM chapters WHERE project_id = ?1",
-                params![input.project_id],
-                |row| row.get(0),
-            )?;
-            let title = input
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("第 {next_no} 章"));
-            conn.execute(
-                "INSERT INTO chapters (project_id, chapter_no, title, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'planning', ?4, ?4)",
-                params![input.project_id, next_no, title, now],
-            )?;
-            let id = conn.last_insert_rowid();
-            conn.query_row(
-                "SELECT id, project_id, chapter_no, title, status, current_artifact_id, created_at, updated_at
-                 FROM chapters WHERE id = ?1",
-                params![id],
-                map_chapter,
-            )
-            .optional()?
-            .ok_or_else(|| AppError::Validation("章节创建失败".to_string()))
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let next_no: i64 = conn.query_row(
+                    "SELECT COALESCE(MAX(chapter_no), 0) + 1 FROM chapters WHERE project_id = ?1",
+                    params![input.project_id],
+                    |row| row.get(0),
+                )?;
+                let title = input
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("第 {next_no} 章"));
+                conn.execute(
+                    "INSERT INTO chapters (project_id, chapter_no, title, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'planning', ?4, ?4)",
+                    params![input.project_id, next_no, title, &now],
+                )?;
+                let id = conn.last_insert_rowid();
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![&now, input.project_id],
+                )?;
+                conn.query_row(
+                    "SELECT id, project_id, chapter_no, title, status, current_artifact_id, created_at, updated_at
+                     FROM chapters WHERE id = ?1",
+                    params![id],
+                    map_chapter,
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("章节创建失败".to_string()))
+            })();
+            match result {
+                Ok(chapter) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(chapter)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -894,13 +1538,18 @@ impl AppState {
                     "DELETE FROM chapters WHERE id = ?1 AND project_id = ?2",
                     params![chapter_id, project_id],
                 )?;
+                let timestamp = now();
                 conn.execute(
                     "UPDATE chapters
                     SET chapter_no = chapter_no - 1, updated_at = ?1
                      WHERE project_id = ?2 AND chapter_no > ?3",
-                    params![now(), project_id, chapter_no],
+                    params![&timestamp, project_id, chapter_no],
                 )?;
-                crate::index_jobs::enqueue_project_search_job_tx(conn, project_id, &now())?;
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![&timestamp, project_id],
+                )?;
+                crate::index_jobs::enqueue_project_search_job_tx(conn, project_id, &timestamp)?;
                 Ok(())
             })();
 
@@ -918,25 +1567,51 @@ impl AppState {
     }
 
     pub fn update_chapter(&self, input: ChapterUpdate) -> AppResult<Chapter> {
+        if input.project_id <= 0 || input.id <= 0 {
+            return Err(AppError::Validation("项目或章节不存在".to_string()));
+        }
         if input.title.trim().is_empty() {
             return Err(AppError::Validation("章节标题不能为空".to_string()));
         }
+        if !matches!(input.status.trim(), "planning" | "approved") {
+            return Err(AppError::Validation("章节状态无效".to_string()));
+        }
         let now = now();
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE chapters
-                 SET title = ?1, status = ?2, updated_at = ?3
-                 WHERE id = ?4",
-                params![input.title.trim(), input.status, now, input.id],
-            )?;
-            conn.query_row(
-                "SELECT id, project_id, chapter_no, title, status, current_artifact_id, created_at, updated_at
-                 FROM chapters WHERE id = ?1",
-                params![input.id],
-                map_chapter,
-            )
-            .optional()?
-            .ok_or_else(|| AppError::Validation("章节不存在".to_string()))
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let changed = conn.execute(
+                    "UPDATE chapters
+                     SET title = ?1, status = ?2, updated_at = ?3
+                     WHERE id = ?4 AND project_id = ?5",
+                    params![input.title.trim(), input.status.trim(), &now, input.id, input.project_id],
+                )?;
+                if changed == 0 {
+                    return Err(AppError::Validation("章节不存在".to_string()));
+                }
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![&now, input.project_id],
+                )?;
+                conn.query_row(
+                    "SELECT id, project_id, chapter_no, title, status, current_artifact_id, created_at, updated_at
+                     FROM chapters WHERE id = ?1 AND project_id = ?2",
+                    params![input.id, input.project_id],
+                    map_chapter,
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("章节不存在".to_string()))
+            })();
+            match result {
+                Ok(chapter) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(chapter)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -1574,21 +2249,42 @@ impl AppState {
         if let Some(reason) = self.protected_artifact_reason(&artifact)? {
             return Err(AppError::Validation(reason));
         }
+        let message = format!(
+            "删除历史版本：{} v{}",
+            stage_label(&artifact.stage),
+            artifact.version
+        );
+        let timestamp = now();
         self.with_conn(|conn| {
-            conn.execute("DELETE FROM artifacts WHERE id = ?1", params![artifact_id])?;
-            Ok(())
-        })?;
-        self.insert_message(
-            project_id,
-            artifact.chapter_id,
-            "human_instruction",
-            &format!(
-                "删除历史版本：{} v{}",
-                stage_label(&artifact.stage),
-                artifact.version
-            ),
-        )?;
-        Ok(())
+            crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, conn)?;
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                delete_artifact_search_data_tx(conn, project_id, artifact_id)?;
+                let deleted = conn.execute(
+                    "DELETE FROM artifacts WHERE id = ?1 AND project_id = ?2",
+                    params![artifact_id, project_id],
+                )?;
+                if deleted == 0 {
+                    return Err(AppError::Validation("产物不存在".to_string()));
+                }
+                conn.execute(
+                    "INSERT INTO messages (project_id, chapter_id, role, content, created_at)
+                     VALUES (?1, ?2, 'human_instruction', ?3, ?4)",
+                    params![project_id, artifact.chapter_id, &message, &timestamp],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
     }
 
     pub fn clear_chapter_history(
@@ -1600,7 +2296,14 @@ impl AppState {
         let chapter = self
             .ensure_chapter(project_id, Some(chapter_id))?
             .ok_or_else(|| AppError::Validation("章节不存在".to_string()))?;
-        let mut keep_set: HashSet<i64> = keep_artifact_ids.iter().copied().collect();
+        let mut keep_set = HashSet::new();
+        for artifact_id in keep_artifact_ids {
+            let artifact = self.get_artifact(*artifact_id)?;
+            if artifact.project_id != project_id || artifact.chapter_id != Some(chapter_id) {
+                return Err(AppError::Validation("保留的产物不属于当前章节".to_string()));
+            }
+            keep_set.insert(*artifact_id);
+        }
         if let Some(current_id) = chapter.current_artifact_id {
             keep_set.insert(current_id);
         }
@@ -1609,8 +2312,8 @@ impl AppState {
             stage: None,
             chapter_id: Some(chapter_id),
         })?;
-        let mut deleted = Vec::new();
-        for artifact in artifacts {
+        let mut to_delete = Vec::new();
+        for artifact in &artifacts {
             if keep_set.contains(&artifact.id) {
                 continue;
             }
@@ -1618,22 +2321,54 @@ impl AppState {
                 keep_set.insert(artifact.id);
                 continue;
             }
-            self.with_conn(|conn| {
-                conn.execute("DELETE FROM artifacts WHERE id = ?1", params![artifact.id])?;
-                Ok(())
-            })?;
-            deleted.push(artifact.id);
+            to_delete.push(artifact.clone());
         }
-        self.insert_message(
-            project_id,
-            Some(chapter_id),
-            "human_instruction",
-            &format!(
-                "清理章节历史版本：删除 {} 个，保留 {} 个。",
-                deleted.len(),
-                keep_set.len()
-            ),
-        )?;
+        let deleted = to_delete
+            .iter()
+            .map(|artifact| artifact.id)
+            .collect::<Vec<_>>();
+        let timestamp = now();
+        let message = format!(
+            "清理章节历史版本：删除 {} 个，保留 {} 个。",
+            deleted.len(),
+            keep_set.len()
+        );
+        self.with_conn(|conn| {
+            crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, conn)?;
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                for artifact in &to_delete {
+                    delete_artifact_search_data_tx(conn, project_id, artifact.id)?;
+                    let changed = conn.execute(
+                        "DELETE FROM artifacts WHERE id = ?1 AND project_id = ?2 AND chapter_id = ?3",
+                        params![artifact.id, project_id, chapter_id],
+                    )?;
+                    if changed == 0 {
+                        return Err(AppError::Validation("清理历史时产物已不存在".to_string()));
+                    }
+                }
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![&timestamp, project_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO messages (project_id, chapter_id, role, content, created_at)
+                     VALUES (?1, ?2, 'human_instruction', ?3, ?4)",
+                    params![project_id, chapter_id, &message, &timestamp],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })?;
         let mut kept_artifact_ids = keep_set.into_iter().collect::<Vec<_>>();
         kept_artifact_ids.sort_unstable();
         Ok(crate::models::HistoryCleanupResult {
@@ -1990,34 +2725,70 @@ impl AppState {
 
         let now = now();
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO writing_skills
-                    (skill_key, name, category, description, content, enabled, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-                 ON CONFLICT(skill_key) DO UPDATE SET
-                    name = excluded.name,
-                    category = excluded.category,
-                    description = excluded.description,
-                    content = excluded.content,
-                    enabled = excluded.enabled,
-                    updated_at = excluded.updated_at",
-                params![
-                    skill_key,
-                    name,
-                    input.category.trim(),
-                    input.description.trim(),
-                    content,
-                    if input.enabled { 1 } else { 0 },
-                    now
-                ],
-            )?;
-            conn.query_row(
-                "SELECT id, skill_key, name, category, description, content, enabled, created_at, updated_at
-                 FROM writing_skills WHERE skill_key = ?1",
-                params![skill_key],
-                map_writing_skill,
-            )
-            .map_err(AppError::from)
+            if let Some(id) = input.id {
+                let existing_key = conn
+                    .query_row(
+                        "SELECT skill_key FROM writing_skills WHERE id = ?1",
+                        params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| AppError::Validation("技能不存在".to_string()))?;
+                if existing_key != skill_key {
+                    return Err(AppError::Validation("技能标识不能修改".to_string()));
+                }
+                conn.execute(
+                    "UPDATE writing_skills
+                     SET name = ?1, category = ?2, description = ?3, content = ?4,
+                         enabled = ?5, updated_at = ?6
+                     WHERE id = ?7",
+                    params![
+                        name,
+                        input.category.trim(),
+                        input.description.trim(),
+                        content,
+                        if input.enabled { 1 } else { 0 },
+                        now,
+                        id
+                    ],
+                )?;
+                conn.query_row(
+                    "SELECT id, skill_key, name, category, description, content, enabled, created_at, updated_at
+                     FROM writing_skills WHERE id = ?1",
+                    params![id],
+                    map_writing_skill,
+                )
+                .map_err(AppError::from)
+            } else {
+                conn.execute(
+                    "INSERT INTO writing_skills
+                        (skill_key, name, category, description, content, enabled, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                     ON CONFLICT(skill_key) DO UPDATE SET
+                        name = excluded.name,
+                        category = excluded.category,
+                        description = excluded.description,
+                        content = excluded.content,
+                        enabled = excluded.enabled,
+                        updated_at = excluded.updated_at",
+                    params![
+                        skill_key,
+                        name,
+                        input.category.trim(),
+                        input.description.trim(),
+                        content,
+                        if input.enabled { 1 } else { 0 },
+                        now
+                    ],
+                )?;
+                conn.query_row(
+                    "SELECT id, skill_key, name, category, description, content, enabled, created_at, updated_at
+                     FROM writing_skills WHERE skill_key = ?1",
+                    params![skill_key],
+                    map_writing_skill,
+                )
+                .map_err(AppError::from)
+            }
         })
     }
 
@@ -2267,7 +3038,9 @@ impl AppState {
             }
         })?;
         if stage == "draft" || stage == "revision" {
-            workflow::sync_story_threads_from_artifact(self, &artifact)?;
+            if let Err(error) = workflow::sync_story_threads_from_artifact(self, &artifact) {
+                eprintln!("story thread refresh unavailable after approval: {error}");
+            }
         }
         Ok(approval)
     }
@@ -2284,29 +3057,84 @@ impl AppState {
     }
 
     pub fn save_ai_settings(&self, input: SaveAiSettings) -> AppResult<AiSettings> {
-        if input.base_url.trim().is_empty() {
+        let base_url = input.base_url.trim().to_string();
+        let model = input.model.trim().to_string();
+        if base_url.is_empty() {
             return Err(AppError::Validation("AI 地址不能为空".to_string()));
         }
-        self.with_conn(|conn| {
-            upsert_setting(conn, "ai.base_url", input.base_url.trim())?;
-            upsert_setting(conn, "ai.model", input.model.trim())?;
-            upsert_setting(conn, "ai.temperature", &input.temperature.to_string())?;
-            upsert_setting(
-                conn,
-                "ai.thinking_enabled",
-                if input.thinking_enabled {
-                    "true"
-                } else {
-                    "false"
-                },
-            )?;
-            Ok(())
-        })?;
-        if let Some(api_key) = input.api_key {
-            if !api_key.trim().is_empty() {
-                secrets::set_api_key_for_scope(input.base_url.trim(), api_key.trim())?;
-            }
+        if model.is_empty() {
+            return Err(AppError::Validation("模型名称不能为空".to_string()));
         }
+        if !input.temperature.is_finite() || !(0.0..=2.0).contains(&input.temperature) {
+            return Err(AppError::Validation(
+                "Temperature 必须在 0 到 2 之间".to_string(),
+            ));
+        }
+        let thinking_level =
+            crate::models::normalize_thinking_level(input.thinking_enabled, &input.thinking_level)
+                .map_err(AppError::Validation)?;
+        let api_key = input
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let updated_at = now();
+
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                upsert_setting(conn, "ai.base_url", &base_url)?;
+                upsert_setting(conn, "ai.model", &model)?;
+                upsert_setting(conn, "ai.temperature", &input.temperature.to_string())?;
+                upsert_setting(
+                    conn,
+                    "ai.thinking_enabled",
+                    if input.thinking_enabled {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )?;
+                upsert_setting(conn, "ai.thinking_level", &thinking_level)?;
+                conn.execute(
+                    "INSERT INTO ai_providers
+                        (label, base_url, model, temperature, thinking_enabled, thinking_level, api_key, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                     ON CONFLICT(base_url) DO UPDATE SET
+                        model = excluded.model,
+                        temperature = excluded.temperature,
+                        thinking_enabled = excluded.thinking_enabled,
+                        thinking_level = excluded.thinking_level,
+                        api_key = CASE
+                            WHEN excluded.api_key <> '' THEN excluded.api_key
+                            ELSE ai_providers.api_key
+                        END,
+                        updated_at = excluded.updated_at",
+                    params![
+                        ai_provider_label(&base_url),
+                        base_url,
+                        model,
+                        input.temperature,
+                        input.thinking_enabled as i64,
+                        thinking_level,
+                        api_key.as_deref().unwrap_or(""),
+                        updated_at
+                    ],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })?;
         self.get_ai_settings()
     }
 
@@ -2323,6 +3151,17 @@ impl AppState {
                 thinking_enabled: get_setting(conn, "ai.thinking_enabled")?
                     .map(|value| value == "true" || value == "1")
                     .unwrap_or(AiSettings::default().thinking_enabled),
+                thinking_level: get_setting(conn, "ai.thinking_level")?.unwrap_or_else(|| {
+                    if get_setting(conn, "ai.thinking_enabled")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|value| value == "true" || value == "1")
+                    {
+                        "medium".to_string()
+                    } else {
+                        AiSettings::default().thinking_level
+                    }
+                }),
                 has_api_key: false,
             })
         })?;
@@ -2331,11 +3170,24 @@ impl AppState {
     }
 
     pub fn get_api_key(&self) -> AppResult<Option<String>> {
-        secrets::get_api_key()
+        let settings = self.get_ai_settings()?;
+        self.get_api_key_for_base_url(&settings.base_url)
     }
 
     pub fn get_api_key_for_base_url(&self, base_url: &str) -> AppResult<Option<String>> {
-        secrets::get_api_key_for_scope(base_url)
+        let normalized = base_url.trim().to_string();
+        let stored = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT NULLIF(api_key, '') FROM ai_providers WHERE base_url = ?1",
+                params![normalized],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(AppError::from)
+        })?;
+
+        Ok(stored)
     }
 
     pub fn get_story_bible(&self, project_id: i64) -> AppResult<Option<StoryBible>> {
@@ -2603,67 +3455,162 @@ fn resolve_project_genre_agent(conn: &Connection, project_id: i64) -> AppResult<
     Ok(profile)
 }
 
+fn ai_provider_label(base_url: &str) -> String {
+    let normalized = base_url.to_ascii_lowercase();
+    if normalized.contains("deepseek") {
+        "DeepSeek".to_string()
+    } else if normalized.contains("minimax") {
+        "MiniMax".to_string()
+    } else if normalized.contains("agentrouter.org") {
+        "AgentRouter".to_string()
+    } else {
+        "自定义供应商".to_string()
+    }
+}
+
+fn default_ai_providers() -> [(
+    &'static str,
+    &'static str,
+    &'static str,
+    f64,
+    bool,
+    &'static str,
+); 3] {
+    [
+        (
+            "DeepSeek",
+            "https://api.deepseek.com",
+            "deepseek-v4-pro",
+            0.75,
+            false,
+            "off",
+        ),
+        (
+            "MiniMax",
+            "https://api.minimaxi.com/v1",
+            "MiniMax-M3",
+            0.72,
+            true,
+            "medium",
+        ),
+        (
+            "AgentRouter",
+            "http://45.145.229.236:38001/v1",
+            "kimi-k3",
+            0.75,
+            false,
+            "off",
+        ),
+    ]
+}
+
+fn default_background_agents() -> Vec<(&'static str, &'static str, &'static str, &'static str, f64)>
+{
+    vec![
+        (
+            "adoption",
+            "资料整理 Agent",
+            "从已批准产物提取知识卡与伏笔候选",
+            crate::prompt_templates::default_prompt("adoption").unwrap(),
+            0.1,
+        ),
+        (
+            "story_index",
+            "故事索引 Agent",
+            "从已批准正文提取实体、事件和原子事实",
+            crate::prompt_templates::default_prompt("story_index").unwrap(),
+            0.0,
+        ),
+        (
+            "chapter_memory",
+            "章节记忆 Agent",
+            "生成下一章使用的事实交接记忆",
+            crate::prompt_templates::default_prompt("chapter_memory").unwrap(),
+            0.1,
+        ),
+        (
+            "continuity_ledger",
+            "状态账本 Agent",
+            "从已批准正文提取物件、资源和状态变化",
+            crate::prompt_templates::default_prompt("continuity_ledger").unwrap(),
+            0.0,
+        ),
+        (
+            "continuity_check",
+            "状态核对 Agent",
+            "核对候选稿是否越过已批准状态边界",
+            crate::prompt_templates::default_prompt("continuity_check").unwrap(),
+            0.0,
+        ),
+        (
+            "context_search_plan",
+            "上下文规划 Agent",
+            "规划需要检索的历史事实",
+            crate::prompt_templates::default_prompt("context_search_plan").unwrap(),
+            0.0,
+        ),
+        (
+            "context_search_rerank",
+            "上下文筛选 Agent",
+            "从检索候选中筛选直接相关的原文证据",
+            crate::prompt_templates::default_prompt("context_search_rerank").unwrap(),
+            0.0,
+        ),
+        (
+            "continuity_review",
+            "连续性审校 Agent",
+            "审校多章衔接和事实连续性",
+            crate::prompt_templates::default_prompt("continuity_review").unwrap(),
+            0.0,
+        ),
+        (
+            "chapter_split_plan",
+            "拆章规划 Agent",
+            "将超载章节拆成可执行的章节任务",
+            crate::prompt_templates::default_prompt("chapter_split_plan").unwrap(),
+            0.0,
+        ),
+        (
+            "artifact_revision",
+            "局部修订 Agent",
+            "只重写用户指定的局部片段",
+            crate::prompt_templates::default_prompt("artifact_revision").unwrap(),
+            0.35,
+        ),
+    ]
+}
+
 fn default_agents() -> Vec<(&'static str, &'static str, &'static str, &'static str, f64)> {
     vec![
         (
             "story_architect",
             "故事架构 Agent",
             "负责统一维护创作基准、阶段大纲、角色与事实一致性",
-            "你是长篇小说的故事架构师，也是唯一的 Canon Manager。世界规则、人物动机、阶段大纲、伏笔、资源和能力边界必须作为同一个整体维护。你不把设定、大纲、角色当作孤立文档：每次补充都要说明它如何服务主角发动机、当前故事阶段和后续因果。允许远期方向保留模糊，但当前阶段必须可执行；新角色、新势力、新规则、物件或伏笔必须有明确引入路径、叙事用途和代价。只使用已批准 Canon，不把候选稿或猜测写成事实。",
+            crate::prompt_templates::default_prompt("story_architect").unwrap(),
             0.62,
         ),
         (
             "draft",
             "写作 Agent",
             "负责章节正文草稿",
-            "你是商业类型小说写手。只输出章节正文，不写创作说明。优先场景、动作、对白和有效细节；少解释设定，少内心总结，少使用泛化比喻。每个段落应承担清楚的叙事作用，但允许为气氛、关系和情绪留出必要空间。严格使用已批准设定、大纲和角色资料，不越过未批准事实。开篇不要空转，应让读者逐渐或立即看清本章正在处理什么；结尾按章节模式完成结果、决定、信息改写、行动启动、关系新平衡或情绪余韵，不强制危险和反转。章节长度由场景、人物关系、情绪承接和冲突解决的实际需要决定，不设上限。优先完成一个主要章节功能；若素材太多，按因果与读者消化能力分配到后续章节，不要把多个独立高潮、设定解释和反转挤成清单。",
+            crate::prompt_templates::default_prompt("draft").unwrap(),
             0.78,
         ),
         (
             "review",
             "试读 Agent",
             "负责挑出问题",
-            "你是苛刻的连载试读编辑。只挑会影响读者继续读的问题，从开篇抓力、节奏、场景可信度、对白质感、人物一致性、悬念强度、解释感和题材承诺兑现检查。先判断本章的章节模式，再按该模式审校，不要把成长、关系、过渡章节误判为缺少打斗或反转。审校与建议都只能使用候选稿、已批准资料和前章已有事实；候选稿凭空加入过去事件、隐藏证据、人物、地点、规则或角色已知信息时，必须标 major 的事实越界，不能用新设定替它修补。每条建议必须提供候选稿或已批准资料中的 evidence_quote；action_evidence_quote 只在建议要求强化、继续使用既有动作时提供，删减、合并或重排可留空。不要因章节本身较长而扣分，只有重复、信息堆叠或失去章节功能时才指出篇幅问题。每条建议必须能直接指导修稿。",
+            crate::prompt_templates::default_prompt("review").unwrap(),
             0.35,
         ),
         (
             "revision",
             "修订 Agent",
             "负责根据反馈改稿",
-            "你是小说修订编辑。只输出修订后的完整正文。优先解决试读问题和人工反馈，保留有效段落，删掉解释感和模板化句子，增强人物动作、对白潜台词和本章状态变化。只允许使用源稿、已批准资料、试读报告和人工指令中已明确的事实；不得为制造钩子编造过去事件、隐藏证据、人物、地点、制度、交易习惯或角色已知信息。需要修结尾时，优先落稳已经形成的结果、决定、关系变化、情绪余波或下一步行动；只有前文已经存在相应压力时才推进威胁和时限。不要为了压缩篇幅删掉必要场景、对白或情绪承接；只有重复或失焦时才主动减法。若原稿信息过载，删除次要机制解释、次要空间层级和次要反转，把章节收束成一个更清晰的主要功能。",
+            crate::prompt_templates::default_prompt("revision").unwrap(),
             0.64,
         ),
     ]
-}
-
-fn patch_default_agent_prompts(conn: &Connection) -> AppResult<()> {
-    let replacements = [
-        (
-            "draft",
-            "开篇不要空转，应尽早给出异常、威胁、任务、瓶颈或正在发生的行动；结尾应落在具体新信息、变化、威胁或选择上，不能只写主角准备去做什么。",
-            "开篇不要空转，应让读者逐渐或立即看清本章正在处理什么；结尾按章节模式完成结果、决定、信息改写、行动启动、关系新平衡或情绪余韵，不强制危险和反转。",
-        ),
-        (
-            "revision",
-            "增强开篇钩子、动作推进、对白潜台词和章末悬念。",
-            "增强人物动作、对白潜台词和本章状态变化。",
-        ),
-        (
-            "revision",
-            "需要更强结尾时，推进已经出现的威胁、时限、资源、伤势或主角已开始的行动。",
-            "需要修结尾时，优先落稳已经形成的结果、决定、关系变化、情绪余波或下一步行动；只有前文已经存在相应压力时才推进威胁和时限。",
-        ),
-    ];
-
-    for (stage, old, new) in replacements {
-        conn.execute(
-            "UPDATE agents
-             SET system_prompt = replace(system_prompt, ?1, ?2)
-             WHERE stage = ?3 AND instr(system_prompt, ?1) > 0",
-            params![old, new, stage],
-        )?;
-    }
-    Ok(())
 }
 
 fn set_default_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
@@ -2913,7 +3860,7 @@ fn invalidate_story_index_from_chapter_tx(
     Ok(())
 }
 
-fn mark_story_bible_changed_tx(
+pub(crate) fn mark_story_bible_changed_tx(
     conn: &Connection,
     project_id: i64,
     timestamp: &str,
@@ -2976,6 +3923,93 @@ fn delete_chapter_search_data_tx(
         params![project_id, chapter_id, chapter_no],
     )?;
     Ok(())
+}
+
+fn delete_artifact_search_data_tx(
+    conn: &Connection,
+    project_id: i64,
+    artifact_id: i64,
+) -> AppResult<()> {
+    if table_exists(conn, "story_search_embeddings")? {
+        conn.execute(
+            "DELETE FROM story_search_embeddings
+             WHERE rowid IN (
+                 SELECT id FROM story_search_documents
+                 WHERE project_id = ?1
+                   AND source_kind = 'artifact' AND source_id = ?2
+             )",
+            params![project_id, artifact_id],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM story_search_documents
+         WHERE project_id = ?1
+           AND source_kind = 'artifact' AND source_id = ?2",
+        params![project_id, artifact_id],
+    )?;
+    conn.execute(
+        "DELETE FROM story_search_sources
+         WHERE project_id = ?1
+           AND (source_artifact_id = ?2 OR (source_kind = 'artifact' AND source_id = ?2))",
+        params![project_id, artifact_id],
+    )?;
+    Ok(())
+}
+
+fn map_ai_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiProvider> {
+    Ok(AiProvider {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        base_url: row.get(2)?,
+        model: row.get(3)?,
+        temperature: row.get(4)?,
+        thinking_enabled: row.get::<_, i64>(5)? != 0,
+        thinking_level: row.get(6)?,
+        tool_protocol: crate::models::ToolProtocol::parse(&row.get::<_, String>(7)?),
+        has_api_key: false,
+    })
+}
+
+fn map_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<Agent> {
+    let system_prompt: String = row.get(4)?;
+    let enabled_tool_keys = parse_agent_keys(&row.get::<_, String>(11)?, true);
+    let allowed_skill_keys = parse_agent_keys(&row.get::<_, String>(12)?, false);
+    Ok(Agent {
+        id: row.get(0)?,
+        stage: row.get(1)?,
+        name: row.get(2)?,
+        role: row.get(3)?,
+        editable_role: row.get(3)?,
+        system_prompt: system_prompt.clone(),
+        editable_system_prompt: system_prompt,
+        temperature: row.get(5)?,
+        provider_base_url: row.get(6)?,
+        model: row.get(7)?,
+        thinking_enabled: row.get::<_, i64>(8)? != 0,
+        thinking_level: row.get(9)?,
+        uses_global_runtime_settings: row.get::<_, i64>(10)? != 0,
+        enabled_tool_keys,
+        allowed_skill_keys,
+    })
+}
+
+fn parse_agent_keys(raw: &str, tools: bool) -> Vec<String> {
+    let parsed = serde_json::from_str::<Vec<String>>(raw).unwrap_or_default();
+    if tools {
+        agent_tools::normalize_keys(&parsed)
+    } else {
+        normalize_skill_keys(&parsed)
+    }
+}
+
+fn normalize_skill_keys(keys: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    keys.iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .filter(|key| seen.insert((*key).to_string()))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
@@ -3386,6 +4420,7 @@ fn dedupe_approvals(conn: &Connection) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ToolProtocol;
 
     #[test]
     fn initializes_database_and_defaults() {
@@ -3395,11 +4430,89 @@ mod tests {
         let settings = state.get_ai_settings().unwrap();
         let skills = state.list_writing_skills().unwrap();
 
-        assert_eq!(agents.len(), 4);
+        assert!(agents.len() >= 14);
         assert!(agents.iter().any(|agent| agent.stage == "story_architect"));
+        assert!(agents
+            .iter()
+            .any(|agent| agent.stage == "context_search_plan"));
+        assert_eq!(
+            agents
+                .iter()
+                .find(|agent| agent.stage == "context_search_rerank")
+                .unwrap()
+                .model,
+            "deepseek-v4-flash"
+        );
         assert!(!agents.iter().any(|agent| agent.stage == "setting"));
         assert_eq!(settings.base_url, "https://api.deepseek.com");
         assert_eq!(settings.model, "deepseek-v4-pro");
+        let draft_agent = agents.iter().find(|agent| agent.stage == "draft").unwrap();
+        assert_eq!(draft_agent.provider_base_url, settings.base_url);
+        assert_eq!(draft_agent.model, settings.model);
+        assert!(!draft_agent.thinking_enabled);
+        state
+            .save_ai_settings(SaveAiSettings {
+                base_url: settings.base_url.clone(),
+                model: settings.model.clone(),
+                temperature: settings.temperature,
+                thinking_enabled: true,
+                thinking_level: "medium".to_string(),
+                api_key: None,
+            })
+            .unwrap();
+        assert!(
+            state
+                .list_agents()
+                .unwrap()
+                .into_iter()
+                .find(|agent| agent.stage == "draft")
+                .unwrap()
+                .thinking_enabled
+        );
+        let saved_agent = state
+            .save_agent_settings(SaveAgentSettings {
+                agent_id: draft_agent.id,
+                provider_base_url: "https://example.test/v1".to_string(),
+                model: "example-model".to_string(),
+                name: Some("自定义写作".to_string()),
+                role: Some("只写章节正文".to_string()),
+                system_prompt: Some("只输出正文，不输出解释。".to_string()),
+                temperature: Some(0.9),
+                thinking_enabled: true,
+                thinking_level: Some("high".to_string()),
+                uses_global_runtime_settings: Some(false),
+                enabled_tool_keys: Some(vec![
+                    agent_tools::CHAPTER_SPLIT.to_string(),
+                    "unknown_tool".to_string(),
+                ]),
+                allowed_skill_keys: Some(vec![
+                    "continuity_and_agency".to_string(),
+                    "unknown_skill".to_string(),
+                ]),
+            })
+            .unwrap();
+        assert_eq!(saved_agent.provider_base_url, "https://example.test/v1");
+        assert_eq!(saved_agent.model, "example-model");
+        assert_eq!(saved_agent.name, "自定义写作");
+        assert_eq!(saved_agent.editable_role, "只写章节正文");
+        assert_eq!(
+            saved_agent.editable_system_prompt,
+            "只输出正文，不输出解释。"
+        );
+        assert_eq!(saved_agent.temperature, 0.9);
+        assert!(saved_agent.thinking_enabled);
+        assert_eq!(saved_agent.thinking_level, "high");
+        assert_eq!(
+            saved_agent.enabled_tool_keys,
+            vec![agent_tools::CHAPTER_SPLIT.to_string()]
+        );
+        assert_eq!(
+            saved_agent.allowed_skill_keys,
+            vec![
+                "continuity_and_agency".to_string(),
+                "unknown_skill".to_string()
+            ]
+        );
         assert!(skills
             .iter()
             .any(|skill| skill.skill_key == "xianxia_power_fantasy"));
@@ -3410,6 +4523,171 @@ mod tests {
             .iter()
             .any(|skill| skill.skill_key == "urban_supernatural"));
         assert!(skills.iter().any(|skill| skill.skill_key == "mystery"));
+    }
+
+    #[test]
+    fn preserves_an_explicitly_empty_agent_tool_allowlist_after_reopen() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let state = AppState::from_path(path.clone()).unwrap();
+        let agent = state
+            .list_agents()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.stage == "draft")
+            .unwrap();
+
+        let saved = state
+            .save_agent_settings(SaveAgentSettings {
+                agent_id: agent.id,
+                provider_base_url: String::new(),
+                model: String::new(),
+                name: None,
+                role: None,
+                system_prompt: None,
+                temperature: None,
+                thinking_enabled: false,
+                thinking_level: Some("off".to_string()),
+                uses_global_runtime_settings: Some(true),
+                enabled_tool_keys: Some(Vec::new()),
+                allowed_skill_keys: Some(Vec::new()),
+            })
+            .unwrap();
+        assert!(saved.enabled_tool_keys.is_empty());
+
+        drop(state);
+        let reopened = AppState::from_path(path).unwrap();
+        let reloaded = reopened
+            .list_agents()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.stage == "draft")
+            .unwrap();
+        assert!(reloaded.enabled_tool_keys.is_empty());
+    }
+
+    #[test]
+    fn persists_ai_provider_catalog_in_database() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+
+        let defaults = state.list_ai_providers().unwrap();
+        assert!(defaults.iter().any(|provider| {
+            provider.base_url == "http://45.145.229.236:38001/v1" && provider.model == "kimi-k3"
+        }));
+
+        let saved = state
+            .save_ai_provider(SaveAiProvider {
+                id: None,
+                label: "测试供应商".to_string(),
+                base_url: "https://provider.example/v1".to_string(),
+                model: "test-model".to_string(),
+                temperature: 0.4,
+                thinking_enabled: true,
+                thinking_level: "medium".to_string(),
+                tool_protocol: ToolProtocol::Auto,
+            })
+            .unwrap();
+        assert_eq!(saved.label, "测试供应商");
+
+        let updated = state
+            .save_ai_provider(SaveAiProvider {
+                id: Some(saved.id),
+                label: "更新后的供应商".to_string(),
+                base_url: saved.base_url.clone(),
+                model: "updated-model".to_string(),
+                temperature: 0.6,
+                thinking_enabled: false,
+                thinking_level: "off".to_string(),
+                tool_protocol: ToolProtocol::Auto,
+            })
+            .unwrap();
+        assert_eq!(updated.label, "更新后的供应商");
+        assert_eq!(updated.model, "updated-model");
+
+        state.delete_ai_provider(updated.id).unwrap();
+        assert!(!state
+            .list_ai_providers()
+            .unwrap()
+            .iter()
+            .any(|provider| provider.id == updated.id));
+    }
+
+    #[test]
+    fn persists_api_key_in_provider_database() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let base_url = "https://provider.example/v1";
+
+        let settings = state
+            .save_ai_settings(SaveAiSettings {
+                base_url: base_url.to_string(),
+                model: "test-model".to_string(),
+                temperature: 0.5,
+                thinking_enabled: false,
+                thinking_level: "off".to_string(),
+                api_key: Some("database-key".to_string()),
+            })
+            .unwrap();
+
+        assert!(settings.has_api_key);
+        assert_eq!(
+            state.get_api_key_for_base_url(base_url).unwrap().as_deref(),
+            Some("database-key")
+        );
+        let stored_key = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT api_key FROM ai_providers WHERE base_url = ?1",
+                    params![base_url],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(AppError::from)
+            })
+            .unwrap();
+        assert_eq!(stored_key, "database-key");
+    }
+
+    #[test]
+    fn deleting_active_ai_provider_switches_global_settings_to_fallback() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let active = state
+            .save_ai_provider(SaveAiProvider {
+                id: None,
+                label: "当前测试供应商".to_string(),
+                base_url: "https://active-provider.example/v1".to_string(),
+                model: "active-model".to_string(),
+                temperature: 0.4,
+                thinking_enabled: true,
+                thinking_level: "medium".to_string(),
+                tool_protocol: ToolProtocol::Auto,
+            })
+            .unwrap();
+        state
+            .save_ai_settings(SaveAiSettings {
+                base_url: active.base_url.clone(),
+                model: active.model.clone(),
+                temperature: active.temperature,
+                thinking_enabled: active.thinking_enabled,
+                thinking_level: "medium".to_string(),
+                api_key: None,
+            })
+            .unwrap();
+
+        state.delete_ai_provider(active.id).unwrap();
+
+        let fallback = state
+            .list_ai_providers()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let settings = state.get_ai_settings().unwrap();
+        assert_eq!(settings.base_url, fallback.base_url);
+        assert_eq!(settings.model, fallback.model);
+        assert_eq!(settings.temperature, fallback.temperature);
+        assert_eq!(settings.thinking_enabled, fallback.thinking_enabled);
     }
 
     #[test]
@@ -3485,6 +4763,7 @@ mod tests {
             .unwrap();
         state
             .save_writing_skill(SaveWritingSkill {
+                id: None,
                 skill_key: "urban_mystery".to_string(),
                 name: "都市异能/悬疑".to_string(),
                 category: "genre".to_string(),
@@ -3529,6 +4808,7 @@ mod tests {
         let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
         let saved = state
             .save_writing_skill(SaveWritingSkill {
+                id: None,
                 skill_key: "xianxia_power_fantasy".to_string(),
                 name: "男频修仙爽文".to_string(),
                 category: "genre".to_string(),
@@ -3547,6 +4827,87 @@ mod tests {
     }
 
     #[test]
+    fn chapter_update_cannot_cross_project_boundary() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let first = state
+            .create_project(NewProject {
+                title: "第一本书".to_string(),
+                genre: "悬疑".to_string(),
+                target_words: 100000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let second = state
+            .create_project(NewProject {
+                title: "第二本书".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let chapter = state.list_chapters(first.id).unwrap().remove(0);
+
+        let error = state
+            .update_chapter(ChapterUpdate {
+                project_id: second.id,
+                id: chapter.id,
+                title: "越权改名".to_string(),
+                status: chapter.status.clone(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Validation(message) if message == "章节不存在"));
+        assert_eq!(
+            state
+                .ensure_chapter(first.id, Some(chapter.id))
+                .unwrap()
+                .unwrap()
+                .title,
+            chapter.title
+        );
+    }
+
+    #[test]
+    fn writing_skill_key_cannot_be_changed_when_editing() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let saved = state
+            .save_writing_skill(SaveWritingSkill {
+                id: None,
+                skill_key: "stable_skill_key".to_string(),
+                name: "稳定标识测试".to_string(),
+                category: "craft".to_string(),
+                description: "测试技能标识不可变".to_string(),
+                content: "## 规则\n- 保留标识".to_string(),
+                enabled: true,
+            })
+            .unwrap();
+
+        let error = state
+            .save_writing_skill(SaveWritingSkill {
+                id: Some(saved.id),
+                skill_key: "renamed_skill_key".to_string(),
+                name: saved.name.clone(),
+                category: saved.category.clone(),
+                description: saved.description.clone(),
+                content: saved.content.clone(),
+                enabled: saved.enabled,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Validation(message) if message == "技能标识不能修改"));
+        assert!(state
+            .get_writing_skill_by_key("stable_skill_key")
+            .unwrap()
+            .is_some());
+        assert!(state
+            .get_writing_skill_by_key("renamed_skill_key")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn saves_dynamic_knowledge_and_foreshadowing_with_chapter_targets() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
@@ -3559,6 +4920,19 @@ mod tests {
             })
             .unwrap();
         let chapter = state.list_chapters(project.id).unwrap().remove(0);
+        let foundation = state
+            .insert_artifact(
+                project.id,
+                None,
+                "setting",
+                "基础设定",
+                "这是资料账本回归测试使用的基础设定。",
+                None,
+            )
+            .unwrap();
+        state
+            .upsert_story_bible_from_artifact(project.id, &foundation, "confirmed")
+            .unwrap();
         let card = state
             .save_knowledge_card(SaveKnowledgeCard {
                 id: None,
@@ -3586,6 +4960,14 @@ mod tests {
             .unwrap();
         let detail = state.get_detail(project.id).unwrap();
 
+        assert_ne!(
+            state.get_project(project.id).unwrap().updated_at,
+            project.updated_at
+        );
+        assert_eq!(
+            state.get_story_bible(project.id).unwrap().unwrap().status,
+            "needs_review"
+        );
         assert_eq!(detail.knowledge_cards.len(), 1);
         assert_eq!(detail.knowledge_cards[0].id, card.id);
         assert_eq!(detail.knowledge_cards[0].status, "approved");
@@ -3603,6 +4985,7 @@ mod tests {
         let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
         state
             .save_writing_skill(SaveWritingSkill {
+                id: None,
                 skill_key: "xianxia_power_fantasy".to_string(),
                 name: "男频修仙爽文".to_string(),
                 category: "genre".to_string(),
@@ -3638,6 +5021,7 @@ mod tests {
         let state = AppState::from_path(path.clone()).unwrap();
         state
             .save_writing_skill(SaveWritingSkill {
+                id: None,
                 skill_key: "general_serialized".to_string(),
                 name: "通用连载写作".to_string(),
                 category: "genre".to_string(),
@@ -3667,6 +5051,7 @@ mod tests {
         let state = AppState::from_path(path.clone()).unwrap();
         state
             .save_writing_skill(SaveWritingSkill {
+                id: None,
                 skill_key: "xianxia_power_fantasy".to_string(),
                 name: "男频修仙爽文".to_string(),
                 category: "genre".to_string(),
@@ -3691,7 +5076,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_default_agent_clauses_without_replacing_custom_prompt() {
+    fn startup_does_not_rewrite_custom_agent_prompt_fragments() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
         let state = AppState::from_path(path.clone()).unwrap();
@@ -3714,11 +5099,10 @@ mod tests {
             .find(|agent| agent.stage == "draft")
             .unwrap();
 
-        assert!(draft.system_prompt.contains("用户保留段落"));
-        assert!(draft.system_prompt.contains("关系新平衡或情绪余韵"));
-        assert!(!draft
-            .system_prompt
-            .contains("结尾应落在具体新信息、变化、威胁或选择上"));
+        assert_eq!(
+            draft.system_prompt,
+            "用户保留段落。开篇不要空转，应尽早给出异常、威胁、任务、瓶颈或正在发生的行动；结尾应落在具体新信息、变化、威胁或选择上，不能只写主角准备去做什么。"
+        );
     }
 
     #[test]
@@ -4268,6 +5652,7 @@ mod tests {
 
         let updated = state
             .update_chapter(ChapterUpdate {
+                project_id: project.id,
                 id: chapter.id,
                 title: "改名后的章节".to_string(),
                 status: "approved".to_string(),
@@ -4638,7 +6023,7 @@ mod tests {
                 ))
             })
             .unwrap();
-        assert_eq!((documents, sources, vectors, version), (1, 1, 1, 2));
+        assert_eq!((documents, sources, vectors, version), (1, 1, 1, 4));
         assert_eq!(document_fks, 2);
         assert_eq!(source_fks, 3);
         let migrated_source_status: String = migrated

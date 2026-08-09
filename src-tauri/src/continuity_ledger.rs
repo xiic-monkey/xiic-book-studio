@@ -118,25 +118,32 @@ pub async fn check_artifact_continuity(
 }
 
 pub async fn ensure_ledger_current(state: &AppState, project_id: i64) -> AppResult<()> {
-    let settings = deterministic_settings(state.get_ai_settings()?);
-    let api_key = state
-        .get_api_key_for_base_url(&settings.base_url)?
-        .ok_or_else(|| AppError::Validation("请先为当前供应商保存 AI API Key".to_string()))?;
+    let mut pending = Vec::new();
     for chapter in state.list_chapters(project_id)? {
         let Some(source) = state.latest_approved_chapter_body(project_id, chapter.id)? else {
             continue;
         };
         let source_hash = chapter_memory::source_text_hash(&source.content);
-        if state.continuity_ledger_source_is_current(
+        if !state.continuity_ledger_source_is_current(
             project_id,
             chapter.id,
             source.id,
             &source_hash,
             NORMALIZATION_VERSION,
         )? {
-            continue;
+            pending.push((chapter, source, source_hash));
         }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
 
+    let agent = state.get_agent("continuity_ledger")?;
+    let settings = deterministic_settings(agent.ai_settings());
+    let api_key = state
+        .get_api_key_for_base_url(&settings.base_url)?
+        .ok_or_else(|| AppError::Validation("请先为当前供应商保存 AI API Key".to_string()))?;
+    for (chapter, source, source_hash) in pending {
         let prompt = extraction_prompt(&chapter.title, &source.content);
         let started = Instant::now();
         let run = state.insert_workflow_run(
@@ -149,14 +156,8 @@ pub async fn ensure_ledger_current(state: &AppState, project_id: i64) -> AppResu
             None,
             0,
         )?;
-        let raw = match ai::complete_chat(
-            &settings,
-            &api_key,
-            "你是小说连续性状态记录员。只从已通过正文中提取可直接引用的状态变化，绝不补写或推断。",
-            &prompt,
-            0.0,
-        )
-        .await
+        let raw = match ai::complete_chat(&settings, &api_key, &agent.system_prompt, &prompt, 0.0)
+            .await
         {
             Ok(output) => output,
             Err(error) => {
@@ -283,7 +284,8 @@ async fn extract_candidate_claims(
     artifact: &Artifact,
     active_states: &HashMap<(String, String), ContinuityLedgerEntry>,
 ) -> AppResult<String> {
-    let settings = deterministic_settings(state.get_ai_settings()?);
+    let agent = state.get_agent("continuity_check")?;
+    let settings = deterministic_settings(agent.ai_settings());
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| AppError::Validation("请先为当前供应商保存 AI API Key".to_string()))?;
@@ -320,14 +322,7 @@ async fn extract_candidate_claims(
 {}"#,
         artifact.content
     );
-    ai::complete_chat(
-        &settings,
-        &api_key,
-        "你是严格的小说状态核对器。只识别直接的、可由原文引证的状态引用，不推断。",
-        &prompt,
-        0.0,
-    )
-    .await
+    ai::complete_chat(&settings, &api_key, &agent.system_prompt, &prompt, 0.0).await
 }
 
 fn parse_source_entries(

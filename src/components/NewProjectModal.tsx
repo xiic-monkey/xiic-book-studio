@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { X, Save, Loader2 } from "lucide-react";
 import type { NewProject } from "../types";
+import { Select } from "./Select";
 
 const NEW_PROJECT_FORM_ID = "new-project-form";
 
@@ -61,21 +62,14 @@ export function NewProjectModal({ isOpen, onClose, onSubmit, formData, onFormCha
           </div>
           <div className="form-field">
             <label htmlFor="genre">题材</label>
-            <select
+            <Select
               id="genre"
               value={formData.genre}
-              onChange={(e) => onFormChange({ ...formData, genre: e.target.value })}
-            >
-              <option value="都市异能">都市异能</option>
-              <option value="玄幻">玄幻</option>
-              <option value="仙侠">仙侠</option>
-              <option value="都市">都市</option>
-              <option value="科幻">科幻</option>
-              <option value="悬疑">悬疑</option>
-              <option value="历史">历史</option>
-              <option value="游戏">游戏</option>
-              <option value="其他">其他</option>
-            </select>
+              onChange={(genre) => onFormChange({ ...formData, genre })}
+              options={[
+                "都市异能", "玄幻", "仙侠", "都市", "科幻", "悬疑", "历史", "游戏", "其他",
+              ].map((value) => ({ value, label: value }))}
+            />
           </div>
           <div className="form-field">
             <label htmlFor="target_words">预计总字数</label>
@@ -83,7 +77,7 @@ export function NewProjectModal({ isOpen, onClose, onSubmit, formData, onFormCha
               id="target_words"
               type="number"
               min="10000"
-              step="10000"
+              step="1000"
               value={formData.target_words}
               onChange={(e) => onFormChange({ ...formData, target_words: Number(e.target.value) })}
             />

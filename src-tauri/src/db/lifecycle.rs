@@ -6,16 +6,92 @@ use super::AppState;
 
 pub(super) fn initialize(state: &AppState) -> AppResult<()> {
     state.migrate()?;
+    crate::v2_storage::migrate(state)?;
     migrate_derived_schema(state)?;
     crate::index_jobs::recover_running_jobs(state)?;
+    crate::index_jobs::enqueue_missing_search_jobs(state)?;
     recover_stale_workflow_runs(state)?;
     workflow::rebuild_story_threads(state)
 }
 
-const DERIVED_SCHEMA_VERSION: i64 = 2;
+pub(super) fn migrate_legacy_api_keys(state: &AppState) -> AppResult<()> {
+    let providers = state.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, base_url, api_key
+             FROM ai_providers ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })?;
+
+    for (provider_id, base_url, stored_key) in providers {
+        let Some(api_key) = crate::secrets::get_api_key_for_scope(&base_url)? else {
+            continue;
+        };
+        if stored_key.trim().is_empty() {
+            state.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE ai_providers SET api_key = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    params![api_key, provider_id],
+                )?;
+                Ok(())
+            })?;
+        }
+        crate::secrets::clear_api_key_for_scope(&base_url)?;
+    }
+
+    let active_base_url = state.with_conn(|conn| {
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'ai.base_url'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    })?;
+    if let Some(base_url) = active_base_url {
+        let has_database_key = state.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ai_providers WHERE base_url = ?1 AND trim(api_key) <> ''
+                 )",
+                [&base_url],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })?;
+        if let Some(api_key) = crate::secrets::get_api_key()? {
+            if !has_database_key {
+                state.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE ai_providers SET api_key = ?1, updated_at = datetime('now')
+                         WHERE base_url = ?2",
+                        params![api_key, base_url],
+                    )?;
+                    Ok(())
+                })?;
+            }
+            crate::secrets::clear_api_key()?;
+        }
+    }
+    Ok(())
+}
+
+const DERIVED_SCHEMA_VERSION: i64 = 4;
 
 fn migrate_derived_schema(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
+        ensure_agent_runtime_columns(conn)?;
+        ensure_ai_provider_api_key_column(conn)?;
+        ensure_ai_provider_runtime_columns(conn)?;
+        ensure_agent_default_models(conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version >= DERIVED_SCHEMA_VERSION {
             return Ok(());
@@ -54,6 +130,135 @@ fn migrate_derived_schema(state: &AppState) -> AppResult<()> {
     })
 }
 
+fn ensure_ai_provider_api_key_column(conn: &Connection) -> AppResult<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('ai_providers') WHERE name = 'api_key'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(
+            "ALTER TABLE ai_providers ADD COLUMN api_key TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_ai_provider_runtime_columns(conn: &Connection) -> AppResult<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('ai_providers') WHERE name = 'thinking_level'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(
+            "ALTER TABLE ai_providers ADD COLUMN thinking_level TEXT NOT NULL DEFAULT 'off';",
+        )?;
+        conn.execute(
+            "UPDATE ai_providers
+             SET thinking_level = CASE WHEN thinking_enabled = 1 THEN 'medium' ELSE 'off' END
+             WHERE trim(thinking_level) = '' OR thinking_level = 'off'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_agent_default_models(conn: &Connection) -> AppResult<()> {
+    conn.execute(
+        "UPDATE agents
+         SET model = 'deepseek-v4-flash'
+         WHERE stage = 'context_search_rerank' AND trim(model) = ''",
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_agent_runtime_columns(conn: &Connection) -> AppResult<()> {
+    let mut added_thinking_level = false;
+    let mut added_tool_keys = false;
+    let mut added_skill_keys = false;
+    for (column, definition) in [
+        ("provider_base_url", "TEXT NOT NULL DEFAULT ''"),
+        ("model", "TEXT NOT NULL DEFAULT ''"),
+        ("thinking_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("thinking_level", "TEXT NOT NULL DEFAULT 'off'"),
+        (
+            "enabled_tool_keys",
+            r#"TEXT NOT NULL DEFAULT '["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]'"#,
+        ),
+        (
+            "allowed_skill_keys",
+            r#"TEXT NOT NULL DEFAULT '["continuity_and_agency"]'"#,
+        ),
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('agents') WHERE name = ?1
+             )",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE agents ADD COLUMN {column} {definition};"
+            ))?;
+            added_thinking_level |= column == "thinking_level";
+            added_tool_keys |= column == "enabled_tool_keys";
+            added_skill_keys |= column == "allowed_skill_keys";
+        }
+    }
+
+    if added_thinking_level {
+        conn.execute(
+            "UPDATE agents
+             SET thinking_level = CASE WHEN thinking_enabled = 1 THEN 'medium' ELSE 'off' END
+             WHERE trim(thinking_level) = '' OR thinking_level = 'off'",
+            [],
+        )?;
+    }
+    if added_tool_keys {
+        conn.execute(
+            r#"UPDATE agents
+             SET enabled_tool_keys = '["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]'
+             WHERE trim(enabled_tool_keys) = '' OR enabled_tool_keys = '[]'"#,
+            [],
+        )?;
+    }
+    ensure_web_search_tool_enabled(conn)?;
+    if added_skill_keys {
+        conn.execute(
+            r#"UPDATE agents
+             SET allowed_skill_keys = '["continuity_and_agency"]'
+             WHERE trim(allowed_skill_keys) = '' OR allowed_skill_keys = '[]'"#,
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_web_search_tool_enabled(conn: &Connection) -> AppResult<()> {
+    // Add the newly introduced web-search capability only to rows that still
+    // hold the exact old default. A custom allowlist, especially an empty one,
+    // is an explicit user decision and must survive every startup unchanged.
+    let old_default = serde_json::to_string(
+        &crate::agent_tools::default_keys()
+            .into_iter()
+            .filter(|key| key != crate::agent_tools::WEB_SEARCH)
+            .collect::<Vec<_>>(),
+    )?;
+    let new_default = serde_json::to_string(&crate::agent_tools::default_keys())?;
+    conn.execute(
+        "UPDATE agents SET enabled_tool_keys = ?1 WHERE enabled_tool_keys = ?2",
+        params![new_default, old_default],
+    )?;
+    Ok(())
+}
+
 fn migrate_search_documents(conn: &Connection) -> AppResult<()> {
     if table_exists(conn, "story_search_embeddings")? {
         conn.execute(
@@ -67,6 +272,7 @@ fn migrate_search_documents(conn: &Connection) -> AppResult<()> {
         "DROP TRIGGER IF EXISTS story_search_documents_ai;
          DROP TRIGGER IF EXISTS story_search_documents_ad;
          DROP TRIGGER IF EXISTS story_search_documents_au;
+         DROP TABLE IF EXISTS story_search_document_terms;
          DROP TABLE IF EXISTS story_search_documents_fts;
          DROP INDEX IF EXISTS idx_story_search_documents_source;
          DROP INDEX IF EXISTS idx_story_search_documents_chapter;
@@ -120,6 +326,15 @@ fn migrate_search_documents(conn: &Connection) -> AppResult<()> {
              ON story_search_documents(project_id, source_kind, source_id, chunk_no);
          CREATE INDEX IF NOT EXISTS idx_story_search_documents_chapter
              ON story_search_documents(project_id, chapter_no_sort, source_kind);
+         CREATE TABLE story_search_document_terms (
+             project_id INTEGER NOT NULL,
+             document_id INTEGER NOT NULL,
+             term TEXT NOT NULL,
+             PRIMARY KEY(project_id, term, document_id),
+             FOREIGN KEY(document_id) REFERENCES story_search_documents(id) ON DELETE CASCADE
+         );
+         CREATE INDEX idx_story_search_document_terms_document
+             ON story_search_document_terms(document_id);
          CREATE VIRTUAL TABLE story_search_documents_fts
              USING fts5(search_text, content='story_search_documents', content_rowid='id', tokenize='trigram');
          CREATE TRIGGER story_search_documents_ai AFTER INSERT ON story_search_documents BEGIN

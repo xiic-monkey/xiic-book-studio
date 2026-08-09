@@ -1,4 +1,45 @@
+import type { ToolProtocol } from "./generated/v2-contracts";
+
+export type {
+  ActionProposal,
+  ActiveAgentRun,
+  AgentRunSummary,
+  AgentToolDefinition,
+  ArtifactSummary,
+  ContextSegment,
+  LegacyAgentPrompt,
+  PreparedContext,
+  ProposalApplyResult,
+  ProposalStatus,
+  ProviderCapabilities,
+  ProjectWorkspace,
+  RunEvent,
+  ToolInvocation,
+  ToolKind,
+  ToolProtocol,
+  WorkflowRunSummary,
+} from "./generated/v2-contracts";
+
 export type Stage = "setting" | "outline" | "characters" | "draft" | "review" | "revision";
+
+export type ReferenceTag = "style" | "structure";
+
+export interface ReferenceSelection {
+  enabled: boolean;
+  source_ids?: number[] | null;
+  tags?: ReferenceTag[] | null;
+}
+
+export interface ReferenceMaterial {
+  id: number;
+  project_id: number;
+  file_name: string;
+  char_count: number;
+  tags: ReferenceTag[];
+  enabled: boolean;
+  chunk_count: number;
+  imported_at: string;
+}
 
 export interface Project {
   id: number;
@@ -37,9 +78,20 @@ export interface Agent {
   stage: string;
   name: string;
   role: string;
+  editable_role: string;
   system_prompt: string;
+  editable_system_prompt: string;
   temperature: number;
+  provider_base_url: string;
+  model: string;
+  thinking_enabled: boolean;
+  thinking_level: ThinkingLevel;
+  uses_global_runtime_settings: boolean;
+  enabled_tool_keys: string[];
+  allowed_skill_keys: string[];
 }
+
+export type ThinkingLevel = "off" | "low" | "medium" | "high";
 
 export interface GenreAgentProfile {
   agent_key: string;
@@ -121,6 +173,7 @@ export interface Chapter {
 }
 
 export interface ChapterUpdate {
+  project_id: number;
   id: number;
   title: string;
   status: string;
@@ -432,6 +485,7 @@ export interface WritingSkill {
 }
 
 export interface SaveWritingSkill {
+  id?: number | null;
   skill_key: string;
   name: string;
   category: string;
@@ -445,7 +499,31 @@ export interface AiSettings {
   model: string;
   temperature: number;
   thinking_enabled: boolean;
+  thinking_level: ThinkingLevel;
   has_api_key: boolean;
+}
+
+export interface AiProvider {
+  id: number;
+  label: string;
+  base_url: string;
+  model: string;
+  temperature: number;
+  thinking_enabled: boolean;
+  thinking_level: ThinkingLevel;
+  tool_protocol: ToolProtocol;
+  has_api_key: boolean;
+}
+
+export interface SaveAiProvider {
+  id?: number | null;
+  label: string;
+  base_url: string;
+  model: string;
+  temperature: number;
+  thinking_enabled: boolean;
+  thinking_level: ThinkingLevel;
+  tool_protocol: ToolProtocol;
 }
 
 export interface ModelInfo {
@@ -476,6 +554,7 @@ export interface ProjectDetail {
   story_bible?: StoryBible | null;
   story_arcs: StoryArc[];
   story_bible_review?: StoryBibleReview | null;
+  canonical_fingerprint: string;
   settings: AiSettings;
 }
 
@@ -631,4 +710,17 @@ export interface StoryContextSnippet {
   matched_term: string;
   content: string;
   score: number;
+}
+
+export interface StoryContextRerankedSnippet extends StoryContextSnippet {
+  candidate_id: number;
+  category: "core" | "supporting" | "conflict" | string;
+  reason: string;
+}
+
+export interface StoryContextRerankResult {
+  candidates: StoryContextSnippet[];
+  selected: StoryContextRerankedSnippet[];
+  status: "success" | "fallback" | "empty" | string;
+  error?: string | null;
 }

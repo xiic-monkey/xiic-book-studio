@@ -1,7 +1,7 @@
 import { Box, CalendarDays, RefreshCcw, Users } from "lucide-react";
 import type {
   Chapter,
-  ProjectDetail,
+  ProjectWorkspace,
   StoryEntity,
   StoryEvent,
   StoryEventParticipant,
@@ -23,7 +23,7 @@ export type EntityTimelineEntry =
 
 type ContinuityLibraryPanelProps = {
   focus: "characters" | "items" | "events";
-  detail: ProjectDetail | null;
+  detail: ProjectWorkspace | null;
   busy: boolean;
   status: StoryIndexStatus;
   participantsByEvent: Map<number, StoryEventParticipant[]>;

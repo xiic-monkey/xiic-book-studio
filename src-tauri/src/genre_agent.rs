@@ -80,12 +80,27 @@ pub fn profile_for_key(agent_key: &str) -> Option<GenreAgentProfile> {
 }
 
 pub fn compose_stage_agent(mut stage_agent: Agent, profile: &GenreAgentProfile) -> Agent {
+    let effective_skill_keys = stage_agent
+        .allowed_skill_keys
+        .iter()
+        .filter(|key| {
+            profile
+                .allowed_skill_keys
+                .iter()
+                .any(|allowed| allowed == *key)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     stage_agent.system_prompt = format!(
         "# 共享 Agent 协议\n{}\n\n# 题材专属 Agent 身份\n{}\n\n你当前绑定的主类型 Skill 是 `{}`。只允许使用白名单 Skill：{}。即使技能库中存在其他题材规则，也不能调用、混合或模仿它们。\n\n# 当前工作模式\n{}",
         BASE_AGENT_PROTOCOL,
         profile.system_prompt,
         profile.primary_skill_key,
-        profile.allowed_skill_keys.join("、"),
+        if effective_skill_keys.is_empty() {
+            "（无辅助 Skill）".to_string()
+        } else {
+            effective_skill_keys.join("、")
+        },
         stage_agent.system_prompt
     );
     stage_agent.role = format!("{}；当前工作模式：{}", profile.role, stage_agent.role);
@@ -131,8 +146,17 @@ mod tests {
                 stage: "draft".to_string(),
                 name: "写作 Agent".to_string(),
                 role: "写正文".to_string(),
+                editable_role: "写正文".to_string(),
                 system_prompt: "只输出正文。".to_string(),
+                editable_system_prompt: "只输出正文。".to_string(),
                 temperature: 0.7,
+                provider_base_url: "https://api.example.com".to_string(),
+                model: "example-model".to_string(),
+                thinking_enabled: false,
+                thinking_level: "off".to_string(),
+                uses_global_runtime_settings: false,
+                enabled_tool_keys: crate::agent_tools::default_keys(),
+                allowed_skill_keys: vec!["continuity_and_agency".to_string()],
             },
             &profile,
         );
@@ -146,5 +170,12 @@ mod tests {
             .contains("不强制固定场景数、固定中段反转"));
         assert!(agent.system_prompt.contains("# 题材专属 Agent 身份"));
         assert!(agent.system_prompt.contains("# 当前工作模式"));
+        assert!(agent
+            .system_prompt
+            .contains("男频修仙/玄幻升级流专属 Agent"));
+        assert!(agent.role.contains("专注升级、资源、能力边界与阶段收益"));
+        assert!(agent.role.contains("写正文"));
+        assert!(!agent.editable_role.contains("男频修仙/玄幻升级流"));
+        assert_eq!(agent.editable_role, "写正文");
     }
 }

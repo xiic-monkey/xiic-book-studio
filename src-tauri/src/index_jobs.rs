@@ -63,36 +63,151 @@ pub(crate) fn enqueue_chapter_index_jobs_tx(
     source_artifact_id: i64,
     timestamp: &str,
 ) -> AppResult<()> {
-    for (job_type, scope_key) in [
-        (STORY_CHAPTER_JOB, format!("chapter:{chapter_id}")),
-        (SEARCH_CHAPTER_JOB, format!("chapter:{chapter_id}")),
-    ] {
-        conn.execute(
-            "INSERT INTO derived_index_jobs
-                (project_id, chapter_id, source_artifact_id, job_type, scope_key, status,
-                 attempt_count, next_attempt_at, last_error, created_at, started_at, finished_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, NULL, ?6, NULL, NULL, ?6)
-             ON CONFLICT(project_id, job_type, scope_key) DO UPDATE SET
-                chapter_id = excluded.chapter_id,
-                source_artifact_id = excluded.source_artifact_id,
-                status = 'pending',
-                attempt_count = 0,
-                next_attempt_at = excluded.next_attempt_at,
-                last_error = NULL,
-                started_at = NULL,
-                finished_at = NULL,
-                updated_at = excluded.updated_at",
-            params![
+    enqueue_chapter_job_tx(
+        conn,
+        project_id,
+        chapter_id,
+        source_artifact_id,
+        STORY_CHAPTER_JOB,
+        timestamp,
+    )?;
+    enqueue_chapter_job_tx(
+        conn,
+        project_id,
+        chapter_id,
+        source_artifact_id,
+        SEARCH_CHAPTER_JOB,
+        timestamp,
+    )?;
+    Ok(())
+}
+
+fn enqueue_search_chapter_job_tx(
+    conn: &Connection,
+    project_id: i64,
+    chapter_id: i64,
+    source_artifact_id: i64,
+    timestamp: &str,
+) -> AppResult<()> {
+    enqueue_chapter_job_tx(
+        conn,
+        project_id,
+        chapter_id,
+        source_artifact_id,
+        SEARCH_CHAPTER_JOB,
+        timestamp,
+    )
+}
+
+fn enqueue_chapter_job_tx(
+    conn: &Connection,
+    project_id: i64,
+    chapter_id: i64,
+    source_artifact_id: i64,
+    job_type: &str,
+    timestamp: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO derived_index_jobs
+            (project_id, chapter_id, source_artifact_id, job_type, scope_key, status,
+             attempt_count, next_attempt_at, last_error, created_at, started_at, finished_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, NULL, ?6, NULL, NULL, ?6)
+         ON CONFLICT(project_id, job_type, scope_key) DO UPDATE SET
+            chapter_id = excluded.chapter_id,
+            source_artifact_id = excluded.source_artifact_id,
+            status = 'pending',
+            attempt_count = 0,
+            next_attempt_at = excluded.next_attempt_at,
+            last_error = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            updated_at = excluded.updated_at",
+        params![
+            project_id,
+            chapter_id,
+            source_artifact_id,
+            job_type,
+            format!("chapter:{chapter_id}"),
+            timestamp
+        ],
+    )?;
+    Ok(())
+}
+
+/// Queue only missing or stale search-index work for existing approved chapter
+/// bodies. This does not schedule AI fact extraction and never touches user text.
+pub(crate) fn enqueue_missing_search_jobs(state: &AppState) -> AppResult<usize> {
+    let timestamp = now();
+    state.with_conn(|conn| {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut stmt = conn.prepare(
+                "SELECT c.project_id, c.id, a.id, c.title, a.content,
+                        s.source_artifact_id, s.source_text_hash, s.status
+                 FROM chapters c
+                 INNER JOIN artifacts a ON a.id = c.current_artifact_id
+                 LEFT JOIN story_search_sources s
+                   ON s.project_id = c.project_id
+                  AND s.source_kind = 'chapter'
+                  AND s.source_id = c.id
+                 WHERE a.stage IN ('draft', 'revision')
+                   AND EXISTS (SELECT 1 FROM approvals ap WHERE ap.artifact_id = a.id)
+                 ORDER BY c.project_id, c.chapter_no",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })?;
+            let rows = rows.collect::<Result<Vec<_>, _>>()?;
+            let mut queued = 0;
+            for (
                 project_id,
                 chapter_id,
+                artifact_id,
+                title,
+                content,
                 source_artifact_id,
-                job_type,
-                scope_key,
-                timestamp
-            ],
-        )?;
-    }
-    Ok(())
+                source_hash,
+                status,
+            ) in rows
+            {
+                let current_hash = crate::story_search::chapter_source_hash(&title, &content);
+                if source_artifact_id == Some(artifact_id)
+                    && source_hash.as_deref() == Some(current_hash.as_str())
+                    && status.as_deref() == Some("success")
+                {
+                    continue;
+                }
+                enqueue_search_chapter_job_tx(
+                    conn,
+                    project_id,
+                    chapter_id,
+                    artifact_id,
+                    &timestamp,
+                )?;
+                queued += 1;
+            }
+            Ok(queued)
+        })();
+        match result {
+            Ok(queued) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(queued)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    })
 }
 
 pub(crate) fn enqueue_following_chapter_index_jobs_tx(
@@ -241,6 +356,14 @@ fn requeue_project_search_job_tx(
         }
         Some(_) => Ok(()),
     }
+}
+
+pub(crate) fn enqueue_project_search_job(state: &AppState, project_id: i64) -> AppResult<()> {
+    let result = state.with_conn(|conn| enqueue_project_search_job_tx(conn, project_id, &now()));
+    if result.is_ok() {
+        state.wake_index_worker();
+    }
+    result
 }
 
 pub(crate) fn retry_index_jobs(
@@ -808,5 +931,43 @@ mod tests {
         assert!(!is_retryable(&AppError::Validation(
             "资料索引条目过多".to_string()
         )));
+    }
+
+    #[test]
+    fn backfill_queues_only_missing_search_index_work() {
+        let (_temp, state, project_id) = state_with_project();
+        let chapter = state.list_chapters(project_id).unwrap().remove(0);
+        let artifact = state
+            .insert_artifact(
+                project_id,
+                Some(chapter.id),
+                "draft",
+                "第一章正文",
+                "黑牌被封入石匣。",
+                None,
+            )
+            .unwrap();
+        state
+            .approve_stage(project_id, "draft", artifact.id, "通过")
+            .unwrap();
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM derived_index_jobs WHERE project_id = ?1",
+                    [project_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(enqueue_missing_search_jobs(&state).unwrap(), 1);
+        let jobs = state.list_derived_index_jobs(project_id).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, SEARCH_CHAPTER_JOB);
+        assert_eq!(jobs[0].chapter_id, Some(chapter.id));
+        assert_eq!(jobs[0].source_artifact_id, Some(artifact.id));
+
+        assert_eq!(enqueue_missing_search_jobs(&state).unwrap(), 1);
+        assert_eq!(state.list_derived_index_jobs(project_id).unwrap().len(), 1);
     }
 }

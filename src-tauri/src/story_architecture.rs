@@ -6,9 +6,9 @@ use crate::{
     db::AppState,
     error::{AppError, AppResult},
     models::{
-        AgentStepResult, CanonIssue, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
-        RunAgentRequest, RunStoryArchitectRequest, StoryBible, StoryBibleReview,
-        StoryBibleReviewRequest,
+        AgentRunRequest, AgentStepResult, CanonIssue, ConfirmStoryBibleRequest,
+        ConfirmStoryBibleReviewRequest, RunAgentRequest, RunStoryArchitectRequest, StoryBible,
+        StoryBibleReview, StoryBibleReviewRequest,
     },
     workflow,
 };
@@ -17,6 +17,17 @@ pub async fn run_story_architect(
     state: &AppState,
     input: RunStoryArchitectRequest,
 ) -> AppResult<AgentStepResult> {
+    workflow::run_agent_step(
+        state,
+        RunAgentRequest::from(build_agent_run_request(state, input)?),
+    )
+    .await
+}
+
+pub(crate) fn build_agent_run_request(
+    state: &AppState,
+    input: RunStoryArchitectRequest,
+) -> AppResult<AgentRunRequest> {
     let stage = input.mode.artifact_stage();
     let arc_context = input
         .arc_id
@@ -46,17 +57,15 @@ pub async fn run_story_architect(
     {
         instruction.push_str(&format!("\n\n# 人工追加指令\n{}", hint.trim()));
     }
-    workflow::run_agent_step(
-        state,
-        RunAgentRequest {
-            project_id: input.project_id,
-            stage,
-            chapter_id: None,
-            user_instruction: Some(instruction),
-            source_artifact_id: input.source_artifact_id,
-        },
-    )
-    .await
+    Ok(AgentRunRequest {
+        project_id: input.project_id,
+        stage,
+        chapter_id: None,
+        user_instruction: Some(instruction),
+        source_artifact_id: input.source_artifact_id,
+        reference_selection: input.reference_selection,
+        prepared_context_id: None,
+    })
 }
 
 pub async fn create_targeted_rework(
@@ -115,11 +124,11 @@ pub async fn review_story_bible(
     }
     let snapshot = canonical_snapshot(state, input.project_id)?;
     let fingerprint = source_text_hash(&snapshot);
-    let settings = state.get_ai_settings()?;
+    let agent = state.get_agent_for_project_stage(input.project_id, "story_architect")?;
+    let settings = agent.ai_settings();
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| AppError::Validation("请先为当前供应商保存 API Key".to_string()))?;
-    let agent = state.get_agent_for_project_stage(input.project_id, "story_architect")?;
     let system_prompt = format!(
         "{}\n\n# 当前审校子模式\n你是故事架构 Agent 的一致性审校模式。你不写正文、不新创设定、不替作者做最终决定。只检查已批准 Canon 内部是否能共同成立，并输出可追溯、可定向返工的问题。",
         agent.system_prompt

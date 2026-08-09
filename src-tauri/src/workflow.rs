@@ -15,12 +15,12 @@ pub use history_search::search_story_context;
 pub use markdown_export::export_markdown;
 
 use crate::{
-    ai, chapter_memory, context_search, continuity_ledger,
+    agent_tools, ai, chapter_memory, context_search, continuity_ledger,
     db::AppState,
     error::{AppError, AppResult},
     genre_skill,
     models::{
-        AgentStepResult, AiSpanRevisionRequest, Artifact, ChapterSplitPlan,
+        Agent, AgentStepResult, AiSpanRevisionRequest, Artifact, ChapterSplitPlan,
         ChapterSplitPlanRequest, ContextPreview, ContextPreviewSegment, ContinuityIssue,
         ContinuityReport, ContinuityReviewRequest, Project, ReviewIssue, RevisionRequest,
         RunAgentRequest, SpanReplacementRequest, Stage, StoryContextSearchInput,
@@ -209,6 +209,27 @@ pub async fn run_agent_step(
     state.get_project(input.project_id)?;
     let chapter = state.ensure_chapter(input.project_id, input.chapter_id)?;
     validate_stage_scope(&input.stage, chapter.is_some())?;
+    let prepared_context = input
+        .prepared_context_id
+        .map(|id| state.get_prepared_context(id))
+        .transpose()?;
+    if let Some(prepared) = prepared_context.as_ref() {
+        if prepared.project_id != input.project_id
+            || prepared.chapter_id != input.chapter_id
+            || prepared.stage != input.stage.as_str()
+        {
+            return Err(AppError::Validation(
+                "准备上下文与当前项目、章节或阶段不匹配".to_string(),
+            ));
+        }
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&prepared.expires_at)
+            .map_err(|_| AppError::Validation("准备上下文过期时间损坏".to_string()))?;
+        if expires_at <= chrono::Utc::now() {
+            return Err(AppError::Validation(
+                "准备上下文已过期，请重新预览".to_string(),
+            ));
+        }
+    }
     let source_artifact = input
         .source_artifact_id
         .map(|artifact_id| state.get_artifact(artifact_id))
@@ -224,6 +245,10 @@ pub async fn run_agent_step(
             Stage::Review => {
                 source.chapter_id == input.chapter_id
                     && (source.stage == "draft" || source.stage == "revision")
+            }
+            Stage::Revision => {
+                source.chapter_id == input.chapter_id
+                    && matches!(source.stage.as_str(), "draft" | "revision" | "review")
             }
             _ => false,
         };
@@ -253,43 +278,69 @@ pub async fn run_agent_step(
     }
 
     let agent = state.get_agent_for_project_stage(input.project_id, input.stage.as_str())?;
-    let settings = state.get_ai_settings()?;
+    let has_history_context = agent.has_tool(agent_tools::HISTORY_CONTEXT);
+    let has_reference_materials = agent.has_tool(agent_tools::REFERENCE_MATERIALS);
+    let has_chapter_memory = agent.has_tool(agent_tools::CHAPTER_MEMORY);
+    let has_continuity_check = agent.has_tool(agent_tools::CONTINUITY_CHECK);
+    let has_web_search = agent.has_tool(agent_tools::WEB_SEARCH);
+    let settings = agent.ai_settings();
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| {
             AppError::Validation("请先在设置里为当前供应商保存 AI API Key".to_string())
         })?;
-    if chapter_memory::is_enabled()
+    if prepared_context.is_none()
+        && has_chapter_memory
+        && chapter_memory::is_enabled()
         && matches!(input.stage, Stage::Draft | Stage::Review | Stage::Revision)
     {
         if let Some(chapter_id) = input.chapter_id {
-            let previous_plan = direct_predecessor_chapter_no(state, input.project_id, chapter_id)?
-                .map(|chapter_no| {
-                    approved_outline_section_for_chapter(state, input.project_id, chapter_no)
-                })
-                .transpose()?
-                .flatten();
-            if let Err(error) = chapter_memory::ensure_predecessor_memory(
-                state,
-                input.project_id,
-                chapter_id,
-                &settings,
-                &api_key,
-                previous_plan.as_deref(),
-            )
-            .await
+            if let Some((predecessor_id, predecessor_no)) =
+                direct_predecessor_chapter(state, input.project_id, chapter_id)?
             {
-                eprintln!("chapter memory unavailable; falling back to existing context: {error}");
+                if state
+                    .latest_approved_chapter_body(input.project_id, predecessor_id)?
+                    .is_some()
+                {
+                    let memory_settings = state.get_ai_settings_for_agent("chapter_memory")?;
+                    let memory_api_key = state
+                        .get_api_key_for_base_url(&memory_settings.base_url)?
+                        .ok_or_else(|| {
+                            AppError::Validation("请先为章节记忆 Agent 配置 API Key".to_string())
+                        })?;
+                    let previous_plan = approved_outline_section_for_chapter(
+                        state,
+                        input.project_id,
+                        predecessor_no,
+                    )?;
+                    if let Err(error) = chapter_memory::ensure_predecessor_memory(
+                        state,
+                        input.project_id,
+                        chapter_id,
+                        &memory_settings,
+                        &memory_api_key,
+                        previous_plan.as_deref(),
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "chapter memory unavailable; falling back to existing context: {error}"
+                        );
+                    }
+                }
             }
         }
     }
-    if matches!(input.stage, Stage::Draft | Stage::Review | Stage::Revision) {
+    if prepared_context.is_none()
+        && has_continuity_check
+        && matches!(input.stage, Stage::Draft | Stage::Review | Stage::Revision)
+    {
         if let Err(error) = continuity_ledger::ensure_ledger_current(state, input.project_id).await
         {
             eprintln!("continuity ledger unavailable for context search: {error}");
         }
     }
-    let ledger_report = if matches!(input.stage, Stage::Review) {
+    let ledger_report = if has_continuity_check && matches!(input.stage, Stage::Review) {
         if let Some(artifact) = source_artifact.as_ref() {
             match continuity_ledger::check_artifact_continuity(
                 state,
@@ -320,7 +371,9 @@ pub async fn run_agent_step(
         input.user_instruction.as_deref(),
         source_artifact.as_ref(),
     )?;
-    let tool_context = if let Some(chapter_id) = input.chapter_id {
+    let tool_context = if prepared_context.is_some() || !has_history_context {
+        None
+    } else if let Some(chapter_id) = input.chapter_id {
         match context_search::prepare_tool_context(
             state,
             input.project_id,
@@ -343,15 +396,48 @@ pub async fn run_agent_step(
     } else {
         None
     };
-    let mut prompt = build_prompt(
-        state,
-        input.project_id,
-        &input.stage,
-        input.chapter_id,
-        input.user_instruction.as_deref(),
-        source_artifact.as_ref(),
-        tool_context.as_deref(),
-    )?;
+    let mut prompt = if let Some(prepared) = prepared_context.as_ref() {
+        prepared.prompt.clone()
+    } else {
+        build_prompt_for_agent(
+            state,
+            input.project_id,
+            &input.stage,
+            input.chapter_id,
+            input.user_instruction.as_deref(),
+            source_artifact.as_ref(),
+            tool_context.as_deref(),
+            &agent,
+        )?
+    };
+    if prepared_context.is_none() && has_reference_materials {
+        if let Some(reference_context) = crate::reference::render_context(
+            state,
+            input.project_id,
+            &input.stage,
+            input.reference_selection.as_ref(),
+            &reference_query(
+                state,
+                input.project_id,
+                &input.stage,
+                input.chapter_id,
+                input.user_instruction.as_deref(),
+                source_artifact.as_ref(),
+            )?,
+        )? {
+            prompt.push_str("\n\n");
+            prompt.push_str(&reference_context);
+        }
+    }
+    if prepared_context.is_none() && has_web_search {
+        if let Some(query) = crate::web_search::requested_query(input.user_instruction.as_deref()) {
+            let results = crate::web_search::search_summaries(state, &query).await?;
+            if let Some(web_context) = crate::web_search::render_context(&query, &results) {
+                prompt.push_str("\n\n");
+                prompt.push_str(&web_context);
+            }
+        }
+    }
     if let Some(report) = ledger_report.as_ref() {
         let guidance = continuity_ledger::render_report_for_prompt(report);
         if !guidance.is_empty() {
@@ -383,8 +469,18 @@ pub async fn run_agent_step(
         None,
         0,
     )?;
+    state.insert_run_event(
+        run.id,
+        input.project_id,
+        input.chapter_id,
+        "started",
+        "",
+        "streaming",
+        None,
+    )?;
     let mut latest_output = String::new();
     let mut last_persisted_chars = 0usize;
+    let mut last_event_chars = 0usize;
     let mut last_persisted_at = Instant::now();
     match ai::complete_chat_streaming(
         &settings,
@@ -393,6 +489,9 @@ pub async fn run_agent_step(
         &prompt,
         agent.temperature,
         |partial| {
+            if state.run_cancellation_requested(run.id)? {
+                return Err(AppError::Validation("Agent 运行已取消".to_string()));
+            }
             latest_output = partial.to_string();
             let chars = partial.chars().count();
             if partial.is_empty()
@@ -408,6 +507,24 @@ pub async fn run_agent_step(
                 )?;
                 last_persisted_chars = chars;
                 last_persisted_at = Instant::now();
+            }
+            let delta = if chars >= last_event_chars {
+                partial.chars().skip(last_event_chars).collect::<String>()
+            } else {
+                last_event_chars = 0;
+                partial.to_string()
+            };
+            if !delta.is_empty() {
+                state.insert_run_event(
+                    run.id,
+                    input.project_id,
+                    input.chapter_id,
+                    "output_delta",
+                    &delta,
+                    "streaming",
+                    None,
+                )?;
+                last_event_chars = chars;
             }
             Ok(())
         },
@@ -442,6 +559,21 @@ pub async fn run_agent_step(
                     parent_for_stage(state, input.project_id, &input.stage, input.chapter_id)?
                 },
             )?;
+            if has_reference_materials {
+                if let Some(warning) = crate::reference::overlap_warning(
+                    state,
+                    input.project_id,
+                    input.reference_selection.as_ref(),
+                    &normalized_output,
+                ) {
+                    state.insert_message(
+                        input.project_id,
+                        input.chapter_id,
+                        "reference_overlap_warning",
+                        &warning,
+                    )?;
+                }
+            }
             run = state.update_workflow_run(
                 run.id,
                 &normalized_output,
@@ -461,16 +593,36 @@ pub async fn run_agent_step(
                     artifact.title
                 ),
             )?;
+            state.insert_run_event(
+                run.id,
+                input.project_id,
+                input.chapter_id,
+                "completed",
+                "",
+                "success",
+                None,
+            )?;
             Ok(AgentStepResult { artifact, run })
         }
         Err(err) => {
             let message = err.to_string();
+            let cancelled = state.run_cancellation_requested(run.id)?;
+            let final_status = if cancelled { "cancelled" } else { "failed" };
             state.update_workflow_run(
                 run.id,
                 &latest_output,
-                "failed",
+                final_status,
                 Some(&message),
                 started.elapsed().as_millis() as i64,
+            )?;
+            state.insert_run_event(
+                run.id,
+                input.project_id,
+                input.chapter_id,
+                final_status,
+                "",
+                final_status,
+                Some(&message),
             )?;
             Err(AppError::Validation(message))
         }
@@ -518,7 +670,8 @@ pub fn preview_agent_context(
         source_artifact.as_ref(),
     )?;
 
-    let prompt = build_prompt(
+    let agent = state.get_agent_for_project_stage(input.project_id, input.stage.as_str())?;
+    let mut prompt = build_prompt_for_agent(
         state,
         input.project_id,
         &input.stage,
@@ -526,8 +679,27 @@ pub fn preview_agent_context(
         input.user_instruction.as_deref(),
         source_artifact.as_ref(),
         None,
+        &agent,
     )?;
-    let agent = state.get_agent_for_project_stage(input.project_id, input.stage.as_str())?;
+    if agent.has_tool(agent_tools::REFERENCE_MATERIALS) {
+        if let Some(reference_context) = crate::reference::render_context(
+            state,
+            input.project_id,
+            &input.stage,
+            input.reference_selection.as_ref(),
+            &reference_query(
+                state,
+                input.project_id,
+                &input.stage,
+                input.chapter_id,
+                input.user_instruction.as_deref(),
+                source_artifact.as_ref(),
+            )?,
+        )? {
+            prompt.push_str("\n\n");
+            prompt.push_str(&reference_context);
+        }
+    }
     let genre_agent = state.get_genre_agent_for_project(input.project_id)?;
     let segments = split_context_prompt(&prompt);
     let total_chars = prompt.chars().count();
@@ -618,7 +790,10 @@ pub async fn request_revision(
     )?;
 
     let agent = state.get_agent_for_project_stage(input.project_id, "revision")?;
-    let settings = state.get_ai_settings()?;
+    let has_history_context = agent.has_tool(agent_tools::HISTORY_CONTEXT);
+    let has_reference_materials = agent.has_tool(agent_tools::REFERENCE_MATERIALS);
+    let has_continuity_check = agent.has_tool(agent_tools::CONTINUITY_CHECK);
+    let settings = agent.ai_settings();
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| {
@@ -627,11 +802,16 @@ pub async fn request_revision(
     let revision_source =
         resolve_revision_source(state, input.project_id, source.chapter_id, Some(&source))?
             .ok_or_else(|| AppError::Validation("没有可修订的章节稿件".to_string()))?;
-    if let Err(error) = continuity_ledger::ensure_ledger_current(state, input.project_id).await {
-        eprintln!("continuity ledger unavailable for revision search: {error}");
+    if has_continuity_check {
+        if let Err(error) = continuity_ledger::ensure_ledger_current(state, input.project_id).await
+        {
+            eprintln!("continuity ledger unavailable for revision search: {error}");
+        }
     }
     let tool_source = revision_search_source(&revision_source, &source, input.feedback.as_str());
-    let tool_context = if let Some(chapter_id) = source.chapter_id {
+    let tool_context = if !has_history_context {
+        None
+    } else if let Some(chapter_id) = source.chapter_id {
         match context_search::prepare_tool_context(
             state,
             input.project_id,
@@ -652,7 +832,7 @@ pub async fn request_revision(
     } else {
         None
     };
-    let mut prompt = build_prompt(
+    let mut prompt = build_prompt_for_agent(
         state,
         input.project_id,
         &Stage::Revision,
@@ -660,56 +840,83 @@ pub async fn request_revision(
         Some(input.feedback.as_str()),
         Some(&source),
         tool_context.as_deref(),
+        &agent,
     )?;
-    match continuity_ledger::check_artifact_continuity(
-        state,
-        crate::models::LedgerContinuityCheckRequest {
-            project_id: input.project_id,
-            artifact_id: revision_source.id,
-        },
-    )
-    .await
-    {
-        Ok(report) => {
-            let guidance = continuity_ledger::render_report_for_prompt(&report);
-            if !guidance.is_empty() {
-                prompt.push_str("\n\n");
-                prompt.push_str(&guidance);
-            }
+    if has_reference_materials {
+        if let Some(reference_context) = crate::reference::render_context(
+            state,
+            input.project_id,
+            &Stage::Revision,
+            input.reference_selection.as_ref(),
+            &reference_query(
+                state,
+                input.project_id,
+                &Stage::Revision,
+                source.chapter_id,
+                Some(input.feedback.as_str()),
+                Some(&source),
+            )?,
+        )? {
+            prompt.push_str("\n\n");
+            prompt.push_str(&reference_context);
         }
-        Err(error) => eprintln!("continuity ledger unavailable; continuing revision: {error}"),
     }
-    if let Some(chapter_id) = revision_source.chapter_id {
-        if let Some(chapter) = state.ensure_chapter(input.project_id, Some(chapter_id))? {
-            if chapter.chapter_no > 1 {
-                let chapter_ids = state
-                    .list_chapters(input.project_id)?
-                    .into_iter()
-                    .filter(|item| item.chapter_no + 1 >= chapter.chapter_no)
-                    .filter(|item| item.chapter_no <= chapter.chapter_no)
-                    .map(|item| item.id)
-                    .collect::<Vec<_>>();
-                if chapter_ids.len() >= 2 {
-                    if let Ok(report) = review_project_continuity(
-                        state,
-                        ContinuityReviewRequest {
-                            project_id: input.project_id,
-                            chapter_ids: Some(chapter_ids),
-                            candidate_artifact_id: Some(revision_source.id),
-                            candidate_artifact_ids: None,
-                        },
-                    )
-                    .await
-                    {
-                        prompt.push_str(&format!(
+    if has_continuity_check {
+        match continuity_ledger::check_artifact_continuity(
+            state,
+            crate::models::LedgerContinuityCheckRequest {
+                project_id: input.project_id,
+                artifact_id: revision_source.id,
+            },
+        )
+        .await
+        {
+            Ok(report) => {
+                let guidance = continuity_ledger::render_report_for_prompt(&report);
+                if !guidance.is_empty() {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&guidance);
+                }
+            }
+            Err(error) => eprintln!("continuity ledger unavailable; continuing revision: {error}"),
+        }
+    }
+    if has_continuity_check {
+        if let Some(chapter_id) = revision_source.chapter_id {
+            if let Some(chapter) = state.ensure_chapter(input.project_id, Some(chapter_id))? {
+                if chapter.chapter_no > 1 {
+                    let chapter_ids = state
+                        .list_chapters(input.project_id)?
+                        .into_iter()
+                        .filter(|item| item.chapter_no + 1 >= chapter.chapter_no)
+                        .filter(|item| item.chapter_no <= chapter.chapter_no)
+                        .map(|item| item.id)
+                        .collect::<Vec<_>>();
+                    if chapter_ids.len() >= 2 {
+                        if let Ok(report) = review_project_continuity(
+                            state,
+                            ContinuityReviewRequest {
+                                project_id: input.project_id,
+                                chapter_ids: Some(chapter_ids),
+                                candidate_artifact_id: Some(revision_source.id),
+                                candidate_artifact_ids: None,
+                            },
+                        )
+                        .await
+                        {
+                            prompt.push_str(&format!(
                             "\n\n# 当前候选稿连续性预检\n结论：{}。\n摘要：{}\n这些问题是拿当前候选稿直接对照最近两章得到的，不是泛化建议。若其中有 major 或 moderate，必须优先修这些，再修句子和结尾落点：",
                             report.verdict, report.summary
                         ));
-                        for issue in report.issues.iter().take(5) {
-                            prompt.push_str(&format!(
-                                "\n- {}（{}）：{} 建议：{}",
-                                issue.issue_type, issue.severity, issue.reason, issue.suggestion
-                            ));
+                            for issue in report.issues.iter().take(5) {
+                                prompt.push_str(&format!(
+                                    "\n- {}（{}）：{} 建议：{}",
+                                    issue.issue_type,
+                                    issue.severity,
+                                    issue.reason,
+                                    issue.suggestion
+                                ));
+                            }
                         }
                     }
                 }
@@ -730,6 +937,7 @@ pub async fn request_revision(
     )?;
     let mut latest_output = String::new();
     let mut last_persisted_chars = 0usize;
+    let mut last_event_chars = 0usize;
     let mut last_persisted_at = Instant::now();
     match ai::complete_chat_streaming(
         &settings,
@@ -738,6 +946,9 @@ pub async fn request_revision(
         &prompt,
         agent.temperature,
         |partial| {
+            if state.run_cancellation_requested(run.id)? {
+                return Err(AppError::Validation("Agent 运行已取消".to_string()));
+            }
             latest_output = partial.to_string();
             let chars = partial.chars().count();
             if partial.is_empty()
@@ -754,6 +965,24 @@ pub async fn request_revision(
                 last_persisted_chars = chars;
                 last_persisted_at = Instant::now();
             }
+            let delta = if chars >= last_event_chars {
+                partial.chars().skip(last_event_chars).collect::<String>()
+            } else {
+                last_event_chars = 0;
+                partial.to_string()
+            };
+            if !delta.is_empty() {
+                state.insert_run_event(
+                    run.id,
+                    input.project_id,
+                    source.chapter_id,
+                    "output_delta",
+                    &delta,
+                    "streaming",
+                    None,
+                )?;
+                last_event_chars = chars;
+            }
             Ok(())
         },
     )
@@ -769,6 +998,21 @@ pub async fn request_revision(
                 &normalized_output,
                 Some(revision_source.id),
             )?;
+            if has_reference_materials {
+                if let Some(warning) = crate::reference::overlap_warning(
+                    state,
+                    input.project_id,
+                    input.reference_selection.as_ref(),
+                    &normalized_output,
+                ) {
+                    state.insert_message(
+                        input.project_id,
+                        source.chapter_id,
+                        "reference_overlap_warning",
+                        &warning,
+                    )?;
+                }
+            }
             run = state.update_workflow_run(
                 run.id,
                 &normalized_output,
@@ -787,10 +1031,11 @@ pub async fn request_revision(
         }
         Err(err) => {
             let message = err.to_string();
+            let cancelled = state.run_cancellation_requested(run.id)?;
             state.update_workflow_run(
                 run.id,
                 &latest_output,
-                "failed",
+                if cancelled { "cancelled" } else { "failed" },
                 Some(&message),
                 started.elapsed().as_millis() as i64,
             )?;
@@ -963,7 +1208,10 @@ pub async fn revise_artifact_span_with_ai(
         )));
     }
 
-    let settings = state.get_ai_settings()?;
+    let revision_agent = state.get_agent("artifact_revision")?;
+    let has_history_context = revision_agent.has_tool(agent_tools::HISTORY_CONTEXT);
+    let has_continuity_check = revision_agent.has_tool(agent_tools::CONTINUITY_CHECK);
+    let settings = revision_agent.ai_settings();
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| {
@@ -972,10 +1220,12 @@ pub async fn revise_artifact_span_with_ai(
 
     let tool_context = if matches!(source.stage.as_str(), "draft" | "revision") {
         if let Some(chapter_id) = source.chapter_id {
-            if let Err(error) =
-                continuity_ledger::ensure_ledger_current(state, input.project_id).await
-            {
-                eprintln!("continuity ledger unavailable for local revision search: {error}");
+            if has_continuity_check {
+                if let Err(error) =
+                    continuity_ledger::ensure_ledger_current(state, input.project_id).await
+                {
+                    eprintln!("continuity ledger unavailable for local revision search: {error}");
+                }
             }
             let search_source = format!(
                 "# 被修订正文\n{}\n\n# 指定片段\n{}\n\n# 人工要求\n{}",
@@ -983,22 +1233,26 @@ pub async fn revise_artifact_span_with_ai(
                 input.find_text,
                 input.instruction.trim()
             );
-            match context_search::prepare_tool_context(
-                state,
-                input.project_id,
-                chapter_id,
-                &Stage::Revision,
-                &search_source,
-                &settings,
-                &api_key,
-            )
-            .await
-            {
-                Ok(context) => context,
-                Err(error) => {
-                    eprintln!("App context search unavailable for local revision: {error}");
-                    None
+            if has_history_context {
+                match context_search::prepare_tool_context(
+                    state,
+                    input.project_id,
+                    chapter_id,
+                    &Stage::Revision,
+                    &search_source,
+                    &settings,
+                    &api_key,
+                )
+                .await
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        eprintln!("App context search unavailable for local revision: {error}");
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None
@@ -1007,7 +1261,7 @@ pub async fn revise_artifact_span_with_ai(
         None
     };
 
-    let system_prompt = "你是长篇小说编辑助手。你只负责重写用户指定的那一小段文字，保持全文其余部分不变。禁止输出解释、分析、标题、引号外说明，只输出替换后的新片段正文。";
+    let system_prompt = &revision_agent.system_prompt;
     let user_prompt = format!(
         "# 当前产物阶段\n{}\n\n# 全文上下文（仅供你保持风格、信息和连续性，不要改未指定部分）\n{}{}\n\n# 需要局部改写的原文片段\n{}\n\n# 局部修订要求\n{}\n\n# 输出要求\n1. 只输出“替换后的新片段”本身，不要输出别的。\n2. 只改这段，未被要求修改的信息、事实、称呼、物件状态、上下文关系要尽量保持连续。\n3. 若要求与上下文冲突，优先做最小必要修改，不扩展新设定。\n4. 新片段必须能直接替换原文片段。",
         stage_label(&source.stage),
@@ -1110,7 +1364,13 @@ pub async fn review_project_continuity(
             )));
         }
     }
-    let settings = state.get_ai_settings()?;
+    let review_agent = state.get_agent("continuity_review")?;
+    if !review_agent.has_tool(agent_tools::CONTINUITY_CHECK) {
+        return Err(AppError::Validation(
+            "当前连续性审校 Agent 未启用“连续性检查”工具，请先在 Agent 设置中启用".to_string(),
+        ));
+    }
+    let settings = review_agent.ai_settings();
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| {
@@ -1214,7 +1474,7 @@ pub async fn review_project_continuity(
     let raw = ai::complete_chat(
         &settings,
         &api_key,
-        "你是经验非常老到的网络小说总编和长篇连续性编辑，只指出真正会伤害连载可用性的多章问题。",
+        &review_agent.system_prompt,
         &prompt,
         0.0,
     )
@@ -1262,13 +1522,24 @@ pub async fn generate_chapter_split_plan(
         ));
     }
 
-    let quality_report = quality::analyze_artifact(&artifact);
-    let continuity_issues =
-        latest_relevant_continuity_issues(state, input.project_id, chapter.chapter_no)?;
-
-    let settings = state.get_ai_settings()?;
+    let split_agent = state.get_agent("chapter_split_plan")?;
+    if !split_agent.has_tool(agent_tools::CHAPTER_SPLIT) {
+        return Err(AppError::Validation(
+            "当前拆章 Agent 未启用“拆章规划”工具，请先在 Agent 设置中启用".to_string(),
+        ));
+    }
+    let has_history_context = split_agent.has_tool(agent_tools::HISTORY_CONTEXT);
+    let has_continuity_check = split_agent.has_tool(agent_tools::CONTINUITY_CHECK);
+    let has_quality_analysis = split_agent.has_tool(agent_tools::QUALITY_ANALYSIS);
+    let quality_report = has_quality_analysis.then(|| quality::analyze_artifact(&artifact));
+    let continuity_issues = if has_continuity_check {
+        latest_relevant_continuity_issues(state, input.project_id, chapter.chapter_no)?
+    } else {
+        Vec::new()
+    };
+    let settings = split_agent.ai_settings();
     let api_key = state
-        .get_api_key()?
+        .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| AppError::Validation("请先在设置里保存 AI API Key".to_string()))?;
     let next_chapter = state
         .list_chapters(input.project_id)?
@@ -1286,14 +1557,16 @@ pub async fn generate_chapter_split_plan(
             .unwrap_or_default();
 
     let mut prompt = project_context(&project);
-    append_split_plan_context(
-        state,
-        input.project_id,
-        chapter.id,
-        chapter.chapter_no,
-        &mut prompt,
-    )?;
-    append_recent_chapter_context(state, input.project_id, chapter.id, &mut prompt)?;
+    if has_history_context {
+        append_split_plan_context(
+            state,
+            input.project_id,
+            chapter.id,
+            chapter.chapter_no,
+            &mut prompt,
+        )?;
+        append_recent_chapter_context(state, input.project_id, chapter.id, &mut prompt)?;
+    }
     append_chapter_task_card(state, input.project_id, chapter.chapter_no, &mut prompt)?;
     prompt.push_str(&format!(
         "\n\n# 当前候选稿\n章节：{}（第 {} 章）\n产物阶段：{} v{}\n\n{}",
@@ -1307,18 +1580,24 @@ pub async fn generate_chapter_split_plan(
         prompt.push_str(&format!("\n\n# 下一章节原大纲\n{}", next_outline));
     }
 
-    prompt.push_str(&format!(
-        "\n\n# 当前本地判断\n- 质量结论：{} / {}\n- 质量摘要：{}",
-        quality_report.score, quality_report.verdict, quality_report.summary
-    ));
-    if !quality_report.warnings.is_empty() {
-        prompt.push_str("\n- 本地质量警告：");
-        for warning in quality_report.warnings.iter().take(4) {
-            prompt.push_str(&format!(
-                "\n  * {}：{} 建议：{}",
-                warning.title, warning.detail, warning.suggestion
-            ));
+    if let Some(quality_report) = quality_report.as_ref() {
+        prompt.push_str(&format!(
+            "\n\n# 当前本地判断\n- 质量结论：{} / {}\n- 质量摘要：{}",
+            quality_report.score, quality_report.verdict, quality_report.summary
+        ));
+        if !quality_report.warnings.is_empty() {
+            prompt.push_str("\n- 本地质量警告：");
+            for warning in quality_report.warnings.iter().take(4) {
+                prompt.push_str(&format!(
+                    "\n  * {}：{} 建议：{}",
+                    warning.title, warning.detail, warning.suggestion
+                ));
+            }
         }
+    } else {
+        prompt.push_str(
+            "\n\n# 当前本地判断\n质量分析工具未启用；请只依据候选稿、章节任务卡和已批准上下文判断是否需要拆章。",
+        );
     }
     if !continuity_issues.is_empty() {
         prompt.push_str("\n- 最近一次多章连续性记录：");
@@ -1337,7 +1616,7 @@ pub async fn generate_chapter_split_plan(
     let raw = ai::complete_chat(
         &settings,
         &api_key,
-        "你是网络小说连载策划编辑，擅长把超载章节拆成两个可执行、可衔接、可写作的章节任务。",
+        &split_agent.system_prompt,
         &prompt,
         0.0,
     )
@@ -1487,6 +1766,32 @@ fn revision_search_source(
     parts.join("\n\n")
 }
 
+fn reference_query(
+    state: &AppState,
+    project_id: i64,
+    stage: &Stage,
+    chapter_id: Option<i64>,
+    user_instruction: Option<&str>,
+    source_artifact: Option<&Artifact>,
+) -> AppResult<String> {
+    let project = state.get_project(project_id)?;
+    let mut parts = vec![project.title, project.genre, project.premise];
+    parts.push(stage.title().to_string());
+    if let Some(chapter_id) = chapter_id {
+        if let Some(chapter) = state.ensure_chapter(project_id, Some(chapter_id))? {
+            parts.push(chapter.title);
+        }
+    }
+    if let Some(instruction) = user_instruction.filter(|value| !value.trim().is_empty()) {
+        parts.push(instruction.trim().to_string());
+    }
+    if let Some(source) = source_artifact {
+        parts.push(source.content.chars().take(1800).collect());
+    }
+    Ok(parts.join("\n"))
+}
+
+#[cfg(test)]
 fn build_prompt(
     state: &AppState,
     project_id: i64,
@@ -1496,11 +1801,72 @@ fn build_prompt(
     source_artifact: Option<&Artifact>,
     tool_context: Option<&str>,
 ) -> AppResult<String> {
+    build_prompt_internal(
+        state,
+        project_id,
+        stage,
+        chapter_id,
+        user_instruction,
+        source_artifact,
+        tool_context,
+        None,
+    )
+}
+
+pub(crate) fn build_prompt_for_agent(
+    state: &AppState,
+    project_id: i64,
+    stage: &Stage,
+    chapter_id: Option<i64>,
+    user_instruction: Option<&str>,
+    source_artifact: Option<&Artifact>,
+    tool_context: Option<&str>,
+    agent: &Agent,
+) -> AppResult<String> {
+    build_prompt_internal(
+        state,
+        project_id,
+        stage,
+        chapter_id,
+        user_instruction,
+        source_artifact,
+        tool_context,
+        Some(agent),
+    )
+}
+
+fn build_prompt_internal(
+    state: &AppState,
+    project_id: i64,
+    stage: &Stage,
+    chapter_id: Option<i64>,
+    user_instruction: Option<&str>,
+    source_artifact: Option<&Artifact>,
+    tool_context: Option<&str>,
+    agent: Option<&Agent>,
+) -> AppResult<String> {
     let project = state.get_project(project_id)?;
+    let has_history_context = agent
+        .map(|item| item.has_tool(agent_tools::HISTORY_CONTEXT))
+        .unwrap_or(true);
+    let has_chapter_memory = agent
+        .map(|item| item.has_tool(agent_tools::CHAPTER_MEMORY))
+        .unwrap_or(true);
+    let has_continuity_check = agent
+        .map(|item| item.has_tool(agent_tools::CONTINUITY_CHECK))
+        .unwrap_or(true);
+    let has_quality_analysis = agent
+        .map(|item| item.has_tool(agent_tools::QUALITY_ANALYSIS))
+        .unwrap_or(true);
     let mut prompt = project_context(&project);
     append_approved_context(state, project_id, &mut prompt)?;
     prompt.push_str(&render_project_genre_skill(state, &project, stage)?);
-    prompt.push_str(&render_supporting_skills(state, &project, stage)?);
+    prompt.push_str(&render_supporting_skills_for_agent(
+        state,
+        &project,
+        stage,
+        agent.map(|item| item.allowed_skill_keys.as_slice()),
+    )?);
     if matches!(stage, Stage::Outline) {
         append_written_progress_context(state, project_id, &mut prompt)?;
     }
@@ -1513,30 +1879,40 @@ fn build_prompt(
             ));
             if matches!(stage, Stage::Draft | Stage::Review | Stage::Revision) {
                 append_chapter_task_card(state, project_id, chapter.chapter_no, &mut prompt)?;
-                append_recent_chapter_context(state, project_id, chapter.id, &mut prompt)?;
-                append_continuity_guidance(
-                    state,
-                    project_id,
-                    chapter.chapter_no,
-                    stage,
-                    &mut prompt,
-                )?;
-                append_retrieved_history(
-                    state,
-                    project_id,
-                    chapter.id,
-                    chapter.chapter_no,
-                    user_instruction,
-                    &mut prompt,
-                )?;
-                append_chapter_state_ledger(
-                    state,
-                    project_id,
-                    chapter.id,
-                    chapter.chapter_no,
-                    user_instruction,
-                    &mut prompt,
-                )?;
+                if has_history_context {
+                    append_recent_chapter_context_with_options(
+                        state,
+                        project_id,
+                        chapter.id,
+                        has_chapter_memory,
+                        &mut prompt,
+                    )?;
+                    append_retrieved_history(
+                        state,
+                        project_id,
+                        chapter.id,
+                        chapter.chapter_no,
+                        user_instruction,
+                        &mut prompt,
+                    )?;
+                }
+                if has_continuity_check {
+                    append_continuity_guidance(
+                        state,
+                        project_id,
+                        chapter.chapter_no,
+                        stage,
+                        &mut prompt,
+                    )?;
+                    append_chapter_state_ledger(
+                        state,
+                        project_id,
+                        chapter.id,
+                        chapter.chapter_no,
+                        user_instruction,
+                        &mut prompt,
+                    )?;
+                }
                 append_foreshadowing_context(state, project_id, chapter.chapter_no, &mut prompt)?;
                 append_chapter_task_contract(
                     state,
@@ -1582,11 +1958,16 @@ fn build_prompt(
                         )
                     })
             })?;
-            let quality_report = quality::analyze_artifact(&draft);
+            let quality_context = if has_quality_analysis {
+                quality_report_for_prompt(&quality::analyze_artifact(&draft))
+            } else {
+                "当前 Agent 未启用质量分析工具；本次试读不使用本地自动评分，只依据候选稿、已批准资料和人工指令审校。"
+                    .to_string()
+            };
             prompt.push_str(&format!(
                 "\n\n# 待试读章节\n{}\n\n# 本地质量信号\n{}\n\n# 章节任务兑现审校\n本章柔性任务契约和章节任务卡是本次审校的语义合同。请先判断候选稿是否实质执行了其中的“本章目标、主要阻力、必须发生的变化、离开状态”：关键行动、选择或结果缺席，被其他事件替代，或只被一句话提及而没有改变局面时，标出 issue_type 为“章节任务未兑现”。只有主要章节功能整体缺席时才给 major；结尾形式与建议不同但已经完成等效状态变化，不算问题。允许同义表达、等效行动、合理场景改写和不同结尾类型；绝不要求照抄章节标题、人物名、资源名或任务卡的字面词汇。\n\n# 审校事实边界\n{}\n建议只能删减、重排、强化候选稿已有动作，或继续使用已批准资料中明确存在的事实。不要建议增加新人物、新物件、新地点、新规则、临时安排或过去事件；如果某个问题只能靠新增事实解决，直接标为事实越界，保留问题但不要给出该新增修法。\n\n# 输出格式\n请只输出 JSON 数组，列出 3-8 个最影响追读的问题。每项包含 issue_type、severity、location、reason、suggestion、evidence_quote、action_evidence_quote 七个字段，不要额外解释。evidence_quote 必须是候选稿、已批准资料或已通过前章中连续出现的 8-80 个字原文，用来证明问题。action_evidence_quote 是可选字段：建议需要强化或继续使用既有动作时，提供其中连续出现的 8-80 个字原文；建议只是删减、合并或重排已有文字时可以留空。若建议需要新增事实、物件、人物、地点、规则、安排或过去事件，就不要给出该建议。severity 只能是 minor、moderate、major。优先覆盖本地质量信号暴露出的真实阅读风险，但不要机械复述指标名。",
                 draft.content,
-                quality_report_for_prompt(&quality_report),
+                quality_context,
                 REVIEW_FACT_BOUNDARY
             ));
         }
@@ -1598,8 +1979,20 @@ fn build_prompt(
             } else {
                 state.approved_artifact(project_id, "review", chapter_id)?
             };
-            let quality_report = quality::analyze_artifact(&source);
-            let revision_contract = revision_contract_for_prompt(&quality_report);
+            let (quality_context, revision_contract) = if has_quality_analysis {
+                let report = quality::analyze_artifact(&source);
+                (
+                    quality_report_for_prompt(&report),
+                    revision_contract_for_prompt(&report),
+                )
+            } else {
+                (
+                    "当前 Agent 未启用质量分析工具；不要使用本地自动评分驱动修订，只依据源稿、试读报告、人工反馈和已批准事实。"
+                        .to_string(),
+                    "未启用本地质量分析工具。只修复试读报告和人工反馈中有证据的问题，不为了任何自动指标改写正文。"
+                        .to_string(),
+                )
+            };
             let review_content = review
                 .as_ref()
                 .map(|artifact| artifact.content.as_str())
@@ -1608,7 +2001,7 @@ fn build_prompt(
                 "\n\n# 原稿\n{}\n\n# 已批准试读报告\n{}\n\n# 本地质量信号\n{}\n\n# 修订约束卡\n{}\n\n# 任务\n输出修订后的完整章节正文，不要解释修改。必须优先解决 major/moderate 问题；保留有效氛围和题材细节；删掉解释感、模板化比喻和重复句式。若本地质量信号显示开篇驱动力、结尾功能、段落重量、解释感或信息反转偏密存在问题，必须在正文里实质修正；但不能为了指标把成长、关系、恢复或过渡章强改成冲突章。若本地质量信号显示叙事失焦，保留必要场景、对白和情绪承接，只删重复解释、重复确认或无后果过渡。\n\n修订时如果发现原稿塞入了过多新名词、新规则、新人物职责、多层真相或多层反转，你必须主动减法：只保留最能改变主角选择的一条核心信息，其余改成疑点、物证、未确认线索或后续章再验证。不要用“第一/第二/第三”总结真相，不要连续写“不是……而是……”解释机制；把说明改成场景阻碍、对白试探、物件状态变化或具体代价。只有当人物互动确实承担本章变化时才补对白，不为对白密度硬塞对话。结尾应按本章模式完成结果、决定、信息改写、行动启动、关系新平衡或情绪余韵；不得为了更刺激凭空加入外部事件、时限、人物或威胁。若旧能力、旧物件、旧血脉或旧资源在本章被写出了明显超出前文的新用途，优先降效果、补外部来源或改成一次性触发，并把代价写得比收益更具体，不能把一次性爆发写成无铺垫永久升级。",
                 source.content,
                 review_content,
-                quality_report_for_prompt(&quality_report),
+                quality_context,
                 revision_contract
             ));
             prompt.push_str("\n\n# 连续性优先级\n修订不是润色。若以下任一类问题存在，必须先改结构再改句子：\n1. 角色已知信息断点：旧角色不能突然知道上一章没有给出的秘密；若必须知道，正文必须写出他/她刚刚获得该信息的动作、代价或路径。\n2. 角色动机断点：上一章为资源、排名、仇怨、交易而行动的人，本章不能无说明变成守门、旁观或单纯推动剧情的工具人。\n3. 物件/禁制状态断点：令牌、门、阵、伤势、药力、封锁若上一章有状态变化，本章必须交代复原、重新激活、持续生效或失效原因。\n4. 主角收益断点：探索/布局章必须让主角带走一个能用的小收益或明确避祸路线；只知道更多秘密不算可用收益。\n若原稿无法同时修好这些问题，允许重写场景顺序、删掉角色提前入场、推迟部分秘密揭示。");
@@ -1653,10 +2046,20 @@ fn render_project_genre_skill(
     ))
 }
 
+#[cfg(test)]
 fn render_supporting_skills(
     state: &AppState,
     project: &Project,
     stage: &Stage,
+) -> AppResult<String> {
+    render_supporting_skills_for_agent(state, project, stage, None)
+}
+
+fn render_supporting_skills_for_agent(
+    state: &AppState,
+    project: &Project,
+    stage: &Stage,
+    agent_allowed_skill_keys: Option<&[String]>,
 ) -> AppResult<String> {
     let profile = state.get_genre_agent_for_project(project.id)?;
     let genre_skill_id = profile.primary_skill_key.as_str();
@@ -1675,6 +2078,14 @@ fn render_supporting_skills(
             .any(|allowed| allowed == &skill.skill_key)
         {
             continue;
+        }
+        if let Some(agent_allowed_skill_keys) = agent_allowed_skill_keys {
+            if !agent_allowed_skill_keys
+                .iter()
+                .any(|allowed| allowed == &skill.skill_key)
+            {
+                continue;
+            }
         }
 
         let intro = match skill.category.as_str() {
@@ -1785,6 +2196,16 @@ fn append_recent_chapter_context(
     current_chapter_id: i64,
     prompt: &mut String,
 ) -> AppResult<()> {
+    append_recent_chapter_context_with_options(state, project_id, current_chapter_id, true, prompt)
+}
+
+fn append_recent_chapter_context_with_options(
+    state: &AppState,
+    project_id: i64,
+    current_chapter_id: i64,
+    include_chapter_memory: bool,
+    prompt: &mut String,
+) -> AppResult<()> {
     let chapters = state.list_chapters(project_id)?;
     let Some(current) = chapters
         .iter()
@@ -1826,7 +2247,7 @@ fn append_recent_chapter_context(
             }
         }
     }
-    if chapter_memory::is_enabled() {
+    if include_chapter_memory && chapter_memory::is_enabled() {
         if let Some(predecessor_id) = direct_predecessor_id {
             if let Some(memory) =
                 chapter_memory::current_memory_for_chapter(state, project_id, predecessor_id)?
@@ -1922,11 +2343,11 @@ fn outline_task_for_prompt(state: &AppState, project_id: i64) -> AppResult<Strin
     }
 }
 
-fn direct_predecessor_chapter_no(
+fn direct_predecessor_chapter(
     state: &AppState,
     project_id: i64,
     current_chapter_id: i64,
-) -> AppResult<Option<i64>> {
+) -> AppResult<Option<(i64, i64)>> {
     let chapters = state.list_chapters(project_id)?;
     let Some(current) = chapters
         .iter()
@@ -1937,8 +2358,8 @@ fn direct_predecessor_chapter_no(
     Ok(chapters
         .iter()
         .filter(|chapter| chapter.chapter_no < current.chapter_no)
-        .map(|chapter| chapter.chapter_no)
-        .max())
+        .max_by_key(|chapter| chapter.chapter_no)
+        .map(|chapter| (chapter.id, chapter.chapter_no)))
 }
 
 fn append_split_plan_context(
@@ -3800,6 +4221,7 @@ mod tests {
             .unwrap();
         state
             .save_writing_skill(crate::models::SaveWritingSkill {
+                id: None,
                 skill_key: "unrelated_romance_craft".to_string(),
                 name: "无关言情规则".to_string(),
                 category: "craft".to_string(),
@@ -4348,6 +4770,7 @@ mod tests {
         let chapter = state.list_chapters(project.id).unwrap().remove(0);
         state
             .update_chapter(ChapterUpdate {
+                project_id: project.id,
                 id: chapter.id,
                 title: "第 1 章 雨夜收尸人".to_string(),
                 status: chapter.status,
@@ -4779,6 +5202,7 @@ mod tests {
                 model,
                 temperature: 0.72,
                 thinking_enabled: false,
+                thinking_level: "off".to_string(),
                 api_key: Some(api_key),
             })
             .unwrap();
@@ -4795,6 +5219,7 @@ mod tests {
         let chapter = state.list_chapters(project.id).unwrap().remove(0);
         state
             .update_chapter(ChapterUpdate {
+                project_id: project.id,
                 id: chapter.id,
                 title: "第 1 章 雨夜收尸人".to_string(),
                 status: chapter.status,
@@ -4809,6 +5234,8 @@ mod tests {
                 chapter_id: None,
                 source_artifact_id: None,
             user_instruction: Some("面向男频商业连载，风格克制冷峻但易读，核心卖点是职业细节、怪异规则、低位逆袭和层层揭露。设定必须具体、可执行、能支持长篇推进。".to_string()),
+                reference_selection: None,
+                prepared_context_id: None,
             },
         )
         .await
@@ -4825,6 +5252,8 @@ mod tests {
                 chapter_id: None,
                 source_artifact_id: None,
             user_instruction: Some("给出整书主线，并明确第一卷前12章的章节目标，尤其说明第1章的开场钩子、冲突和结尾悬念。".to_string()),
+                reference_selection: None,
+                prepared_context_id: None,
             },
         )
         .await
@@ -4841,6 +5270,8 @@ mod tests {
                 chapter_id: None,
                 source_artifact_id: None,
             user_instruction: Some("重点把主角、殡仪馆师父、第一章出现的女警、幕后怪异势力的前台人物写清楚，确保角色有鲜明口吻和现实职业感。".to_string()),
+                reference_selection: None,
+                prepared_context_id: None,
             },
         )
         .await
@@ -4857,6 +5288,8 @@ mod tests {
                 chapter_id: Some(chapter.id),
                 source_artifact_id: None,
             user_instruction: Some("只写第一章正文，目标约1200到1800字。必须从暴雨夜收尸开场，尽快展示主角职业细节和特殊能力，章末给出强悬念，避免摘要式写法，多用场景、动作、对话和细节推进。".to_string()),
+                reference_selection: None,
+                prepared_context_id: None,
             },
         )
         .await
@@ -4873,6 +5306,8 @@ mod tests {
                 chapter_id: Some(chapter.id),
                 source_artifact_id: None,
             user_instruction: Some("重点检查是否像真正网文开篇，而不是设定说明；对节奏、信息投放、悬念强度、对白质感从严挑问题。".to_string()),
+                reference_selection: None,
+                prepared_context_id: None,
             },
         )
         .await
@@ -4887,6 +5322,7 @@ mod tests {
                 project_id: project.id,
                 artifact_id: draft.artifact.id,
                 feedback: "优先解决开头抓力、对白僵硬、解释感过重的问题。修订时保留职业氛围和怪异感，结尾悬念再抬高一档。".to_string(),
+                reference_selection: None,
             },
         )
         .await

@@ -1,0 +1,469 @@
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use crate::{
+    db::AppState,
+    error::{AppError, AppResult},
+    models::{
+        AgentRunRequest, AgentRunSummary, Artifact, ContextSegment, PreparedContext,
+        RevisionRequest, RunAgentRequest, RunStoryArchitectRequest, Stage, WorkflowRun,
+    },
+    tool_runtime::{self, ToolExecutionContext},
+    workflow,
+};
+
+pub async fn preview_agent_run(
+    state: &AppState,
+    request: AgentRunRequest,
+) -> AppResult<PreparedContext> {
+    prepare_context(state, &request, true).await
+}
+
+pub async fn start_agent_run(
+    state: &AppState,
+    mut request: AgentRunRequest,
+) -> AppResult<AgentRunSummary> {
+    let prepared = if let Some(id) = request.prepared_context_id {
+        let prepared = state.get_prepared_context(id)?;
+        validate_prepared_context(state, &request, &prepared)?;
+        prepared
+    } else {
+        prepare_context(state, &request, true).await?
+    };
+    request.prepared_context_id = Some(prepared.id);
+    let result = workflow::run_agent_step(state, RunAgentRequest::from(request.clone())).await?;
+    state.link_run_prepared_context(result.run.id, prepared.id)?;
+    let agent = state.get_agent_for_project_stage(request.project_id, request.stage.as_str())?;
+    let mut proposal_agent = agent.clone();
+    proposal_agent.enabled_tool_keys.retain(|key| {
+        crate::agent_tools::get(key)
+            .is_some_and(|definition| definition.kind == crate::models::ToolKind::Proposal)
+    });
+    if !proposal_agent.enabled_tool_keys.is_empty() {
+        let proposal_prompt = format!(
+            "# 已完成的 Agent 产物\n阶段：{}\n标题：{}\n\n{}\n\n# 人工原始指令\n{}\n\n只在产物明确需要创建章节、重命名章节、生成资料候选、知识卡或伏笔候选时创建写入提案。不得提议删除、批准或直接应用正文。",
+            request.stage.as_str(),
+            result.artifact.title,
+            result.artifact.content,
+            request.user_instruction.as_deref().unwrap_or("未提供")
+        );
+        let _ = tool_runtime::prepare_tools(
+            ToolExecutionContext {
+                state,
+                agent: &proposal_agent,
+                project_id: request.project_id,
+                chapter_id: request.chapter_id,
+                stage: &request.stage,
+                source_artifact_id: Some(result.artifact.id),
+                user_instruction: request.user_instruction.as_deref(),
+                reference_selection: request.reference_selection.as_ref(),
+                run_id: Some(result.run.id),
+                preview: false,
+            },
+            &proposal_prompt,
+        )
+        .await?;
+    }
+
+    let tool_invocations = tool_invocations_for_run(state, result.run.id, Some(prepared.id))?;
+    let proposals = state
+        .list_action_proposals(request.project_id, None)?
+        .into_iter()
+        .filter(|proposal| proposal.source_run_id == Some(result.run.id))
+        .collect();
+    Ok(AgentRunSummary {
+        run: result.run,
+        artifact: Some(result.artifact),
+        prepared_context_id: Some(prepared.id),
+        tool_invocations,
+        proposals,
+    })
+}
+
+pub async fn start_story_architect_run(
+    state: &AppState,
+    request: RunStoryArchitectRequest,
+) -> AppResult<AgentRunSummary> {
+    let request = crate::story_architecture::build_agent_run_request(state, request)?;
+    start_agent_run(state, request).await
+}
+
+pub async fn start_revision_run(
+    state: &AppState,
+    request: RevisionRequest,
+) -> AppResult<AgentRunSummary> {
+    let source = state.get_artifact(request.artifact_id)?;
+    if source.project_id != request.project_id {
+        return Err(AppError::Validation("修订目标不属于当前项目".to_string()));
+    }
+    if !matches!(source.stage.as_str(), "draft" | "revision" | "review") {
+        return Err(AppError::Validation(
+            "只能对章节草稿、试读报告或修订稿发起修订".to_string(),
+        ));
+    }
+    if request.feedback.trim().is_empty() {
+        return Err(AppError::Validation("请填写修订反馈".to_string()));
+    }
+    start_agent_run(
+        state,
+        AgentRunRequest {
+            project_id: request.project_id,
+            stage: Stage::Revision,
+            chapter_id: source.chapter_id,
+            user_instruction: Some(request.feedback),
+            source_artifact_id: Some(source.id),
+            reference_selection: request.reference_selection,
+            prepared_context_id: None,
+        },
+    )
+    .await
+}
+
+pub fn get_agent_run(state: &AppState, run_id: i64) -> AppResult<AgentRunSummary> {
+    let run = workflow_run(state, run_id)?;
+    let prepared_context_id = state.prepared_context_id_for_run(run_id)?;
+    let proposals = state
+        .list_action_proposals(run.project_id, None)?
+        .into_iter()
+        .filter(|proposal| proposal.source_run_id == Some(run_id))
+        .collect();
+    Ok(AgentRunSummary {
+        run,
+        artifact: None,
+        prepared_context_id,
+        tool_invocations: tool_invocations_for_run(state, run_id, prepared_context_id)?,
+        proposals,
+    })
+}
+
+pub fn cancel_agent_run(state: &AppState, run_id: i64) -> AppResult<AgentRunSummary> {
+    let run = workflow_run(state, run_id)?;
+    if !matches!(run.status.as_str(), "streaming" | "running") {
+        return Err(AppError::Validation(
+            "只有正在运行的 Agent 任务可以取消".to_string(),
+        ));
+    }
+    let updated = state.update_workflow_run(
+        run_id,
+        &run.output,
+        "cancellation_requested",
+        Some("用户请求取消"),
+        run.elapsed_ms,
+    )?;
+    state.insert_run_event(
+        run_id,
+        run.project_id,
+        run.chapter_id,
+        "cancellation_requested",
+        "",
+        "cancellation_requested",
+        None,
+    )?;
+    let prepared_context_id = state.prepared_context_id_for_run(run_id)?;
+    Ok(AgentRunSummary {
+        run: updated,
+        artifact: None,
+        prepared_context_id,
+        tool_invocations: tool_invocations_for_run(state, run_id, prepared_context_id)?,
+        proposals: state
+            .list_action_proposals(run.project_id, None)?
+            .into_iter()
+            .filter(|proposal| proposal.source_run_id == Some(run_id))
+            .collect(),
+    })
+}
+
+async fn prepare_context(
+    state: &AppState,
+    request: &AgentRunRequest,
+    preview: bool,
+) -> AppResult<PreparedContext> {
+    state.purge_expired_prepared_contexts()?;
+    let source = validate_request(state, request)?;
+    let agent = state.get_agent_for_project_stage(request.project_id, request.stage.as_str())?;
+    let mut prompt = workflow::build_prompt_for_agent(
+        state,
+        request.project_id,
+        &request.stage,
+        request.chapter_id,
+        request.user_instruction.as_deref(),
+        source.as_ref(),
+        None,
+        &agent,
+    )?;
+    let preparation = tool_runtime::prepare_tools(
+        ToolExecutionContext {
+            state,
+            agent: &agent,
+            project_id: request.project_id,
+            chapter_id: request.chapter_id,
+            stage: &request.stage,
+            source_artifact_id: request.source_artifact_id,
+            user_instruction: request.user_instruction.as_deref(),
+            reference_selection: request.reference_selection.as_ref(),
+            run_id: None,
+            preview,
+        },
+        &prompt,
+    )
+    .await?;
+    if let Some(tool_context) = preparation.rendered_context.as_deref() {
+        prompt.push_str("\n\n");
+        prompt.push_str(tool_context);
+    }
+    let fingerprint = context_fingerprint(state, request, &agent, source.as_ref())?;
+    let segments = split_segments(&prompt);
+    state.insert_prepared_context(
+        request.project_id,
+        request.chapter_id,
+        request.stage.as_str(),
+        &fingerprint,
+        &agent.system_prompt,
+        &prompt,
+        &segments,
+        &preparation.invocation_ids,
+    )
+}
+
+fn validate_request(state: &AppState, request: &AgentRunRequest) -> AppResult<Option<Artifact>> {
+    state.get_project(request.project_id)?;
+    match request.stage {
+        Stage::Setting | Stage::Outline | Stage::Characters if request.chapter_id.is_some() => {
+            return Err(AppError::Validation(
+                "设定、大纲和角色阶段不能绑定章节".to_string(),
+            ));
+        }
+        Stage::Draft | Stage::Review | Stage::Revision if request.chapter_id.is_none() => {
+            return Err(AppError::Validation(
+                "写作、试读和修订阶段必须选择章节".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    if request.chapter_id.is_some() {
+        state
+            .ensure_chapter(request.project_id, request.chapter_id)?
+            .ok_or_else(|| AppError::Validation("章节不属于当前项目".to_string()))?;
+    }
+    let source = request
+        .source_artifact_id
+        .map(|id| state.get_artifact(id))
+        .transpose()?;
+    if source
+        .as_ref()
+        .is_some_and(|artifact| artifact.project_id != request.project_id)
+    {
+        return Err(AppError::Validation("候选产物不属于当前项目".to_string()));
+    }
+    if let Some(source) = source.as_ref() {
+        let valid_source = match request.stage {
+            Stage::Setting | Stage::Outline | Stage::Characters => {
+                source.chapter_id.is_none() && source.stage == request.stage.as_str()
+            }
+            Stage::Review => {
+                source.chapter_id == request.chapter_id
+                    && matches!(source.stage.as_str(), "draft" | "revision")
+            }
+            Stage::Revision => {
+                source.chapter_id == request.chapter_id
+                    && matches!(source.stage.as_str(), "draft" | "revision" | "review")
+            }
+            Stage::Draft => false,
+        };
+        if !valid_source {
+            return Err(AppError::Validation(
+                "当前阶段不支持把这个产物作为上下文来源".to_string(),
+            ));
+        }
+    }
+    Ok(source)
+}
+
+fn validate_prepared_context(
+    state: &AppState,
+    request: &AgentRunRequest,
+    prepared: &PreparedContext,
+) -> AppResult<()> {
+    if prepared.project_id != request.project_id
+        || prepared.chapter_id != request.chapter_id
+        || prepared.stage != request.stage.as_str()
+    {
+        return Err(AppError::Validation(
+            "准备上下文与当前请求不匹配".to_string(),
+        ));
+    }
+    let expires_at = DateTime::parse_from_rfc3339(&prepared.expires_at)
+        .map_err(|_| AppError::Validation("准备上下文过期时间损坏".to_string()))?;
+    if expires_at <= Utc::now() {
+        return Err(AppError::Validation(
+            "准备上下文已过期，请重新预览".to_string(),
+        ));
+    }
+    let source = validate_request(state, request)?;
+    let agent = state.get_agent_for_project_stage(request.project_id, request.stage.as_str())?;
+    let current = context_fingerprint(state, request, &agent, source.as_ref())?;
+    if current != prepared.fingerprint {
+        return Err(AppError::Validation(
+            "项目资料、章节、候选稿、Prompt 或工具配置已变化，请重新预览".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn context_fingerprint(
+    state: &AppState,
+    request: &AgentRunRequest,
+    agent: &crate::models::Agent,
+    source: Option<&Artifact>,
+) -> AppResult<String> {
+    #[derive(Serialize)]
+    struct Fingerprint<'a> {
+        project_updated_at: &'a str,
+        canonical_fingerprint: String,
+        chapter_id: Option<i64>,
+        chapter_updated_at: Option<String>,
+        stage: &'a str,
+        source_id: Option<i64>,
+        source_hash: Option<String>,
+        instruction: Option<&'a str>,
+        reference_selection: &'a Option<crate::models::ReferenceSelection>,
+        agent_id: i64,
+        system_prompt: &'a str,
+        enabled_tool_keys: &'a [String],
+        allowed_skill_keys: &'a [String],
+        provider_base_url: &'a str,
+        model: &'a str,
+        tool_protocol: &'a str,
+        reference_fingerprint: String,
+    }
+    let project = state.get_project(request.project_id)?;
+    let chapter_updated_at = request.chapter_id.and_then(|id| {
+        state
+            .ensure_chapter(request.project_id, Some(id))
+            .ok()
+            .flatten()
+            .map(|chapter| chapter.updated_at)
+    });
+    let value = Fingerprint {
+        project_updated_at: &project.updated_at,
+        canonical_fingerprint: crate::story_architecture::canonical_fingerprint(
+            state,
+            request.project_id,
+        )?,
+        chapter_id: request.chapter_id,
+        chapter_updated_at,
+        stage: request.stage.as_str(),
+        source_id: source.map(|artifact| artifact.id),
+        source_hash: source.map(|artifact| chapter_memory_hash(&artifact.content)),
+        instruction: request.user_instruction.as_deref(),
+        reference_selection: &request.reference_selection,
+        agent_id: agent.id,
+        system_prompt: &agent.system_prompt,
+        enabled_tool_keys: &agent.enabled_tool_keys,
+        allowed_skill_keys: &agent.allowed_skill_keys,
+        provider_base_url: &agent.provider_base_url,
+        model: &agent.model,
+        tool_protocol: state
+            .provider_capabilities(&agent.provider_base_url)?
+            .configured_protocol
+            .as_str(),
+        reference_fingerprint: crate::reference::selection_fingerprint(
+            state,
+            request.project_id,
+            request.reference_selection.as_ref(),
+        )?,
+    };
+    let encoded = serde_json::to_vec(&value)?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn chapter_memory_hash(content: &str) -> String {
+    crate::chapter_memory::source_text_hash(content)
+}
+
+fn split_segments(prompt: &str) -> Vec<ContextSegment> {
+    const MAX_PREVIEW_CHARS: usize = 2_400;
+    let mut segments: Vec<(String, String)> = Vec::new();
+    for line in prompt.lines() {
+        if line.starts_with("# ") {
+            segments.push((
+                line.trim_start_matches("# ").trim().to_string(),
+                String::new(),
+            ));
+        } else if let Some((_, content)) = segments.last_mut() {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(line);
+        }
+    }
+    if segments.is_empty() {
+        segments.push(("生成上下文".to_string(), prompt.to_string()));
+    }
+    segments
+        .into_iter()
+        .filter(|(_, content)| !content.trim().is_empty())
+        .map(|(label, content)| {
+            let chars = content.chars().count();
+            let truncated = chars > MAX_PREVIEW_CHARS;
+            let preview = if truncated {
+                content.chars().take(MAX_PREVIEW_CHARS).collect::<String>()
+                    + "\n…（预览已截断，正式运行使用完整内容）"
+            } else {
+                content
+            };
+            ContextSegment {
+                kind: segment_kind(&label).to_string(),
+                label,
+                source: "application_context_pipeline".to_string(),
+                content: preview,
+                chars,
+                truncated,
+            }
+        })
+        .collect()
+}
+
+fn segment_kind(label: &str) -> &'static str {
+    if label.contains("工具") || label.contains("检索") || label.contains("账本") {
+        "tool_result"
+    } else if label.contains("人工") {
+        "human_instruction"
+    } else if label.contains("任务") || label.contains("输出") {
+        "task"
+    } else {
+        "static_context"
+    }
+}
+
+fn workflow_run(state: &AppState, run_id: i64) -> AppResult<WorkflowRun> {
+    state.get_workflow_run_v2(run_id)
+}
+
+fn tool_invocations_for_run(
+    state: &AppState,
+    run_id: i64,
+    prepared_context_id: Option<i64>,
+) -> AppResult<Vec<crate::models::ToolInvocation>> {
+    let mut invocations = if let Some(prepared_context_id) = prepared_context_id {
+        state.list_tool_invocations_for_context(prepared_context_id)?
+    } else {
+        Vec::new()
+    };
+    invocations.extend(state.list_tool_invocations_for_run(run_id)?);
+    invocations.sort_by_key(|invocation| invocation.id);
+    Ok(invocations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_segments_keep_heading_boundaries() {
+        let segments = split_segments("# 项目\nA\n# Agent 工具执行结果\nB");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].kind, "tool_result");
+    }
+}

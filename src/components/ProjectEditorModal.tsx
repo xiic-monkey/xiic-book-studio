@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2, Save, X } from "lucide-react";
 import type { ProjectUpdate } from "../types";
+import { Select } from "./Select";
 
 const PROJECT_EDITOR_FORM_ID = "project-editor-form";
 
@@ -82,7 +83,7 @@ export function ProjectEditorModal({
               id="project_target_words"
               type="number"
               min="10000"
-              step="10000"
+              step="1000"
               value={formData.target_words}
               onChange={(event) =>
                 onFormChange({ ...formData, target_words: Number(event.target.value) || 0 })
@@ -91,15 +92,16 @@ export function ProjectEditorModal({
           </div>
           <div className="form-field">
             <label htmlFor="project_status">项目状态</label>
-            <select
+            <Select
               id="project_status"
               value={formData.status}
-              onChange={(event) => onFormChange({ ...formData, status: event.target.value })}
-            >
-              <option value="active">进行中</option>
-              <option value="paused">暂停</option>
-              <option value="archived">归档</option>
-            </select>
+              onChange={(status) => onFormChange({ ...formData, status })}
+              options={[
+                { value: "active", label: "进行中" },
+                { value: "paused", label: "暂停" },
+                { value: "archived", label: "归档" },
+              ]}
+            />
           </div>
           <div className="form-field">
             <label htmlFor="project_premise">核心设定 / 梗概</label>

@@ -142,7 +142,8 @@ async fn index_approved_chapter_impl(
         });
     }
 
-    let settings = deterministic_settings(state.get_ai_settings()?);
+    let agent = state.get_agent("story_index")?;
+    let settings = deterministic_settings(agent.ai_settings());
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| {
@@ -161,14 +162,8 @@ async fn index_approved_chapter_impl(
         0,
     )?;
 
-    let raw = match ai::complete_json_chat(
-        &settings,
-        &api_key,
-        "你是小说连续性资料索引 Agent。只从已通过正文提取可验证的实体、事件和原子事实，不续写、不推断、不修改正文。",
-        &prompt,
-        0.0,
-    )
-    .await
+    let raw = match ai::complete_json_chat(&settings, &api_key, &agent.system_prompt, &prompt, 0.0)
+        .await
     {
         Ok(raw) => raw,
         Err(error) => {
@@ -252,7 +247,12 @@ pub async fn rebuild_story_index(
 ) -> AppResult<Vec<StoryIndexSummary>> {
     state.get_project(input.project_id)?;
     let chapter_ids = if let Some(chapter_id) = input.chapter_id {
-        vec![chapter_id]
+        vec![
+            state
+                .ensure_chapter(input.project_id, Some(chapter_id))?
+                .ok_or_else(|| AppError::Validation("章节不存在".to_string()))?
+                .id,
+        ]
     } else {
         state
             .list_chapters(input.project_id)?
@@ -445,6 +445,32 @@ fn deterministic_settings(mut settings: crate::models::AiSettings) -> crate::mod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn story_index_rebuild_rejects_an_unknown_chapter_id() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(crate::models::NewProject {
+                title: "索引边界测试".to_string(),
+                genre: "悬疑".to_string(),
+                target_words: 100000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+
+        let error = rebuild_story_index(
+            &state,
+            RebuildStoryIndexRequest {
+                project_id: project.id,
+                chapter_id: Some(999_999),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::Validation(message) if message == "章节不存在"));
+    }
 
     #[test]
     fn rejects_unverifiable_index_rows() {

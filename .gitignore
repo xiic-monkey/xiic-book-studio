@@ -15,3 +15,4 @@ npm-debug.log*
 src-tauri/resources/models/*
 !src-tauri/resources/models/.gitkeep
 src-tauri/resources/sqlite-vec/vec0.dylib
+src-tauri/resources/web-search-mcp/

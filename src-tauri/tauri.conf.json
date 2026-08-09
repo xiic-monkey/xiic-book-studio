@@ -27,7 +27,14 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "resources/**/*"
+      "resources/models/bge-small-zh-v1.5/**/*",
+      "resources/web-search-mcp/service/**/*",
+      "resources/web-search-mcp/runtime/**/*",
+      "resources/web-search-mcp/node_modules/playwright/**/*",
+      "resources/web-search-mcp/node_modules/playwright-core/**/*",
+      "resources/web-search-mcp/browsers/**/*",
+      "resources/web-search-mcp/xiic-manifest.json",
+      "resources/web-search-mcp/LICENSE"
     ],
     "icon": [
       "icons/32x32.png",

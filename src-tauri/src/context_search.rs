@@ -11,13 +11,17 @@ use crate::{
     db::AppState,
     error::{AppError, AppResult},
     models::{
-        AiSettings, ContinuityLedgerEntry, Stage, StoryContextSearchInput, StoryContextSnippet,
+        AiSettings, ContinuityLedgerEntry, Stage, StoryContextRerankRequest,
+        StoryContextRerankResult, StoryContextRerankedSnippet, StoryContextSearchInput,
+        StoryContextSnippet,
     },
     workflow,
 };
 
 const PLAN_STAGE: &str = "context_search_plan";
+const RERANK_STAGE: &str = "context_search_rerank";
 const MAX_SOURCE_CHARS: usize = 24_000;
+const MAX_RERANK_SOURCE_CHARS: usize = 8_000;
 const MAX_AGENT_SEARCHES: usize = 6;
 const MAX_EXECUTED_SEARCHES: usize = 12;
 
@@ -32,6 +36,47 @@ struct SearchRequest {
 struct SearchPlan {
     #[serde(default)]
     searches: Vec<SearchRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RerankCandidate {
+    candidate_id: usize,
+    query: String,
+    query_reason: String,
+    source_label: String,
+    matched_term: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankPlan {
+    #[serde(default)]
+    selections: Vec<RerankSelection>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RerankSelection {
+    candidate_id: usize,
+    category: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct RerankedSearchSnippet {
+    search: SearchRequest,
+    snippet: StoryContextSnippet,
+    category: String,
+    reason: String,
+}
+
+struct RerankExecutionContext<'a> {
+    state: &'a AppState,
+    project_id: i64,
+    chapter_id: i64,
+    stage: &'a Stage,
+    source_material: &'a str,
+    settings: &'a AiSettings,
+    api_key: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -60,8 +105,8 @@ pub async fn prepare_tool_context(
     chapter_id: i64,
     stage: &Stage,
     source_material: &str,
-    settings: &AiSettings,
-    api_key: &str,
+    _settings: &AiSettings,
+    _api_key: &str,
 ) -> AppResult<Option<String>> {
     if source_material.trim().is_empty() {
         return Ok(None);
@@ -85,10 +130,15 @@ pub async fn prepare_tool_context(
         0,
     )?;
 
+    let planner_agent = state.get_agent(PLAN_STAGE)?;
+    let planner_settings = planner_agent.ai_settings();
+    let planner_api_key = state
+        .get_api_key_for_base_url(&planner_settings.base_url)?
+        .ok_or_else(|| AppError::Validation("请先为上下文规划 Agent 配置 API Key".to_string()))?;
     let (agent_searches, planner_error) = match ai::complete_json_chat(
-        settings,
-        api_key,
-        "你是长篇小说 Agent 的上下文检索规划器。你只能提出搜索请求，不能续写、试读或修订正文。所有查询都必须由输入原文中的逐字证据触发。",
+        &planner_settings,
+        &planner_api_key,
+        &planner_agent.system_prompt,
         &planner_prompt,
         0.0,
     )
@@ -125,6 +175,24 @@ pub async fn prepare_tool_context(
     }
 
     let snippets = execute_history_searches(state, project_id, chapter_id, &planned)?;
+    let rerank_agent = state.get_agent(RERANK_STAGE)?;
+    let rerank_settings = rerank_agent.ai_settings();
+    let rerank_api_key = state
+        .get_api_key_for_base_url(&rerank_settings.base_url)?
+        .ok_or_else(|| AppError::Validation("请先为上下文筛选 Agent 配置 API Key".to_string()))?;
+    let reranked_snippets = rerank_agent_snippets(
+        RerankExecutionContext {
+            state,
+            project_id,
+            chapter_id,
+            stage,
+            source_material,
+            settings: &rerank_settings,
+            api_key: &rerank_api_key,
+        },
+        &snippets,
+    )
+    .await?;
     let ledger_hits =
         matching_ledger_hits(state, project_id, chapter_id, source_material, &planned)?;
     let fact_hits =
@@ -136,10 +204,65 @@ pub async fn prepare_tool_context(
     Ok(Some(render_tool_context(
         stage,
         &planned,
-        &snippets,
+        &reranked_snippets,
         &ledger_hits,
         &fact_hits,
     )))
+}
+
+/// Rerank a manual search without trusting client-provided candidate text. This
+/// deliberately keeps raw candidates in the response so users can inspect
+/// any model exclusion.
+pub async fn rerank_story_context(
+    state: &AppState,
+    input: StoryContextRerankRequest,
+) -> AppResult<StoryContextRerankResult> {
+    state.get_project(input.project_id)?;
+    let candidates = workflow::search_story_context(
+        state,
+        StoryContextSearchInput {
+            project_id: input.project_id,
+            chapter_id: input.chapter_id,
+            query: input.query.trim().to_string(),
+            limit: Some(12),
+            include_immediate_previous: input.include_immediate_previous,
+        },
+    )?;
+    if candidates.is_empty() {
+        return Ok(StoryContextRerankResult {
+            candidates,
+            selected: Vec::new(),
+            status: "empty".to_string(),
+            error: None,
+        });
+    }
+
+    let rerank_agent = state.get_agent(RERANK_STAGE)?;
+    let settings = rerank_agent.ai_settings();
+    let Some(api_key) = state.get_api_key_for_base_url(&settings.base_url)? else {
+        return Ok(raw_rerank_fallback(
+            candidates,
+            "请先在设置里为当前供应商保存 AI API Key".to_string(),
+        ));
+    };
+    let rerank_candidates = candidates_for_manual_rerank(&input.query, &candidates);
+    match rerank_candidates_with_model(
+        &settings,
+        &api_key,
+        input.stage.as_ref(),
+        input.task_context.as_deref().unwrap_or_default(),
+        &rerank_candidates,
+    )
+    .await
+    {
+        Ok(selections) => Ok(StoryContextRerankResult {
+            selected: selections_to_public(&candidates, &selections),
+            candidates,
+            status: "success".to_string(),
+            error: None,
+        }),
+        Err(error) => Ok(raw_rerank_fallback(candidates, error.to_string())),
+    }
 }
 
 fn build_planner_prompt(stage: &Stage, source_material: &str, ledger_catalog: &[String]) -> String {
@@ -383,6 +506,266 @@ fn execute_history_searches(
     Ok(results)
 }
 
+async fn rerank_agent_snippets(
+    context: RerankExecutionContext<'_>,
+    snippets: &[(SearchRequest, StoryContextSnippet)],
+) -> AppResult<Vec<RerankedSearchSnippet>> {
+    if snippets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let candidates = candidates_for_agent_rerank(snippets);
+    let prompt = build_reranker_prompt(Some(context.stage), context.source_material, &candidates);
+    let started = Instant::now();
+    let run = context.state.insert_workflow_run(
+        context.project_id,
+        Some(context.chapter_id),
+        RERANK_STAGE,
+        &prompt,
+        "",
+        "running",
+        None,
+        0,
+    )?;
+
+    match rerank_candidates_with_model(
+        context.settings,
+        context.api_key,
+        Some(context.stage),
+        context.source_material,
+        &candidates,
+    )
+    .await
+    {
+        Ok(selections) => {
+            let output = serde_json::json!({
+                "candidate_count": candidates.len(),
+                "selections": selections,
+            });
+            context.state.update_workflow_run(
+                run.id,
+                &serde_json::to_string(&output)?,
+                "success",
+                None,
+                started.elapsed().as_millis() as i64,
+            )?;
+            Ok(selections_to_agent_snippets(snippets, &selections))
+        }
+        Err(error) => {
+            let fallback = raw_agent_rerank_fallback(snippets);
+            context.state.update_workflow_run(
+                run.id,
+                &serde_json::to_string(&serde_json::json!({
+                    "candidate_count": candidates.len(),
+                    "fallback": true,
+                }))?,
+                "failed",
+                Some(&error.to_string()),
+                started.elapsed().as_millis() as i64,
+            )?;
+            Ok(fallback)
+        }
+    }
+}
+
+fn candidates_for_agent_rerank(
+    snippets: &[(SearchRequest, StoryContextSnippet)],
+) -> Vec<RerankCandidate> {
+    snippets
+        .iter()
+        .enumerate()
+        .map(|(index, (search, snippet))| RerankCandidate {
+            candidate_id: index + 1,
+            query: search.query.clone(),
+            query_reason: search.reason.clone(),
+            source_label: snippet.source_label.clone(),
+            matched_term: snippet.matched_term.clone(),
+            content: snippet.content.clone(),
+        })
+        .collect()
+}
+
+fn candidates_for_manual_rerank(
+    query: &str,
+    snippets: &[StoryContextSnippet],
+) -> Vec<RerankCandidate> {
+    snippets
+        .iter()
+        .enumerate()
+        .map(|(index, snippet)| RerankCandidate {
+            candidate_id: index + 1,
+            query: query.trim().to_string(),
+            query_reason: "手动历史检索".to_string(),
+            source_label: snippet.source_label.clone(),
+            matched_term: snippet.matched_term.clone(),
+            content: snippet.content.clone(),
+        })
+        .collect()
+}
+
+async fn rerank_candidates_with_model(
+    settings: &AiSettings,
+    api_key: &str,
+    stage: Option<&Stage>,
+    task_context: &str,
+    candidates: &[RerankCandidate],
+) -> AppResult<Vec<RerankSelection>> {
+    let prompt = build_reranker_prompt(stage, task_context, candidates);
+    let raw = ai::complete_json_chat(
+        settings,
+        api_key,
+        "你是小说历史上下文的证据筛选器。你不能搜索、不能编造事实、不能改写候选内容；只能从候选编号中选择与当前任务直接相关的原文证据。",
+        &prompt,
+        0.0,
+    )
+    .await?;
+    parse_rerank_plan(&raw, candidates.len())
+}
+
+fn build_reranker_prompt(
+    stage: Option<&Stage>,
+    task_context: &str,
+    candidates: &[RerankCandidate],
+) -> String {
+    let stage_label = stage.map(Stage::title).unwrap_or("手动历史检索");
+    let task_context = if task_context.trim().is_empty() {
+        "（没有额外任务正文；仅按查询与候选来源判断相关性）".to_string()
+    } else {
+        sample_source(task_context, MAX_RERANK_SOURCE_CHARS)
+    };
+    let rendered_candidates = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "## 候选 {}\n查询：{}\n查询目的：{}\n来源：{}\n命中词：{}\n原文：{}",
+                candidate.candidate_id,
+                candidate.query,
+                candidate.query_reason,
+                candidate.source_label,
+                candidate.matched_term,
+                candidate.content,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!(
+        "# 任务\n当前阶段：{stage_label}\n只保留能够帮助当前任务核对历史人物、物件、地点、事件、状态或承诺的候选。删除明显无关、只共享字面词但没有事实关联、或与已选证据重复的候选。\n\n# 当前材料\n{task_context}\n\n# 候选证据\n{rendered_candidates}\n\n# 输出约束\n只输出 JSON 对象：{{\"selections\":[{{\"candidate_id\":1,\"category\":\"core|supporting|conflict\",\"reason\":\"不超过80字的筛选理由\"}}]}}。\n- `candidate_id` 必须来自候选证据，不能新增。\n- `core` 表示后续 Agent 应直接使用的关键历史证据；`supporting` 表示保守保留的辅助证据；`conflict` 表示候选证明当前材料可能与历史冲突。\n- 没有相关候选时返回 `{{\"selections\":[]}}`。\n- 不得输出摘要、改写后的原文、未在候选中出现的事实或来源。"
+    )
+}
+
+fn parse_rerank_plan(raw: &str, candidate_count: usize) -> AppResult<Vec<RerankSelection>> {
+    let cleaned = raw
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| raw.trim().strip_prefix("```"))
+        .unwrap_or(raw.trim())
+        .trim_end_matches("```")
+        .trim();
+    let plan: RerankPlan = serde_json::from_str(cleaned)?;
+    let mut selections = Vec::new();
+    let mut seen = HashSet::new();
+    for mut selection in plan.selections {
+        selection.category = selection.category.trim().to_ascii_lowercase();
+        selection.reason = selection.reason.trim().to_string();
+        if selection.candidate_id == 0
+            || selection.candidate_id > candidate_count
+            || !matches!(
+                selection.category.as_str(),
+                "core" | "supporting" | "conflict"
+            )
+            || selection.reason.is_empty()
+            || selection.reason.chars().count() > 160
+            || !seen.insert(selection.candidate_id)
+        {
+            return Err(AppError::Validation(
+                "上下文筛选器返回了无效候选选择".to_string(),
+            ));
+        }
+        selections.push(selection);
+    }
+    Ok(selections)
+}
+
+fn selections_to_agent_snippets(
+    snippets: &[(SearchRequest, StoryContextSnippet)],
+    selections: &[RerankSelection],
+) -> Vec<RerankedSearchSnippet> {
+    selections
+        .iter()
+        .filter_map(|selection| {
+            let (search, snippet) = snippets.get(selection.candidate_id - 1)?.clone();
+            Some(RerankedSearchSnippet {
+                search,
+                snippet,
+                category: selection.category.clone(),
+                reason: selection.reason.clone(),
+            })
+        })
+        .collect()
+}
+
+fn selections_to_public(
+    candidates: &[StoryContextSnippet],
+    selections: &[RerankSelection],
+) -> Vec<StoryContextRerankedSnippet> {
+    selections
+        .iter()
+        .filter_map(|selection| {
+            let snippet = candidates.get(selection.candidate_id - 1)?;
+            Some(StoryContextRerankedSnippet {
+                candidate_id: selection.candidate_id,
+                source_label: snippet.source_label.clone(),
+                matched_term: snippet.matched_term.clone(),
+                content: snippet.content.clone(),
+                score: snippet.score,
+                category: selection.category.clone(),
+                reason: selection.reason.clone(),
+            })
+        })
+        .collect()
+}
+
+fn raw_agent_rerank_fallback(
+    snippets: &[(SearchRequest, StoryContextSnippet)],
+) -> Vec<RerankedSearchSnippet> {
+    snippets
+        .iter()
+        .cloned()
+        .map(|(search, snippet)| RerankedSearchSnippet {
+            search,
+            snippet,
+            category: "supporting".to_string(),
+            reason: "AI 筛选不可用，保留原始候选".to_string(),
+        })
+        .collect()
+}
+
+fn raw_rerank_fallback(
+    candidates: Vec<StoryContextSnippet>,
+    error: String,
+) -> StoryContextRerankResult {
+    let selected = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, snippet)| StoryContextRerankedSnippet {
+            candidate_id: index + 1,
+            source_label: snippet.source_label.clone(),
+            matched_term: snippet.matched_term.clone(),
+            content: snippet.content.clone(),
+            score: snippet.score,
+            category: "supporting".to_string(),
+            reason: "AI 筛选不可用，保留原始候选".to_string(),
+        })
+        .collect();
+    StoryContextRerankResult {
+        candidates,
+        selected,
+        status: "fallback".to_string(),
+        error: Some(error),
+    }
+}
+
 fn prior_ledger_catalog(
     state: &AppState,
     project_id: i64,
@@ -550,7 +933,7 @@ fn matching_story_fact_hits(
 fn render_tool_context(
     stage: &Stage,
     searches: &[SearchRequest],
-    snippets: &[(SearchRequest, StoryContextSnippet)],
+    snippets: &[RerankedSearchSnippet],
     ledger_hits: &[LedgerHit],
     fact_hits: &[StoryFactHit],
 ) -> String {
@@ -564,11 +947,16 @@ fn render_tool_context(
         ));
     }
     if !snippets.is_empty() {
-        output.push_str("\n\n## search_story_context 命中");
-        for (search, snippet) in snippets {
+        output.push_str("\n\n## 筛选后的历史证据");
+        for selected in snippets {
             output.push_str(&format!(
-                "\n- 查询 `{}` -> [{}] 命中 `{}`：{}",
-                search.query, snippet.source_label, snippet.matched_term, snippet.content
+                "\n- [{}] 查询 `{}` -> [{}] 命中 `{}`：{}（筛选理由：{}）",
+                selected.category,
+                selected.search.query,
+                selected.snippet.source_label,
+                selected.snippet.matched_term,
+                selected.snippet.content,
+                selected.reason,
             ));
         }
     }
@@ -804,5 +1192,47 @@ mod tests {
             state.get_artifact(pending_past.id).unwrap().status,
             "pending_human_approval"
         );
+    }
+
+    #[test]
+    fn reranker_accepts_only_valid_candidate_ids_and_categories() {
+        let raw = r#"{"selections":[
+            {"candidate_id":2,"category":"core","reason":"直接说明物件当前归属"},
+            {"candidate_id":1,"category":"supporting","reason":"补充前置事件"}
+        ]}"#;
+        let selections = parse_rerank_plan(raw, 2).unwrap();
+        assert_eq!(selections.len(), 2);
+        assert_eq!(selections[0].candidate_id, 2);
+        assert_eq!(selections[0].category, "core");
+    }
+
+    #[test]
+    fn reranker_rejects_invented_duplicate_or_unknown_selections() {
+        let invented = r#"{"selections":[{"candidate_id":3,"category":"core","reason":"不存在"}]}"#;
+        assert!(parse_rerank_plan(invented, 2).is_err());
+
+        let duplicate = r#"{"selections":[
+            {"candidate_id":1,"category":"core","reason":"一"},
+            {"candidate_id":1,"category":"supporting","reason":"二"}
+        ]}"#;
+        assert!(parse_rerank_plan(duplicate, 2).is_err());
+
+        let invalid_category =
+            r#"{"selections":[{"candidate_id":1,"category":"summary","reason":"非法分类"}]}"#;
+        assert!(parse_rerank_plan(invalid_category, 2).is_err());
+    }
+
+    #[test]
+    fn reranker_fallback_preserves_original_evidence() {
+        let candidates = vec![StoryContextSnippet {
+            source_label: "第 1 章".to_string(),
+            matched_term: "黑牌".to_string(),
+            content: "黑牌被封入石匣。".to_string(),
+            score: 10,
+        }];
+        let fallback = raw_rerank_fallback(candidates, "模型不可用".to_string());
+        assert_eq!(fallback.status, "fallback");
+        assert_eq!(fallback.selected.len(), 1);
+        assert_eq!(fallback.selected[0].content, "黑牌被封入石匣。");
     }
 }

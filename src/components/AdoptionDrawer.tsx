@@ -2,6 +2,7 @@ import { Check, Edit3, Loader2, RefreshCcw, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import type { AdoptionProposal, Chapter, Foreshadowing, KnowledgeCard } from "../types";
+import { Select } from "./Select";
 
 type Props = {
   open: boolean;
@@ -139,28 +140,36 @@ export function AdoptionDrawer({
                 </div>
 
                 {proposal.target_kind === "knowledge_card" && (
-                  <select value={text(data, "category")} onChange={(event) => setField(proposal.id, "category", event.target.value)}>
-                    {categories.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                  </select>
+                  <Select
+                    value={text(data, "category")}
+                    onChange={(value) => setField(proposal.id, "category", value)}
+                    options={categories.map(([value, label]) => ({ value, label }))}
+                  />
                 )}
                 <input value={text(data, "title")} onChange={(event) => setField(proposal.id, "title", event.target.value)} placeholder="标题" />
                 <textarea rows={5} value={text(data, "content")} onChange={(event) => setField(proposal.id, "content", event.target.value)} placeholder="确认后的事实内容" />
 
                 {proposal.target_kind === "knowledge_card" ? (
-                  <select value={optionalId(data, "source_chapter_id")} onChange={(event) => setField(proposal.id, "source_chapter_id", Number(event.target.value) || null)}>
-                    <option value="">不绑定章节</option>
-                    {chapters.map((chapter) => <option value={chapter.id} key={chapter.id}>{chapter.title}</option>)}
-                  </select>
+                  <Select
+                    value={String(optionalId(data, "source_chapter_id"))}
+                    onChange={(value) => setField(proposal.id, "source_chapter_id", Number(value) || null)}
+                    options={[
+                      { value: "", label: "不绑定章节" },
+                      ...chapters.map((chapter) => ({ value: String(chapter.id), label: chapter.title })),
+                    ]}
+                  />
                 ) : (
                   <div className="adoption-fields-row">
-                    <select value={optionalId(data, "planted_chapter_id")} onChange={(event) => setField(proposal.id, "planted_chapter_id", Number(event.target.value) || null)}>
-                      <option value="">埋设章节未指定</option>
-                      {chapters.map((chapter) => <option value={chapter.id} key={chapter.id}>{chapter.title}</option>)}
-                    </select>
-                    <select value={optionalId(data, "planned_payoff_chapter_id")} onChange={(event) => setField(proposal.id, "planned_payoff_chapter_id", Number(event.target.value) || null)}>
-                      <option value="">回收章节未指定</option>
-                      {chapters.map((chapter) => <option value={chapter.id} key={chapter.id}>{chapter.title}</option>)}
-                    </select>
+                    <Select
+                      value={String(optionalId(data, "planted_chapter_id"))}
+                      onChange={(value) => setField(proposal.id, "planted_chapter_id", Number(value) || null)}
+                      options={[{ value: "", label: "埋设章节未指定" }, ...chapters.map((chapter) => ({ value: String(chapter.id), label: chapter.title }))]}
+                    />
+                    <Select
+                      value={String(optionalId(data, "planned_payoff_chapter_id"))}
+                      onChange={(value) => setField(proposal.id, "planned_payoff_chapter_id", Number(value) || null)}
+                      options={[{ value: "", label: "回收章节未指定" }, ...chapters.map((chapter) => ({ value: String(chapter.id), label: chapter.title }))]}
+                    />
                     <input value={text(data, "planned_payoff_note")} onChange={(event) => setField(proposal.id, "planned_payoff_note", event.target.value)} placeholder="回收里程碑" />
                   </div>
                 )}
