@@ -233,16 +233,19 @@ pub async fn refresh_knowledge_card(
         .into_iter()
         .find(|card| card.id == card_id && card.status == "approved")
     {
+        let chapter_id = existing_chapter_id(state, project_id, card.source_chapter_id)?;
+        let source_artifact_id =
+            existing_artifact_id(state, project_id, card.source_artifact_id)?;
         replace_source_with_runtime(
             state,
             &SearchSourcePayload {
                 project_id,
                 source_kind: "knowledge_card",
                 source_id: card.id,
-                chapter_id: card.source_chapter_id,
-                chapter_no_sort: chapter_no(state, project_id, card.source_chapter_id)?,
+                chapter_id,
+                chapter_no_sort: chapter_no(state, project_id, chapter_id)?,
                 stage: None,
-                source_artifact_id: card.source_artifact_id,
+                source_artifact_id,
                 title: card.title.clone(),
                 content: card.content,
                 search_label: format!("知识卡：{}", card.title),
@@ -275,16 +278,19 @@ pub async fn refresh_foreshadowing(
                 )
         })
     {
+        let chapter_id = existing_chapter_id(state, project_id, item.planted_chapter_id)?;
+        let source_artifact_id =
+            existing_artifact_id(state, project_id, item.source_artifact_id)?;
         replace_source_with_runtime(
             state,
             &SearchSourcePayload {
                 project_id,
                 source_kind: "foreshadowing",
                 source_id: item.id,
-                chapter_id: item.planted_chapter_id,
-                chapter_no_sort: chapter_no(state, project_id, item.planted_chapter_id)?,
+                chapter_id,
+                chapter_no_sort: chapter_no(state, project_id, chapter_id)?,
                 stage: None,
-                source_artifact_id: item.source_artifact_id,
+                source_artifact_id,
                 title: item.title.clone(),
                 content: item.content,
                 search_label: format!("伏笔：{}", item.title),
@@ -674,14 +680,17 @@ fn collect_project_sources(
         .into_iter()
         .filter(|card| card.status == "approved")
     {
+        let chapter_id = existing_chapter_id(state, project_id, card.source_chapter_id)?;
+        let source_artifact_id =
+            existing_artifact_id(state, project_id, card.source_artifact_id)?;
         sources.push(SearchSourcePayload {
             project_id,
             source_kind: "knowledge_card",
             source_id: card.id,
-            chapter_id: card.source_chapter_id,
-            chapter_no_sort: chapter_no(state, project_id, card.source_chapter_id)?,
+            chapter_id,
+            chapter_no_sort: chapter_no(state, project_id, chapter_id)?,
             stage: None,
-            source_artifact_id: card.source_artifact_id,
+            source_artifact_id,
             title: card.title.clone(),
             content: card.content,
             search_label: format!("知识卡：{}", card.title),
@@ -701,14 +710,17 @@ fn collect_project_sources(
             )
         })
     {
+        let chapter_id = existing_chapter_id(state, project_id, item.planted_chapter_id)?;
+        let source_artifact_id =
+            existing_artifact_id(state, project_id, item.source_artifact_id)?;
         sources.push(SearchSourcePayload {
             project_id,
             source_kind: "foreshadowing",
             source_id: item.id,
-            chapter_id: item.planted_chapter_id,
-            chapter_no_sort: chapter_no(state, project_id, item.planted_chapter_id)?,
+            chapter_id,
+            chapter_no_sort: chapter_no(state, project_id, chapter_id)?,
             stage: None,
-            source_artifact_id: item.source_artifact_id,
+            source_artifact_id,
             title: item.title.clone(),
             content: item.content,
             search_label: format!("伏笔：{}", item.title),
@@ -841,7 +853,12 @@ pub(crate) fn invalidate_chapters_from_tx(
     Ok(())
 }
 
-fn delete_source(conn: &Connection, project_id: i64, kind: &str, source_id: i64) -> AppResult<()> {
+pub(crate) fn delete_source(
+    conn: &Connection,
+    project_id: i64,
+    kind: &str,
+    source_id: i64,
+) -> AppResult<()> {
     if table_exists(conn, "story_search_embeddings")? {
         conn.execute(
             "DELETE FROM story_search_embeddings WHERE rowid IN
@@ -1108,6 +1125,53 @@ fn chapter_no(
         .into_iter()
         .find(|chapter| chapter.id == chapter_id)
         .map(|chapter| chapter.chapter_no))
+}
+
+/// Resolves an optional FK target to `Some(id)` only if that row still exists in
+/// the project. Returns `None` otherwise so callers can fall back to a NULL FK
+/// column instead of failing the write with `FOREIGN KEY constraint failed`.
+/// This guards against stale references left behind by older or migrated data
+/// where the cascade that would normally null them out never ran.
+fn existing_chapter_id(
+    state: &AppState,
+    project_id: i64,
+    chapter_id: Option<i64>,
+) -> AppResult<Option<i64>> {
+    let Some(chapter_id) = chapter_id else {
+        return Ok(None);
+    };
+    let exists: bool = state.with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM chapters WHERE id = ?1 AND project_id = ?2",
+                params![chapter_id, project_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|value| value.is_some())?)
+    })?;
+    Ok(if exists { Some(chapter_id) } else { None })
+}
+
+fn existing_artifact_id(
+    state: &AppState,
+    project_id: i64,
+    artifact_id: Option<i64>,
+) -> AppResult<Option<i64>> {
+    let Some(artifact_id) = artifact_id else {
+        return Ok(None);
+    };
+    let exists: bool = state.with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM artifacts WHERE id = ?1 AND project_id = ?2",
+                params![artifact_id, project_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|value| value.is_some())?)
+    })?;
+    Ok(if exists { Some(artifact_id) } else { None })
 }
 
 fn table_exists(conn: &Connection, table: &str) -> AppResult<bool> {

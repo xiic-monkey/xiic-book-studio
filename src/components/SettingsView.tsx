@@ -23,7 +23,6 @@ import type {
   AiSettings,
   AgentToolDefinition,
   GenreAgentProfile,
-  LegacyAgentPrompt,
   ModelInfo,
   ProviderCapabilities,
   SaveAiProvider,
@@ -68,8 +67,6 @@ function agentDraftFromAgent(agent: Agent): AgentDraft {
   };
 }
 
-const LEGACY_PROVIDER_STORAGE_KEY = "xiic-book-studio.ai-providers.v1";
-
 function normalizeBaseUrl(baseUrl: string) {
   return baseUrl.trim();
 }
@@ -86,36 +83,6 @@ function normalizeProvider(provider: Partial<ProviderConfig>, index: number): Pr
     tool_protocol: provider.tool_protocol ?? "auto",
     has_api_key: Boolean(provider.has_api_key),
   };
-}
-
-function readLegacyProviders(): SaveAiProvider[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(LEGACY_PROVIDER_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .map((provider) => ({
-        id: null,
-        label: typeof provider?.label === "string" ? provider.label.trim() : "",
-        base_url: typeof provider?.baseUrl === "string" ? provider.baseUrl.trim() : "",
-        model: typeof provider?.model === "string" ? provider.model.trim() : "",
-        temperature: Number(provider?.temperature),
-        thinking_enabled: Boolean(provider?.thinkingEnabled),
-        thinking_level: (Boolean(provider?.thinkingEnabled) ? "medium" : "off") as ThinkingLevel,
-        tool_protocol: "auto" as ToolProtocol,
-      }))
-      .filter(
-        (provider) =>
-          provider.label &&
-          provider.base_url &&
-          provider.model &&
-          Number.isFinite(provider.temperature)
-      );
-  } catch {
-    return [];
-  }
 }
 
 function buildProviderFromSettings(settings: AiSettings): ProviderConfig {
@@ -213,7 +180,6 @@ interface SettingsViewProps {
   onRebuildStorySearch: () => Promise<void>;
   agents: Agent[];
   agentTools: AgentToolDefinition[];
-  legacyAgentPrompts: LegacyAgentPrompt[];
   genreAgent?: GenreAgentProfile | null;
   writingSkills: WritingSkill[];
   onSaveWritingSkill: (input: SaveWritingSkill) => Promise<void>;
@@ -244,7 +210,6 @@ export function SettingsView({
   onRebuildStorySearch,
   agents,
   agentTools,
-  legacyAgentPrompts,
   genreAgent,
   writingSkills,
   onSaveWritingSkill,
@@ -258,7 +223,6 @@ export function SettingsView({
   const [providers, setProviders] = useState<ProviderConfig[]>(initialProviderState.providers);
   const [selectedProviderId, setSelectedProviderId] = useState(initialProviderState.selectedProviderId);
   const providerCatalogInitialized = useRef(savedProviders.length > 0);
-  const legacyMigrationStarted = useRef(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
@@ -275,6 +239,32 @@ export function SettingsView({
   const [localStorySearchStatus, setLocalStorySearchStatus] = useState<StorySearchStatus | null>(
     storySearchStatus ?? null
   );
+  const isTestingConnection = busy === "测试连接";
+  const isConnectionSuccessNotice = notice?.startsWith("连接成功：") ?? false;
+  const [testConnectionToast, setTestConnectionToast] = useState<string | null>(null);
+  const [errorToast, setErrorToast] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!notice || !isConnectionSuccessNotice) {
+      setTestConnectionToast(null);
+      return;
+    }
+
+    setTestConnectionToast(notice);
+    const timer = window.setTimeout(() => setTestConnectionToast(null), 2500);
+    return () => window.clearTimeout(timer);
+  }, [isConnectionSuccessNotice, notice]);
+
+  useEffect(() => {
+    if (!error) {
+      setErrorToast(null);
+      return;
+    }
+
+    setErrorToast(error);
+    const timer = window.setTimeout(() => setErrorToast(null), 2500);
+    return () => window.clearTimeout(timer);
+  }, [error]);
 
   useEffect(() => {
     const nextProviderState = buildProviderState(settings, savedProviders);
@@ -323,31 +313,6 @@ export function SettingsView({
       .then((status) => setLocalStorySearchStatus(status))
       .catch(() => setLocalStorySearchStatus(null));
   }, [projectId]);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || legacyMigrationStarted.current || savedProviders.length === 0) return;
-    const legacyProviders = readLegacyProviders();
-    legacyMigrationStarted.current = true;
-    if (legacyProviders.length === 0) {
-      window.localStorage.removeItem(LEGACY_PROVIDER_STORAGE_KEY);
-      return;
-    }
-
-    let cancelled = false;
-    void (async () => {
-      for (const provider of legacyProviders) {
-        if (cancelled) return;
-        const saved = await onSaveProvider(provider);
-        if (!saved) return;
-      }
-      if (!cancelled) {
-        window.localStorage.removeItem(LEGACY_PROVIDER_STORAGE_KEY);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [onSaveProvider, savedProviders.length]);
 
   useEffect(() => {
     if (writingSkills.length === 0) {
@@ -626,10 +591,6 @@ export function SettingsView({
       case "ai":
         return (
           <div className="settings-content">
-            <div className="settings-intro">
-              <p>集中管理 AI 服务供应商、模型参数和访问凭据。</p>
-              <span>配置只影响本地工作台，不会写入书籍项目文件。</span>
-            </div>
             <div className="settings-section">
               <h3>服务配置</h3>
               <div className="form-field">
@@ -670,7 +631,7 @@ export function SettingsView({
                   type="text"
                   value={currentProvider?.label ?? ""}
                   onChange={(e) => updateCurrentProvider({ label: e.target.value })}
-                  placeholder="例如：官方服务 / 自定义服务"
+                  placeholder="服务名称"
                 />
               </div>
               <div className="form-field">
@@ -699,7 +660,7 @@ export function SettingsView({
                         updateCurrentProvider({ model: value });
                       }}
                       options={[
-                        { value: "", label: "手动输入模型名" },
+                        { value: "", label: "自定义模型" },
                         ...(aiSettings.model && !models.some((model) => model.id === aiSettings.model)
                           ? [{ id: aiSettings.model, owned_by: null }, ...models]
                           : models
@@ -722,10 +683,9 @@ export function SettingsView({
                       setAiSettings({ ...aiSettings, model: value });
                       updateCurrentProvider({ model: value });
                     }}
-                    placeholder="也可直接手动输入模型名"
+                    placeholder="模型名称"
                   />
                   <div className="settings-hint-row">
-                    <span>模型列表通过当前 Base URL 的 `/models` 手动刷新。</span>
                     {loadingModels && <span>正在拉取模型列表…</span>}
                     {!loadingModels && models.length > 0 && <span>已获取 {models.length} 个模型</span>}
                     {modelError && <span className="settings-error">{modelError}</span>}
@@ -764,7 +724,7 @@ export function SettingsView({
                       updateCurrentProvider({ thinking_enabled: value, thinking_level });
                     }}
                   />
-                  <span>开启供应商支持的思考能力</span>
+                  <span>启用思考</span>
                 </label>
                 <div className="form-field">
                   <label htmlFor="thinking_level">思考强度</label>
@@ -792,9 +752,6 @@ export function SettingsView({
                     ]}
                   />
                 </div>
-                <div className="settings-hint-row">
-                  <span>不同供应商对思考强度的支持不同；不支持分级时会降级为开启/关闭。</span>
-                </div>
               </div>
               <div className="form-field">
                 <label htmlFor="tool_protocol">工具调用协议</label>
@@ -803,14 +760,11 @@ export function SettingsView({
                   value={currentProvider?.tool_protocol ?? "auto"}
                   onChange={(value) => updateCurrentProvider({ tool_protocol: value as ToolProtocol })}
                   options={[
-                    { value: "auto", label: "自动（原生优先，明确不支持时回退）" },
+                    { value: "auto", label: "自动" },
                     { value: "native", label: "仅原生 tool calling" },
                     { value: "structured", label: "仅结构化 JSON 计划" },
                   ]}
                 />
-                <div className="settings-hint-row">
-                  <span>认证、限流、超时或服务端错误不会触发自动回退。</span>
-                </div>
                 <div className="settings-hint-row">
                   {loadingProviderCapabilities && <span>正在读取运行时能力状态…</span>}
                   {!loadingProviderCapabilities && providerCapabilities && (
@@ -837,19 +791,16 @@ export function SettingsView({
                   id="api_key"
                   type="password"
                   value={localApiKey}
-                  placeholder="输入新 Key，留空则保留该供应商已保存的 Key"
+                  placeholder="新 Key（留空保留）"
                   onChange={(e) => setLocalApiKey(e.target.value)}
                 />
-                <div className="settings-hint-row">
-                  <span>API Key 会按供应商地址直接保存在本地 SQLite 中。</span>
-                </div>
               </div>
               <div className="button-row">
                 <button onClick={handleSaveAi} disabled={Boolean(busy)} className="btn-primary">
                   {busy === "保存设置" ? <Loader2 size={14} className="spin" /> : <><KeyRound size={14} /> 保存</>}
                 </button>
                 <button onClick={handleTestConnection} disabled={Boolean(busy)}>
-                  <RefreshCcw size={14} /> 测试连接
+                  {isTestingConnection ? <><Loader2 size={14} className="spin" /> 测试中…</> : <><RefreshCcw size={14} /> 测试连接</>}
                 </button>
               </div>
             </div>
@@ -859,10 +810,6 @@ export function SettingsView({
       case "agents":
         return (
           <div className="settings-content wide">
-            <div className="settings-intro">
-              <p>这里统一管理每个 Agent 的身份、模型参数、思考强度、工具和 Skill 白名单。</p>
-              <span>供应商、模型和思考模式可以继承全局服务配置；Temperature、工具和辅助 Skill 按 Agent 单独保存。</span>
-            </div>
             {genreAgent && (
               <section className="agent-prompt-card agent-profile-card">
                 <header>
@@ -879,9 +826,6 @@ export function SettingsView({
                 <p>{genreAgent.allowed_skill_keys.join(" · ")}</p>
               </section>
             )}
-            <p className="settings-hint agent-settings-note">
-              题材 Agent 是当前项目共享的身份层；每个运行 Agent 下面的配置都会直接影响实际工作流。
-            </p>
             {agentModelError && <p className="settings-error">{agentModelError}</p>}
             <div className="agent-settings-layout">
               <nav className="agent-list" aria-label="Agent 列表">
@@ -1004,7 +948,7 @@ export function SettingsView({
                             className="agent-model-select"
                             value={draft.model}
                             disabled={draft.uses_global_runtime_settings}
-                            placeholder="从已获取的模型中选择"
+                            placeholder="选择模型"
                             onChange={(model) => updateAgentDraft(agent, { model })}
                             options={availableModels.map((model) => ({
                               value: model.id,
@@ -1071,7 +1015,7 @@ export function SettingsView({
                         <label>可用工具</label>
                         <div className="agent-checkbox-list">
                           {agentTools.map((tool) => (
-                            <label className="checkbox-field" key={tool.key} title={tool.description}>
+                            <label className="checkbox-field" key={tool.key}>
                               <input
                                 type="checkbox"
                                 checked={draft.enabled_tool_keys.includes(tool.key)}
@@ -1097,7 +1041,7 @@ export function SettingsView({
                           {writingSkills
                             .filter((skill) => skill.enabled)
                             .map((skill) => (
-                              <label className="checkbox-field" key={skill.skill_key} title={skill.description}>
+                              <label className="checkbox-field" key={skill.skill_key}>
                                 <input
                                   type="checkbox"
                                   checked={draft.allowed_skill_keys.includes(skill.skill_key)}
@@ -1156,32 +1100,9 @@ export function SettingsView({
                   </section>
                 );
               })()}
-              {!selectedAgent && <p className="settings-hint">选择一个书籍项目后查看 Agent 配置。</p>}
+              {!selectedAgent && <p className="settings-hint">未选择项目</p>}
               </div>
             </div>
-            {legacyAgentPrompts.length > 0 && (
-              <section className="settings-section legacy-prompt-archive">
-                <h3>旧版 Prompt 归档</h3>
-                <p className="settings-hint">这些 Prompt 仅供查看和手动复制，不会参与 V2 Agent 运行。</p>
-                {legacyAgentPrompts.map((prompt) => (
-                  <details key={prompt.id} className="context-preview-section">
-                    <summary>
-                      <span>{prompt.name} · {prompt.stage}</span>
-                      <small>{prompt.imported_at}</small>
-                    </summary>
-                    <pre>{prompt.system_prompt}</pre>
-                    <div className="button-row legacy-prompt-actions">
-                      <button
-                        type="button"
-                        onClick={() => void navigator.clipboard.writeText(prompt.system_prompt)}
-                      >
-                        复制 Prompt
-                      </button>
-                    </div>
-                  </details>
-                ))}
-              </section>
-            )}
           </div>
         );
 
@@ -1190,7 +1111,7 @@ export function SettingsView({
           <div className="settings-content">
             <div className="settings-section">
               <h3>编辑器偏好</h3>
-              <p className="settings-hint">编辑器相关设置将在后续版本中开放</p>
+              <p className="settings-hint">暂无设置</p>
             </div>
           </div>
         );
@@ -1270,7 +1191,7 @@ export function SettingsView({
                     </div>
                   </div>
                 ) : (
-                  <p className="settings-hint">技能库还没有内容</p>
+                  <p className="settings-hint">暂无技能</p>
                 )}
               </div>
             </div>
@@ -1312,14 +1233,10 @@ export function SettingsView({
                     <strong>{localStorySearchStatus.last_indexed_at ?? "尚未建立"}</strong>
                   </div>
                 ) : (
-                  <p className="settings-hint">
-                    {projectId ? "正在读取当前项目的本地检索状态" : "选择书籍项目后查看本地检索状态"}
-                  </p>
+                  <p className="settings-hint">{projectId ? "读取中…" : "未选择项目"}</p>
                 )}
                 {localStorySearchStatus?.stale && (
-                  <p className="local-search-stale">
-                    有 {localStorySearchStatus.stale_sources} 个来源因正文更新而等待重建。
-                  </p>
+                  <p className="local-search-stale">待重建：{localStorySearchStatus.stale_sources}</p>
                 )}
               </div>
             </div>
@@ -1331,7 +1248,7 @@ export function SettingsView({
           <div className="settings-content">
             <div className="settings-section">
               <h3>外观设置</h3>
-              <p className="settings-hint">主题、字体大小等设置将在后续版本中开放</p>
+              <p className="settings-hint">暂无设置</p>
             </div>
           </div>
         );
@@ -1343,6 +1260,18 @@ export function SettingsView({
 
   return (
     <div className="settings-view">
+      {testConnectionToast && (
+        <div className="settings-toast settings-toast-success" role="status" aria-live="polite">
+          <Check size={14} />
+          <span>{testConnectionToast}</span>
+        </div>
+      )}
+      {errorToast && (
+        <div className="settings-toast settings-toast-error" role="alert" aria-live="assertive">
+          <AlertCircle size={14} />
+          <span>{errorToast}</span>
+        </div>
+      )}
       <aside className="settings-sidebar">
         <header className="settings-sidebar-header">
           <button className="back-btn" onClick={onBack}>
@@ -1370,14 +1299,13 @@ export function SettingsView({
           <h2>{categories.find((c) => c.id === settingsCategory)?.label}</h2>
         </header>
         <div className="settings-main-body">
-          {(notice || error || busy) && (
+          {(busy && !isTestingConnection) || (notice && !isConnectionSuccessNotice) ? (
             <div className={`status-banner ${error ? "error" : ""}`}>
-              {busy && <Loader2 size={14} className="spin" />}
-              {error && <AlertCircle size={14} />}
+              {busy && !isTestingConnection && <Loader2 size={14} className="spin" />}
               {notice && !error && !busy && <Check size={14} />}
               <span>{busy ?? error ?? notice}</span>
             </div>
-          )}
+          ) : null}
           {renderCategoryContent()}
         </div>
       </main>

@@ -2,12 +2,12 @@ use crate::{
     agent_run_service,
     db::AppState,
     error::{AppError, AppResult},
+    index_jobs,
     models::{
         ActionProposal, ActiveAgentRun, Agent, AgentRunRequest, AgentRunSummary, Artifact,
         ArtifactFilters, ArtifactSummary, DecideActionProposalRequest, DerivedIndexJob,
-        LegacyAgentPrompt, ListActionProposalsRequest, PreparedContext, ProjectWorkspace,
-        ProposalApplyResult, ProviderCapabilities, RevisionRequest, RunEvent,
-        RunStoryArchitectRequest,
+        ListActionProposalsRequest, PreparedContext, ProjectWorkspace, ProposalApplyResult,
+        ProviderCapabilities, RevisionRequest, RunEvent, RunStoryArchitectRequest,
     },
 };
 
@@ -79,6 +79,7 @@ impl ApplicationGateway {
             project,
             genre_agent: self.state.get_genre_agent_for_project(project_id)?,
             chapters: self.state.list_chapters(project_id)?,
+            formal_char_count: self.state.formal_char_count(project_id)?,
             artifacts: self.state.list_artifact_summaries(ArtifactFilters {
                 project_id,
                 stage: None,
@@ -121,10 +122,6 @@ impl ApplicationGateway {
         self.state.list_derived_index_jobs(project_id)
     }
 
-    pub fn list_legacy_agent_prompts(&self) -> AppResult<Vec<LegacyAgentPrompt>> {
-        self.state.list_legacy_agent_prompts()
-    }
-
     pub fn get_provider_capabilities(
         &self,
         provider_base_url: &str,
@@ -144,8 +141,20 @@ impl ApplicationGateway {
         &self,
         input: DecideActionProposalRequest,
     ) -> AppResult<ProposalApplyResult> {
-        self.state
-            .apply_action_proposal(input.project_id, input.proposal_id, &input.note)
+        let result =
+            self.state
+                .apply_action_proposal(input.project_id, input.proposal_id, &input.note)?;
+        if matches!(
+            result.proposal.proposal_type.as_str(),
+            "knowledge_card" | "knowledge_card_update" | "knowledge_card_delete"
+        ) {
+            if let Err(error) =
+                index_jobs::enqueue_project_search_job(&self.state, input.project_id)
+            {
+                eprintln!("knowledge card search refresh unavailable: {error}");
+            }
+        }
+        Ok(result)
     }
 
     pub fn reject_action_proposal(
@@ -166,7 +175,55 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
-    use crate::models::NewProject;
+    use crate::{index_jobs, models::NewProject};
+
+    #[test]
+    fn applying_a_knowledge_card_proposal_queues_search_rebuild() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "资料卡索引测试".to_string(),
+                genre: "测试".to_string(),
+                target_words: 10_000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        assert!(state
+            .list_derived_index_jobs(project.id)
+            .unwrap()
+            .iter()
+            .all(|job| job.job_type != index_jobs::SEARCH_PROJECT_JOB));
+        let proposal = state
+            .create_action_proposal(
+                project.id,
+                None,
+                None,
+                "knowledge_card",
+                "创建资料卡",
+                &serde_json::json!({
+                    "category": "world",
+                    "title": "新资料",
+                    "content": "等待建立检索索引"
+                }),
+                None,
+            )
+            .unwrap();
+
+        ApplicationGateway::new(state.clone())
+            .apply_action_proposal(DecideActionProposalRequest {
+                project_id: project.id,
+                proposal_id: proposal.id,
+                note: "确认".to_string(),
+            })
+            .unwrap();
+
+        assert!(state
+            .list_derived_index_jobs(project.id)
+            .unwrap()
+            .iter()
+            .any(|job| job.job_type == index_jobs::SEARCH_PROJECT_JOB));
+    }
 
     #[test]
     fn project_workspace_omits_large_bodies_and_run_prompts() {
@@ -246,5 +303,45 @@ mod tests {
         assert!(!text.contains("ARTIFACT_BODY_SENTINEL"));
         assert!(!text.contains("WORKFLOW_PROMPT_SENTINEL"));
         assert!(!text.contains("WORKFLOW_OUTPUT_SENTINEL"));
+    }
+
+    #[test]
+    fn formal_char_count_uses_current_approved_artifacts_only() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "字数统计".into(),
+                genre: "测试".into(),
+                target_words: 10_000,
+                premise: "统计".into(),
+            })
+            .unwrap();
+        state.with_conn(|conn| {
+            for chapter_no in 2..=3_i64 {
+                conn.execute(
+                    "INSERT INTO chapters (project_id, chapter_no, title, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'writing', 't', 't')",
+                    params![project.id, chapter_no, format!("第{chapter_no}章")],
+                )?;
+            }
+            let chapters = state.list_chapters(project.id)?;
+            conn.execute(
+                "INSERT INTO artifacts (project_id, chapter_id, stage, title, content, version, status, created_at)
+                 VALUES (?1, ?2, 'draft', '正式', '甲 乙\n丙', 1, 'approved', 't')",
+                params![project.id, chapters[0].id],
+            )?;
+            let approved_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO artifacts (project_id, chapter_id, stage, title, content, version, status, created_at)
+                 VALUES (?1, ?2, 'draft', '候选', '不应计入', 1, 'pending_review', 't')",
+                params![project.id, chapters[1].id],
+            )?;
+            let pending_id = conn.last_insert_rowid();
+            conn.execute("UPDATE chapters SET current_artifact_id = ?1 WHERE id = ?2", params![approved_id, chapters[0].id])?;
+            conn.execute("UPDATE chapters SET current_artifact_id = ?1 WHERE id = ?2", params![pending_id, chapters[1].id])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(state.formal_char_count(project.id).unwrap(), 3);
     }
 }

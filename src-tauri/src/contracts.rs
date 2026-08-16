@@ -1,5 +1,4 @@
 pub const V2_COMMANDS: &[(&str, &str)] = &[
-    ("listToolDefinitions", "list_tool_definitions"),
     ("previewAgentRun", "preview_agent_run"),
     ("startAgentRun", "start_agent_run"),
     ("startStoryArchitectRun", "start_story_architect_run"),
@@ -15,7 +14,6 @@ pub const V2_COMMANDS: &[(&str, &str)] = &[
     ("listActionProposals", "list_action_proposals_v2"),
     ("applyActionProposal", "apply_action_proposal"),
     ("rejectActionProposal", "reject_action_proposal"),
-    ("listLegacyAgentPrompts", "list_legacy_agent_prompts"),
     ("getProviderCapabilities", "get_provider_capabilities"),
     ("resetAgentPrompt", "reset_agent_prompt"),
 ];

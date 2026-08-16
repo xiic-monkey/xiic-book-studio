@@ -604,6 +604,32 @@ async fn execute_call(
             &call.arguments,
             None,
         ),
+        agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD => {
+            let card_id = required_i64(&call.arguments, "card_id")?;
+            let card = context
+                .state
+                .get_knowledge_card(context.project_id, card_id)?;
+            create_proposal(
+                context,
+                "knowledge_card_update",
+                &format!("更新知识卡 #{}", card_id),
+                &call.arguments,
+                Some(&card.updated_at),
+            )
+        }
+        agent_tools::PROPOSE_DELETE_KNOWLEDGE_CARD => {
+            let card_id = required_i64(&call.arguments, "card_id")?;
+            let card = context
+                .state
+                .get_knowledge_card(context.project_id, card_id)?;
+            create_proposal(
+                context,
+                "knowledge_card_delete",
+                &format!("删除知识卡 #{}", card_id),
+                &call.arguments,
+                Some(&card.updated_at),
+            )
+        }
         agent_tools::PROPOSE_FORESHADOWING => create_proposal(
             context,
             "foreshadowing",

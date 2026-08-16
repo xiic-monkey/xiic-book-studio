@@ -41,7 +41,7 @@ export function AgentRunInspector({
     <section className="agent-run-inspector">
       <header className="agent-run-inspector-head">
         <div>
-          <strong>Agent 运行明细</strong>
+          <strong>本次运行</strong>
           <span>
             {run ? `运行 #${run.run.id} · ${run.run.status}` : "当前项目"}
             {pendingProposals.length > 0 ? ` · ${pendingProposals.length} 条待确认提案` : ""}

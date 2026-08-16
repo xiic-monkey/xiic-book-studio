@@ -24,14 +24,13 @@ import type {
   ChapterUpdate,
   ClearChapterHistoryInput,
   DeleteArtifactInput,
+  DeleteKnowledgeCardInput,
   LedgerContinuityReport,
   ContinuityReport,
-  ContextPreview,
   DerivedIndexJob,
   Foreshadowing,
   HistoryCleanupResult,
   KnowledgeCard,
-  LegacyAgentPrompt,
   NewProject,
   NewChapter,
   ModelInfo,
@@ -144,7 +143,6 @@ export const api = {
     invokeCommand<void>("delete_ai_provider", { providerId }),
   listAgents: () => invokeCommand<Agent[]>("list_agents"),
   listAgentTools: () => invokeCommand<AgentToolDefinition[]>("list_agent_tools"),
-  listToolDefinitions: () => invokeCommand<AgentToolDefinition[]>(V2_COMMANDS.listToolDefinitions),
   getProviderCapabilities: (providerBaseUrl: string) =>
     invokeCommand<ProviderCapabilities>(V2_COMMANDS.getProviderCapabilities, { providerBaseUrl }),
   saveAgentSettings: (input: {
@@ -191,15 +189,6 @@ export const api = {
   }) => invokeCommand<string>("test_ai_connection", { input }),
   listModels: (input?: { base_url?: string | null; api_key?: string | null }) =>
     invokeCommand<ModelInfo[]>("list_models", { input }),
-  runAgentStep: (input: {
-    project_id: number;
-    stage: Stage;
-    chapter_id?: number | null;
-    user_instruction?: string | null;
-    source_artifact_id?: number | null;
-    reference_selection?: ReferenceSelection | null;
-    prepared_context_id?: number | null;
-  }) => invokeCommand<AgentStepResult>("run_agent_step", { input }),
   previewAgentRun: (input: {
     project_id: number;
     stage: Stage;
@@ -272,16 +261,12 @@ export const api = {
   }) => invokeCommand<ArtifactSummary[]>(V2_COMMANDS.listArtifactSummaries, { filters }),
   listIndexJobs: (projectId: number) =>
     invokeCommand<V2DerivedIndexJob[]>(V2_COMMANDS.listIndexJobs, { projectId }),
-  listLegacyAgentPrompts: () =>
-    invokeCommand<LegacyAgentPrompt[]>(V2_COMMANDS.listLegacyAgentPrompts),
   listActionProposals: (input: { project_id: number; status?: string | null }) =>
     invokeCommand<ActionProposal[]>(V2_COMMANDS.listActionProposals, { input }),
   applyActionProposal: (input: { project_id: number; proposal_id: number; note?: string }) =>
     invokeCommand<ProposalApplyResult>(V2_COMMANDS.applyActionProposal, { input }),
   rejectActionProposal: (input: { project_id: number; proposal_id: number; note?: string }) =>
     invokeCommand<ActionProposal>(V2_COMMANDS.rejectActionProposal, { input }),
-  rebuildChapterMemory: (input: { project_id: number; chapter_id: number }) =>
-    invokeCommand<ChapterMemoryRecord>("rebuild_chapter_memory", { input }),
   rebuildStoryIndex: (input: { project_id: number; chapter_id?: number | null }) =>
     invokeCommand<StoryIndexSummary[]>("rebuild_story_index", { input }),
   retryIndexJobs: (input: { project_id: number; chapter_id?: number | null }) =>
@@ -290,22 +275,6 @@ export const api = {
     invokeCommand<StorySearchStatus>("rebuild_story_search_index", { input }),
   getStorySearchStatus: (projectId: number) =>
     invokeCommand<StorySearchStatus>("get_story_search_status", { projectId }),
-  runStoryArchitect: (input: {
-    project_id: number;
-    mode: StoryArchitectMode;
-    arc_id?: number | null;
-    user_instruction?: string | null;
-    source_artifact_id?: number | null;
-    reference_selection?: ReferenceSelection | null;
-  }) => invokeCommand<AgentStepResult>("run_story_architect", { input }),
-  createTargetedRework: (input: {
-    project_id: number;
-    mode: StoryArchitectMode;
-    arc_id?: number | null;
-    user_instruction?: string | null;
-    source_artifact_id?: number | null;
-    reference_selection?: ReferenceSelection | null;
-  }) => invokeCommand<AgentStepResult>("create_targeted_rework", { input }),
   confirmStoryBible: (input: { project_id: number; note: string }) =>
     invokeCommand<StoryBible>("confirm_story_bible", { input }),
   reviewStoryBible: (input: { project_id: number }) =>
@@ -313,14 +282,6 @@ export const api = {
   confirmStoryBibleReview: (input: { project_id: number; review_id: number; note: string }) =>
     invokeCommand<StoryBibleReview>("confirm_story_bible_review", { input }),
   listStoryArcs: (projectId: number) => invokeCommand<StoryArc[]>("list_story_arcs", { projectId }),
-  previewAgentContext: (input: {
-    project_id: number;
-    stage: Stage;
-    chapter_id?: number | null;
-    user_instruction?: string | null;
-    source_artifact_id?: number | null;
-    reference_selection?: ReferenceSelection | null;
-  }) => invokeCommand<ContextPreview>("preview_agent_context", { input }),
   approveStage: (projectId: number, stage: Stage, artifactId: number, note?: string) =>
     invokeCommand<Approval>("approve_stage", {
       projectId,
@@ -328,23 +289,16 @@ export const api = {
       artifactId,
       note: note || ""
     }),
-  requestRevision: (input: {
-    project_id: number;
-    artifact_id: number;
-    feedback: string;
-    reference_selection?: ReferenceSelection | null;
-  }) =>
-    invokeCommand<AgentStepResult>("request_revision", { input }),
   replaceArtifactSpan: (input: SpanReplacementInput) =>
     invokeCommand<AgentStepResult>("replace_artifact_span", { input }),
   reviseArtifactSpanWithAi: (input: AiSpanRevisionInput) =>
     invokeCommand<AgentStepResult>("revise_artifact_span_with_ai", { input }),
   deleteArtifact: (input: DeleteArtifactInput) =>
     invokeCommand<void>("delete_artifact", { input }),
+  deleteKnowledgeCard: (input: DeleteKnowledgeCardInput) =>
+    invokeCommand<void>("delete_knowledge_card", { input }),
   clearChapterHistory: (input: ClearChapterHistoryInput) =>
     invokeCommand<HistoryCleanupResult>("clear_chapter_history", { input }),
-  listArtifacts: (filters: { project_id: number; stage?: Stage | null; chapter_id?: number | null }) =>
-    invokeCommand<Artifact[]>("list_artifacts", { filters }),
   exportProject: (projectId: number) =>
     invokeCommand<string>("export_project", { projectId, format: "markdown" }),
   analyzeArtifactQuality: (projectId: number, artifactId: number) =>

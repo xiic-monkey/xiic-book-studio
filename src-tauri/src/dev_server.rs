@@ -23,14 +23,15 @@ use crate::{
         AgentRunRequest, AiSpanRevisionRequest, ChapterGateRequest, ChapterSplitPlanRequest,
         ClearChapterHistoryRequest, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
         ContinuityReviewRequest, DecideActionProposalRequest, DecideAdoptionProposalsRequest,
-        DeleteArtifactRequest, ImportReferenceTextRequest, LedgerContinuityCheckRequest,
+        DeleteArtifactRequest, DeleteKnowledgeCardRequest, ImportReferenceTextRequest,
+        LedgerContinuityCheckRequest,
         ListActionProposalsRequest, ListAdoptionProposalsRequest, ListModelsInput,
-        PrepareArtifactAdoptionsRequest, RebuildChapterMemoryRequest, RebuildStoryIndexRequest,
-        RebuildStorySearchIndexRequest, RetryIndexJobsRequest, RevisionRequest, RunAgentRequest,
-        RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider, SaveAiSettings,
-        SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest,
-        StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextSearchInput,
-        TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
+        PrepareArtifactAdoptionsRequest, RebuildStoryIndexRequest, RebuildStorySearchIndexRequest,
+        RetryIndexJobsRequest, RevisionRequest, RunStoryArchitectRequest, SaveAgentSettings,
+        SaveAiProvider, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill,
+        SpanReplacementRequest, StoryBibleReviewRequest, StoryContextRerankRequest,
+        StoryContextSearchInput, TestAiConnectionInput, UpdateAdoptionProposalRequest,
+        UpdateReferenceMaterialRequest,
     },
 };
 
@@ -73,7 +74,6 @@ pub async fn run() -> AppResult<()> {
         std::fs::create_dir_all(parent)?;
     }
     let app = AppState::from_path(db_path.clone())?;
-    app.migrate_legacy_api_keys()?;
     let gateway = ApplicationGateway::new(app);
     gateway.start_background_workers();
     let state = DevServerState { gateway, db_path };
@@ -258,6 +258,11 @@ async fn dispatch_command(
             let input: SaveKnowledgeCard = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.save_knowledge_card(input)?)?)
         }
+        "delete_knowledge_card" => {
+            let input: DeleteKnowledgeCardRequest = read_required(&payload, "input")?;
+            gateway.delete_knowledge_card(input)?;
+            Ok(serde_json::to_value(())?)
+        }
         "save_foreshadowing" => {
             let input: SaveForeshadowing = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.save_foreshadowing(input)?)?)
@@ -301,28 +306,6 @@ async fn dispatch_command(
             let input: Option<ListModelsInput> = read_optional(&payload, "input")?;
             Ok(serde_json::to_value(gateway.list_models(input).await?)?)
         }
-        "run_agent_step" => {
-            let input: RunAgentRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(gateway.run_agent_step(input).await?)?)
-        }
-        "rebuild_chapter_memory" => {
-            let input: RebuildChapterMemoryRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(
-                gateway.rebuild_chapter_memory(input).await?,
-            )?)
-        }
-        "run_story_architect" => {
-            let input: RunStoryArchitectRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(
-                gateway.run_story_architect(input).await?,
-            )?)
-        }
-        "create_targeted_rework" => {
-            let input: RunStoryArchitectRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(
-                gateway.create_targeted_rework(input).await?,
-            )?)
-        }
         "confirm_story_bible" => {
             let input: ConfirmStoryBibleRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.confirm_story_bible(input)?)?)
@@ -342,10 +325,6 @@ async fn dispatch_command(
         "list_story_arcs" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             Ok(serde_json::to_value(gateway.list_story_arcs(project_id)?)?)
-        }
-        "preview_agent_context" => {
-            let input: RunAgentRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(gateway.preview_agent_context(input)?)?)
         }
         "approve_stage" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
@@ -381,12 +360,6 @@ async fn dispatch_command(
                 gateway.get_story_search_status(project_id)?,
             )?)
         }
-        "request_revision" => {
-            let input: RevisionRequest = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(
-                gateway.request_revision(input).await?,
-            )?)
-        }
         "replace_artifact_span" => {
             let input: SpanReplacementRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.replace_artifact_span(input)?)?)
@@ -406,9 +379,6 @@ async fn dispatch_command(
             let input: ClearChapterHistoryRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.clear_chapter_history(input)?)?)
         }
-        "list_artifacts" => Ok(serde_json::to_value(
-            gateway.list_artifacts(read_required(&payload, "filters")?)?,
-        )?),
         "export_project" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             let format = read_string(&payload, &["format"])?;
@@ -455,7 +425,6 @@ async fn dispatch_command(
                 gateway.rerank_story_context(input).await?,
             )?)
         }
-        "list_tool_definitions" => Ok(serde_json::to_value(gateway.list_agent_tools())?),
         "preview_agent_run" => {
             let input: AgentRunRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
@@ -525,9 +494,6 @@ async fn dispatch_command(
         "list_index_jobs" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             Ok(serde_json::to_value(gateway.list_index_jobs(project_id)?)?)
-        }
-        "list_legacy_agent_prompts" => {
-            Ok(serde_json::to_value(gateway.list_legacy_agent_prompts()?)?)
         }
         "get_provider_capabilities" => {
             let provider_base_url = payload

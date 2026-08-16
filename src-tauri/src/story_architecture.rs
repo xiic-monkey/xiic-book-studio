@@ -6,23 +6,10 @@ use crate::{
     db::AppState,
     error::{AppError, AppResult},
     models::{
-        AgentRunRequest, AgentStepResult, CanonIssue, ConfirmStoryBibleRequest,
-        ConfirmStoryBibleReviewRequest, RunAgentRequest, RunStoryArchitectRequest, StoryBible,
-        StoryBibleReview, StoryBibleReviewRequest,
+        AgentRunRequest, CanonIssue, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
+        RunStoryArchitectRequest, StoryBible, StoryBibleReview, StoryBibleReviewRequest,
     },
-    workflow,
 };
-
-pub async fn run_story_architect(
-    state: &AppState,
-    input: RunStoryArchitectRequest,
-) -> AppResult<AgentStepResult> {
-    workflow::run_agent_step(
-        state,
-        RunAgentRequest::from(build_agent_run_request(state, input)?),
-    )
-    .await
-}
 
 pub(crate) fn build_agent_run_request(
     state: &AppState,
@@ -66,13 +53,6 @@ pub(crate) fn build_agent_run_request(
         reference_selection: input.reference_selection,
         prepared_context_id: None,
     })
-}
-
-pub async fn create_targeted_rework(
-    state: &AppState,
-    input: RunStoryArchitectRequest,
-) -> AppResult<AgentStepResult> {
-    run_story_architect(state, input).await
 }
 
 pub fn confirm_story_bible(

@@ -4,6 +4,7 @@ import {
   Box,
   BookOpen,
   CalendarDays,
+  CalendarPlus,
   Check,
   Copy,
   ChevronLeft,
@@ -29,7 +30,6 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent, PointerEvent } from "react";
-import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../../api";
 import { ArtifactDiffPanel } from "../../components/ArtifactDiffPanel";
@@ -53,7 +53,6 @@ import type {
   Foreshadowing,
   KnowledgeCard,
   LedgerContinuityReport,
-  LegacyAgentPrompt,
   NewProject,
   Project,
   ProjectUpdate,
@@ -86,6 +85,7 @@ import type {
 import { NewProjectModal } from "../../components/NewProjectModal";
 import { ProjectEditorModal } from "../../components/ProjectEditorModal";
 import { SettingsView } from "../../components/SettingsView";
+import { DropdownMenu } from "../../components/DropdownMenu";
 import { AdoptionDrawer } from "../../components/AdoptionDrawer";
 import { AgentRunInspector } from "../agent-runs/AgentRunInspector";
 import { useActionProposals } from "../proposals/useActionProposals";
@@ -93,9 +93,9 @@ import { useArtifact } from "./useArtifact";
 import { projectWorkspaceQueryKey, useProjectWorkspace } from "./useProjectWorkspace";
 
 const foundationStages: Array<{ id: Stage; label: string; scope: "book" }> = [
-  { id: "setting", label: "世界与规则", scope: "book" },
-  { id: "outline", label: "阶段大纲", scope: "book" },
-  { id: "characters", label: "角色卡", scope: "book" },
+  { id: "setting", label: "世界观", scope: "book" },
+  { id: "outline", label: "大纲", scope: "book" },
+  { id: "characters", label: "角色", scope: "book" },
 ];
 
 const productionStages: Array<{ id: Stage; label: string; scope: "chapter" }> = [
@@ -234,7 +234,6 @@ export function BookStudioWorkspace() {
   const [agentTools, setAgentTools] = useState<AgentToolDefinition[]>([]);
   const [storySearchStatus, setStorySearchStatus] = useState<StorySearchStatus | null>(null);
   const [writingSkills, setWritingSkills] = useState<WritingSkill[]>([]);
-  const [legacyAgentPrompts, setLegacyAgentPrompts] = useState<LegacyAgentPrompt[]>([]);
   const [apiKey, setApiKey] = useState("");
   const [instruction, setInstruction] = useState("");
   const [revisionFeedback, setRevisionFeedback] = useState("");
@@ -259,7 +258,6 @@ export function BookStudioWorkspace() {
   const [contextSnippets, setContextSnippets] = useState<StoryContextSnippet[]>([]);
   const [contextRerank, setContextRerank] = useState<StoryContextRerankResult | null>(null);
   const [contextPreview, setContextPreview] = useState<PreparedContext | null>(null);
-  const [storyBibleNote, setStoryBibleNote] = useState("");
   const [showAdoptionDrawer, setShowAdoptionDrawer] = useState(false);
   const [referenceMaterials, setReferenceMaterials] = useState<ReferenceMaterial[]>([]);
   const [referenceSelections, setReferenceSelections] = useState<Record<string, ReferenceSelection>>({});
@@ -275,6 +273,7 @@ export function BookStudioWorkspace() {
   const [libraryOriginSurface, setLibraryOriginSurface] = useState<ContentSurface>("official");
   const [librarySection, setLibrarySection] = useState<LibrarySection>("setting");
   const [libraryFocus, setLibraryFocus] = useState<LibraryFocus>("setting");
+  const [libraryMode, setLibraryMode] = useState<ContentSurface>("workbench");
   const [selectedLibraryEntityId, setSelectedLibraryEntityId] = useState<number | null>(null);
   const [showKnowledgeComposer, setShowKnowledgeComposer] = useState(false);
   const [knowledgeTitle, setKnowledgeTitle] = useState("");
@@ -307,40 +306,48 @@ export function BookStudioWorkspace() {
   });
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const activeProjectRequestRef = useRef<number | null>(null);
-  const chapterToolsRef = useRef<HTMLDetailsElement | null>(null);
-  const [chapterToolsOpen, setChapterToolsOpen] = useState(false);
-  const [chapterToolsPosition, setChapterToolsPosition] = useState({ top: 0, left: 0 });
   const referenceFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const visibleContentSurface: ContentSurface = mainSurface === "library" ? libraryOriginSurface : mainSurface;
-
-  function updateChapterToolsPosition() {
-    const summary = chapterToolsRef.current?.querySelector("summary");
-    if (!summary) return;
-    const rect = summary.getBoundingClientRect();
-    const menuWidth = 168;
-    const viewportPadding = 8;
-    const left = Math.max(
-      viewportPadding,
-      Math.min(rect.left, window.innerWidth - menuWidth - viewportPadding)
-    );
-    setChapterToolsPosition({ top: rect.bottom + 6, left });
+  function currentContentSurface(): ContentSurface {
+    return mainSurface === "library" ? libraryMode : mainSurface;
   }
 
-  useEffect(() => {
-    if (!chapterToolsOpen) return;
-    const update = () => updateChapterToolsPosition();
-    update();
-    window.addEventListener("resize", update);
-    window.addEventListener("scroll", update, true);
-    return () => {
-      window.removeEventListener("resize", update);
-      window.removeEventListener("scroll", update, true);
-    };
-  }, [chapterToolsOpen]);
+  function switchContentSurface(surface: ContentSurface) {
+    if (mainSurface === "library") {
+      setLibraryOriginSurface(surface);
+      setLibraryMode(surface);
+      setMainSurface("library");
+      return;
+    }
+    setMainSurface(surface);
+    setLibraryMode(surface);
+  }
 
-  function openLibrary(focus?: LibraryFocus) {
-    if (mainSurface !== "library") setLibraryOriginSurface(mainSurface);
+  function enterWorkbench() {
+    // 资料页的“创作工作台”应进入对应的资料工具，而不是跳到章节编辑器。
+    // 章节正文页才进入 draft/review/revision 流水线。
+    if (mainSurface === "library") {
+      setLibraryOriginSurface("workbench");
+      setLibraryMode("workbench");
+      if (libraryFocus === "setting" || libraryFocus === "outline" || libraryFocus === "characters") {
+        setSelectedChapterId(null);
+        setSelectedStage(librarySection);
+        setSelectedArtifactId(null);
+        openKnowledgeEditor();
+      }
+      return;
+    }
+    switchContentSurface("workbench");
+  }
+
+  function exitLibrary() {
+    switchContentSurface(libraryOriginSurface);
+  }
+
+  function openLibrary(focus?: LibraryFocus, mode?: ContentSurface) {
+    const nextMode = mode ?? currentContentSurface();
+    setLibraryOriginSurface(nextMode);
+    setLibraryMode(nextMode);
     const section = focus && foundationStages.some((stage) => stage.id === focus)
       ? focus as LibrarySection
       : null;
@@ -349,6 +356,7 @@ export function BookStudioWorkspace() {
       setLibrarySection(section);
       setSelectedStage(section);
       setSelectedArtifactId(null);
+      setSelectedChapterId(null);
     } else {
       setLibraryFocus(focus ?? "foreshadowing");
     }
@@ -363,7 +371,6 @@ export function BookStudioWorkspace() {
     void refreshAgents();
     void refreshAgentTools();
     void refreshWritingSkills();
-    void refreshLegacyAgentPrompts();
   }, []);
 
   useEffect(() => {
@@ -458,6 +465,8 @@ export function BookStudioWorkspace() {
 
   useEffect(() => {
     if (!detail) return;
+    // 资料工具页不应自动选中第一章；章节选择只属于正文工作台。
+    if (mainSurface === "library") return;
     const selectedExists = detail.chapters.some((chapter) => chapter.id === selectedChapterId);
     if (selectedExists) return;
     const firstChapter = detail.chapters[0];
@@ -469,7 +478,7 @@ export function BookStudioWorkspace() {
         (artifact.status === "approved" || detail.approvals.some((approval) => approval.artifact_id === artifact.id))
     );
     selectChapter(firstChapter, hasApprovedFoundation ? "draft" : "setting");
-  }, [detail, selectedChapterId]);
+  }, [detail, mainSurface, selectedChapterId]);
 
   const selectedChapter = useMemo(
     () => detail?.chapters.find((chapter) => chapter.id === selectedChapterId) ?? null,
@@ -506,8 +515,13 @@ export function BookStudioWorkspace() {
   const visibleArtifacts = useMemo(() => {
     if (!detail) return [];
     const stageMeta = stages.find((stage) => stage.id === selectedStage);
+    // 章节体（草稿/修订）同属"正文演进"，合并展示以便跨阶段对比 diff
+    const stagesToShow =
+      stageMeta?.scope === "chapter" && bodyStages.includes(selectedStage)
+        ? bodyStages
+        : [selectedStage];
     return detail.artifacts
-      .filter((artifact) => artifact.stage === selectedStage)
+      .filter((artifact) => stagesToShow.includes(artifact.stage))
       .filter((artifact) =>
         stageMeta?.scope === "chapter" ? artifact.chapter_id === selectedChapterId : artifact.chapter_id == null
       )
@@ -521,19 +535,47 @@ export function BookStudioWorkspace() {
   const selectedArtifactQuery = useArtifact(selectedProjectId, selectedArtifactSummary?.id);
   const selectedArtifact = selectedArtifactQuery.data ?? null;
 
+  // 试读产物指向被审的源产物（草稿），用于在试读页并排展示原文
+  const reviewSourceSummary = useMemo(() => {
+    if (!selectedArtifact || selectedArtifact.stage !== "review" || selectedArtifact.parent_artifact_id == null) return null;
+    return detail?.artifacts.find((artifact) => artifact.id === selectedArtifact.parent_artifact_id) ?? null;
+  }, [detail, selectedArtifact]);
+  const reviewSourceQuery = useArtifact(selectedProjectId, reviewSourceSummary?.id);
+  const reviewSourceArtifact = reviewSourceQuery.data ?? null;
+
   const libraryArtifactSummary = useMemo(() => {
     if (!detail) return null;
-    return detail.artifacts
-      .filter((artifact) => artifact.stage === librarySection && artifact.chapter_id == null)
-      .sort((a, b) => {
-        const approvalDelta = Number(b.status === "approved") - Number(a.status === "approved");
-        if (approvalDelta !== 0) return approvalDelta;
-        return b.version - a.version;
-      })[0] ?? null;
-  }, [detail, librarySection]);
+    const sectionArtifacts = detail.artifacts.filter(
+      (artifact) => artifact.stage === librarySection && artifact.chapter_id == null,
+    );
+    if (libraryMode === "official") {
+      const approved = sectionArtifacts.filter((artifact) => artifact.status === "approved");
+      return approved.sort((a, b) => b.version - a.version)[0] ?? null;
+    }
+    return sectionArtifacts.sort((a, b) => b.version - a.version)[0] ?? null;
+  }, [detail, librarySection, libraryMode]);
 
   const libraryArtifactQuery = useArtifact(selectedProjectId, libraryArtifactSummary?.id);
   const libraryArtifact = libraryArtifactQuery.data ?? null;
+
+  const libraryArtifactApproved = useMemo(() => {
+    if (!detail || !libraryArtifactSummary) return false;
+    return (
+      libraryArtifactSummary.status === "approved" ||
+      detail.approvals.some((approval) => approval.artifact_id === libraryArtifactSummary.id)
+    );
+  }, [detail, libraryArtifactSummary]);
+
+  const libraryArtifactLabel = useMemo(() => {
+    if (!libraryArtifactSummary) {
+      return libraryMode === "official"
+        ? "暂无正式资料"
+        : "暂无资料";
+    }
+    return libraryArtifactApproved
+      ? `基准 v${libraryArtifactSummary.version} · 已确认`
+      : `候选 v${libraryArtifactSummary.version} · 待确认`;
+  }, [libraryArtifactSummary, libraryArtifactApproved, libraryMode]);
 
   const currentChapterBodySummary = useMemo(() => {
     if (!detail || !selectedChapter?.current_artifact_id) return null;
@@ -555,12 +597,18 @@ export function BookStudioWorkspace() {
       if (librarySection === "outline") return card.category === "outline" || card.category === "chapter_plan";
       return ["world", "cultivation", "map", "faction", "taboo", "item", "rule"].includes(card.category);
     };
-    return (detail.knowledge_cards ?? []).filter(categoryMatch);
-  }, [detail, librarySection]);
+    const modeMatch = (card: KnowledgeCard) =>
+      libraryMode === "official" ? card.status === "approved" : card.status !== "archived";
+    return (detail.knowledge_cards ?? []).filter((card) => categoryMatch(card) && modeMatch(card));
+  }, [detail, librarySection, libraryMode]);
 
   const visibleForeshadowings = useMemo(
-    () => detail?.foreshadowings?.filter((item) => item.status !== "archived") ?? [],
-    [detail]
+    () => detail?.foreshadowings?.filter((item) =>
+      libraryMode === "official"
+        ? ["active", "ready_for_payoff", "resolved"].includes(item.status)
+        : item.status !== "archived"
+    ) ?? [],
+    [detail, libraryMode]
   );
 
   const timelineEntityKind = libraryFocus === "characters"
@@ -773,8 +821,8 @@ export function BookStudioWorkspace() {
     if (selectedArtifact.chapter_id != null) {
       return selectedArtifactIsCurrentBody ? "当前正式正文不能删除" : null;
     }
-    return selectedArtifactApproved ? "当前已批准资料不能删除" : null;
-  }, [selectedArtifact, selectedArtifactApproved, selectedArtifactIsCurrentBody]);
+    return null;
+  }, [selectedArtifact, selectedArtifactIsCurrentBody]);
 
   const gateArtifact = useMemo(() => {
     if (!detail || !chapterGateReport) return null;
@@ -902,7 +950,6 @@ export function BookStudioWorkspace() {
     setContextSnippets([]);
     setContextRerank(null);
     setContextPreview(null);
-    setStoryBibleNote("");
     setShowAdoptionDrawer(false);
     setReferenceMaterials([]);
     setReferenceSelections({});
@@ -1009,6 +1056,8 @@ export function BookStudioWorkspace() {
         if (event.kind === "completed") {
           setNotice(`${stageLabel(summary.artifact.stage)}已生成 v${summary.artifact.version}`);
         }
+      } else if (event.kind === "completed" && ["setting", "outline", "characters"].includes(summary.run.stage)) {
+        setError("故事架构生成完成，但没有返回设定卡。请检查 Agent 配置或重试。");
       }
     } catch (error) {
       if (activeProjectRequestRef.current === event.project_id) {
@@ -1174,14 +1223,6 @@ export function BookStudioWorkspace() {
     try {
       const list = await api.listWritingSkills();
       setWritingSkills(list);
-    } catch (err) {
-      setError(String(err));
-    }
-  }
-
-  async function refreshLegacyAgentPrompts() {
-    try {
-      setLegacyAgentPrompts(await api.listLegacyAgentPrompts());
     } catch (err) {
       setError(String(err));
     }
@@ -1407,7 +1448,7 @@ export function BookStudioWorkspace() {
 
   function selectChapter(chapter: Chapter, stage?: Stage) {
     if (mainSurface === "library") {
-      setMainSurface(libraryOriginSurface);
+      switchContentSurface(libraryOriginSurface);
     }
     const currentBody = resolveChapterBody(detail, chapter);
     setSelectedChapterId(chapter.id);
@@ -1422,7 +1463,7 @@ export function BookStudioWorkspace() {
     setSelectedChapterId(chapter.id);
     setSelectedStage(body?.stage ?? "draft");
     setSelectedArtifactId(body?.id ?? null);
-    setMainSurface("official");
+    switchContentSurface("official");
   }
 
   async function rebuildLibraryIndex() {
@@ -1431,7 +1472,7 @@ export function BookStudioWorkspace() {
       const jobs = await api.retryIndexJobs({ project_id: detail.project.id });
       await refreshDetailBestEffort(detail.project.id, "资料索引更新");
       const queued = jobs.filter((job) => job.status === "pending").length;
-      setNotice(queued > 0 ? `资料索引已加入后台队列：${queued} 个任务` : "没有需要更新的索引任务");
+      setNotice(queued > 0 ? `索引任务已排队：${queued}` : "索引已是最新");
     });
   }
 
@@ -1476,6 +1517,29 @@ export function BookStudioWorkspace() {
     setKnowledgeContent(card.content);
     setKnowledgeCategory(card.category);
     setEditingKnowledgeCardId(card.id);
+    setShowKnowledgeComposer(true);
+  }
+
+  function editKnowledgeSection(section: { title: string; content: string[] }) {
+    setKnowledgeTitle(section.title);
+    setKnowledgeContent(section.content.join("\n"));
+    setKnowledgeCategory(librarySection === "characters" ? "character" : librarySection === "outline" ? "outline" : "world");
+    setEditingKnowledgeCardId(null);
+    setShowKnowledgeComposer(true);
+  }
+
+  function openKnowledgeEditor() {
+    const firstCard = libraryCards[0];
+    if (firstCard) {
+      editKnowledgeCard(firstCard);
+      return;
+    }
+    const firstSection = librarySourceSections[0];
+    if (firstSection) {
+      editKnowledgeSection(firstSection);
+      return;
+    }
+    resetKnowledgeComposer();
     setShowKnowledgeComposer(true);
   }
 
@@ -1547,6 +1611,20 @@ export function BookStudioWorkspace() {
     });
   }
 
+  async function deleteKnowledgeCard(card: KnowledgeCard) {
+    if (!detail) return;
+    const confirmed = window.confirm(
+      `确定删除资料卡“${card.title}”吗？\n该资料卡会从项目资料中彻底移除，且不可恢复。`
+    );
+    if (!confirmed) return;
+    await runTask("删除资料卡", async () => {
+      await api.deleteKnowledgeCard({ project_id: detail.project.id, card_id: card.id });
+      if (editingKnowledgeCardId === card.id) resetKnowledgeComposer();
+      await refreshDetailBestEffort(detail.project.id, "资料卡删除");
+      setNotice(`已删除资料卡 ${card.title}`);
+    });
+  }
+
   async function updateForeshadowingStatus(
     item: Foreshadowing,
     status: "active" | "ready_for_payoff" | "resolved" | "archived"
@@ -1595,7 +1673,6 @@ export function BookStudioWorkspace() {
       setSelectedArtifactId(null);
       setCompareArtifactId(null);
       setChapterDraft("");
-      if (chapterToolsRef.current?.open) chapterToolsRef.current.open = false;
       await refreshDetailBestEffort(detail.project.id, "章节删除");
       setNotice(`已删除 ${chapterTitle}`);
     });
@@ -1646,21 +1723,22 @@ export function BookStudioWorkspace() {
 
     let message: string | null = null;
     if (!detail.story_bible || detail.story_bible.status !== "confirmed") {
-      message = "写作前请先在这里确认创作基准。";
+      message = "请先确认创作基准。";
     } else if (!activeStoryArc) {
-      message = "写作前请先确认当前故事阶段。";
+      message = "请先确认故事阶段。";
     } else if (!detail.story_bible_review) {
-      message = "创作基准已确认，请先运行一致性审校。";
+      message = "请先完成一致性审校。";
     } else if (detail.story_bible_review.canon_fingerprint !== detail.canonical_fingerprint) {
-      message = "Canon 已变化，请重新运行一致性审校。";
+      message = "创作基准已变化，请重新审校。";
     } else if (detail.story_bible_review.issues.some((issue) => issue.severity === "major")) {
-      message = "当前一致性审校存在未解决的 major 问题，请先处理后再写作。";
+      message = "一致性审校有未解决问题。";
     } else if (detail.story_bible_review.status !== "confirmed") {
-      message = "请先人工确认最新的一致性审校结论。";
+      message = "请确认最新审校结论。";
     }
 
     if (!message) return false;
     setLibraryOriginSurface("workbench");
+    setLibraryMode("workbench");
     setLibrarySection("setting");
     setLibraryFocus("setting");
     setMainSurface("library");
@@ -1675,18 +1753,18 @@ export function BookStudioWorkspace() {
   ) {
     if (!detail) return;
     if (streamingRun) {
-      setNotice("当前已有 Agent 任务正在运行，请先等待或停止它。");
+      setNotice("Agent 运行中");
       return;
     }
     if (stage === "setting" || stage === "outline" || stage === "characters") {
       return runStoryArchitect(architectModeByStage[stage], mode);
     }
     if (detail.project.id !== selectedProjectId) {
-      setError("书籍切换尚未完成，请等待当前书籍加载后再运行 Agent。");
+      setError("项目切换中，请稍候。");
       return;
     }
     if (redirectToStoryBibleIfDraftBlocked(stage)) return;
-    setMainSurface("workbench");
+    switchContentSurface("workbench");
     const meta = stages.find((item) => item.id === stage);
     await runTask("运行 Agent", async () => {
       const sourceArtifactId = stage === "review" ? agentSourceArtifactId(stage) : null;
@@ -1712,10 +1790,16 @@ export function BookStudioWorkspace() {
   ) {
     if (!detail) return;
     if (streamingRun) {
-      setNotice("当前已有 Agent 任务正在运行，请先等待或停止它。");
+      setNotice("Agent 运行中");
       return;
     }
     const stage = artifactStageForArchitectMode(architectMode);
+    setLibraryMode("workbench");
+    setLibraryOriginSurface("workbench");
+    setLibrarySection(stage);
+    setLibraryFocus(stage);
+    setSelectedStage(stage);
+    setSelectedArtifactId(null);
     setMainSurface("library");
     await runTask("运行故事架构 Agent", async () => {
       const explicitSource = detail.artifacts.find((artifact) => artifact.id === explicitArchitectSourceId);
@@ -1751,6 +1835,8 @@ export function BookStudioWorkspace() {
     if (!detail) return;
     const architectMode = resolveArchitectMode(issue.owner_mode);
     const stage = artifactStageForArchitectMode(architectMode);
+    setLibraryMode("workbench");
+    setLibraryOriginSurface("workbench");
     setMainSurface("library");
     await runTask("定向返工故事资料", async () => {
       const result = await api.startStoryArchitectRun({
@@ -1776,8 +1862,7 @@ export function BookStudioWorkspace() {
   async function confirmStoryBible() {
     if (!detail) return;
     await runTask("确认创作基准", async () => {
-      await api.confirmStoryBible({ project_id: detail.project.id, note: storyBibleNote });
-      setStoryBibleNote("");
+      await api.confirmStoryBible({ project_id: detail.project.id, note: "" });
       await refreshDetailBestEffort(detail.project.id, "创作基准确认");
       setNotice("创作基准与当前故事阶段已确认");
     });
@@ -1799,11 +1884,10 @@ export function BookStudioWorkspace() {
       await api.confirmStoryBibleReview({
         project_id: detail.project.id,
         review_id: reviewId,
-        note: storyBibleNote,
+        note: "",
       });
-      setStoryBibleNote("");
       await refreshDetailBestEffort(detail.project.id, "一致性审校确认");
-      setNotice("一致性审校已人工确认，可以继续正文创作");
+      setNotice("一致性审校已确认");
     });
   }
 
@@ -1906,7 +1990,7 @@ export function BookStudioWorkspace() {
       setNotice("当前产物已经通过");
       return;
     }
-    await runTask("人工通过", async () => {
+    await runTask("审核通过", async () => {
       const approvedArtifact = selectedArtifact;
       await api.approveStage(detail.project.id, approvedArtifact.stage, approvedArtifact.id, approvalNote);
       setApprovalNote("");
@@ -1991,7 +2075,7 @@ export function BookStudioWorkspace() {
   async function requestRevision() {
     if (!detail || !selectedArtifact) return;
     if (streamingRun) {
-      setNotice("当前已有 Agent 任务正在运行，请先等待或停止它。");
+      setNotice("Agent 运行中");
       return;
     }
     await runTask("请求修订", async () => {
@@ -2046,7 +2130,7 @@ export function BookStudioWorkspace() {
   async function reviseSelectedArtifactSpanWithAi() {
     if (!detail || !selectedArtifact) return;
     if (!selectedArtifactSupportsLocalPatch) {
-      setNotice("当前产物暂不支持 AI 局部修订");
+      setNotice("当前产物暂不支持 AI 局部改写");
       return;
     }
     await runTask("AI 局部修订", async () => {
@@ -2061,8 +2145,8 @@ export function BookStudioWorkspace() {
       setPatchFindText("");
       setPatchReplaceText("");
       setAiPatchInstruction("");
-      await refreshDetailBestEffort(detail.project.id, "AI 局部修订");
-      setNotice(`AI 局部修订已生成 ${result.artifact.title} v${result.artifact.version}`);
+      await refreshDetailBestEffort(detail.project.id, "AI 局部改写");
+      setNotice(`AI 局部改写已生成 ${result.artifact.title} v${result.artifact.version}`);
     });
   }
 
@@ -2084,6 +2168,63 @@ export function BookStudioWorkspace() {
       const deletedVersion = selectedArtifact.version;
       await refreshDetailBestEffort(detail.project.id, "版本删除");
       setNotice(`已删除版本 v${deletedVersion}`);
+    });
+  }
+
+  async function deleteLibrarySourceArtifact() {
+    if (!detail || librarySection !== "setting") return;
+    const worldArtifactVersions = detail.artifacts
+      .filter((artifact) =>
+        artifact.stage === "setting" &&
+        artifact.chapter_id == null &&
+        artifact.project_id === detail.project.id
+      )
+      .sort((a, b) => b.version - a.version);
+    const worldKnowledgeCards = (detail.knowledge_cards ?? []).filter((card) =>
+      ["world", "cultivation", "map", "faction", "taboo", "item", "rule"].includes(card.category)
+    );
+    const confirmed = window.confirm(
+      `确定清空当前世界观的全部内容吗？\n将删除 ${worldArtifactVersions.length} 个草稿/正式版本和 ${worldKnowledgeCards.length} 张设定卡，且不可恢复。`
+    );
+    if (!confirmed) return;
+    await runTask("清空世界观", async () => {
+      for (const artifact of worldArtifactVersions) {
+        await api.deleteArtifact({
+          project_id: detail.project.id,
+          artifact_id: artifact.id,
+        });
+      }
+      for (const card of worldKnowledgeCards) {
+        await api.deleteKnowledgeCard({
+          project_id: detail.project.id,
+          card_id: card.id,
+        });
+      }
+      await refreshDetailBestEffort(detail.project.id, "候选原稿删除");
+      setNotice("世界观的草稿、正式版本和设定卡已清空");
+    });
+  }
+
+  async function deleteLibrarySourceSection(section: { title: string }) {
+    if (!detail || !libraryArtifactSummary || !libraryArtifact) return;
+    const heading = section.title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = libraryArtifact.content.match(new RegExp(`^##+\\s+${heading}\\s*$[\\s\\S]*?(?=^##+\\s+|\\s*$)`, "m"));
+    if (!match?.[0]) {
+      setError("无法定位这张候选卡片的原文");
+      return;
+    }
+    const confirmed = window.confirm(`确定删除候选卡片“${section.title}”吗？`);
+    if (!confirmed) return;
+    await runTask("删除候选卡片", async () => {
+      await api.replaceArtifactSpan({
+        project_id: detail.project.id,
+        artifact_id: libraryArtifactSummary.id,
+        find_text: match[0],
+        replace_text: "",
+        note: `删除候选卡片：${section.title}`,
+      });
+      await refreshDetailBestEffort(detail.project.id, "候选卡片删除");
+      setNotice(`已删除候选卡片“${section.title}”`);
     });
   }
 
@@ -2149,7 +2290,7 @@ export function BookStudioWorkspace() {
   }
 
   function viewBodyArtifact(artifact: Artifact) {
-    setMainSurface("workbench");
+    switchContentSurface("workbench");
     setSelectedStage(artifact.stage);
     setSelectedArtifactId(artifact.id);
     setNotice(`已切到 ${artifact.stage === "revision" ? "修订稿" : "草稿"} v${artifact.version}`);
@@ -2248,10 +2389,10 @@ export function BookStudioWorkspace() {
 
   async function checkLedgerContinuity() {
     if (!detail || !selectedArtifact || (selectedArtifact.stage !== "draft" && selectedArtifact.stage !== "revision")) {
-      setNotice("请选择一份章节草稿或修订稿进行状态账本核对");
+      setNotice("请选择一份章节草稿或修订稿进行连续性核对");
       return;
     }
-    await runTask("状态账本核对", async () => {
+    await runTask("连续性核对", async () => {
       const report = await api.checkArtifactLedgerContinuity({
         project_id: detail.project.id,
         artifact_id: selectedArtifact.id,
@@ -2458,7 +2599,6 @@ export function BookStudioWorkspace() {
         onRebuildStorySearch={rebuildStorySearchIndex}
         agents={agentCatalog}
         agentTools={agentTools}
-        legacyAgentPrompts={legacyAgentPrompts}
         genreAgent={detail?.genre_agent}
         writingSkills={writingSkills}
         onSaveWritingSkill={handleSaveWritingSkill}
@@ -2489,271 +2629,7 @@ export function BookStudioWorkspace() {
                 <ChevronRight size={16} />
               </button>
             </div>
-          ) : false ? (
-            <section className="library-workspace">
-              <header className="library-header">
-                <div>
-                  <h2>书籍资料</h2>
-                  <p>这里是会随创作逐步扩展的设定、大纲、角色与伏笔账本。</p>
-                </div>
-                <div className="button-row">
-                  <button onClick={() => setShowKnowledgeComposer((current) => !current)} disabled={!detail || Boolean(busy)}>
-                    <Plus size={14} /> 补充资料
-                  </button>
-                </div>
-              </header>
-
-              {(libraryFocus === "characters" || libraryFocus === "items" || libraryFocus === "events") && (
-                <section className="continuity-library">
-                  <header className="continuity-library-head">
-                    <div>
-                      <div className="panel-title">
-                        {libraryFocus === "characters" ? <Users size={15} /> : libraryFocus === "items" ? <Box size={15} /> : <CalendarDays size={15} />}
-                        连续性资料
-                      </div>
-                      <h3>{libraryFocus === "characters" ? "角色时间线" : libraryFocus === "items" ? "物品与资源" : "事件时间线"}</h3>
-                      <p>仅显示已通过正式正文中有原文出处的记录。点击章节可回到正式内容。</p>
-                      {storyIndexStatus.approved > 0 && (
-                        <div className={storyIndexStatus.failed.length > 0 ? "library-index-status has-error" : "library-index-status"}>
-                          <span>资料索引</span>
-                          <strong>已覆盖 {storyIndexStatus.succeeded}/{storyIndexStatus.approved} 章</strong>
-                          {storyIndexStatus.pending > 0 && <small>{storyIndexStatus.pending} 章待更新</small>}
-                          {storyIndexStatus.failed.length > 0 && (
-                            <small title={storyIndexStatus.failed.map(({ chapter, source }) => `第 ${chapter.chapter_no} 章：${source?.error ?? "更新失败"}`).join("\n")}>
-                              {storyIndexStatus.failed.length} 章更新失败
-                            </small>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                    <button onClick={rebuildLibraryIndex} disabled={!detail || Boolean(busy)}>
-                      <RefreshCcw size={14} /> 更新资料索引
-                    </button>
-                  </header>
-
-                  {libraryFocus === "events" ? (
-                    <div className="event-timeline">
-                      {(detail?.story_events ?? []).map((event: StoryEvent) => {
-                        const chapter = detail?.chapters.find((item) => item.id === event.narrative_chapter_id);
-                        const participants = participantsByEvent.get(event.id) ?? [];
-                        return (
-                          <article key={event.id} className="timeline-event">
-                            <div className="timeline-marker" />
-                            <div className="timeline-event-body">
-                              <div className="timeline-event-head">
-                                <div><span>{chapter ? `第 ${chapter.chapter_no} 章` : "章节未定"}</span><strong>{event.title}</strong></div>
-                                {event.story_time && <small>{event.story_time}</small>}
-                              </div>
-                              <p>{event.summary}</p>
-                              {participants.length > 0 && (
-                                <div className="timeline-participants">
-                                  {participants.map((participant) => (
-                                    <button key={`${participant.event_id}-${participant.entity_id}-${participant.role}`} onClick={() => {
-                                      openLibrary("characters");
-                                      setSelectedLibraryEntityId(participant.entity_id);
-                                    }}>
-                                      {participant.entity_name}<span>{participant.role}</span>
-                                    </button>
-                                  ))}
-                                </div>
-                              )}
-                              <blockquote>{event.source_quote}</blockquote>
-                              {chapter && <button className="timeline-source" onClick={() => openTimelineChapter(chapter.id)}>查看正式正文</button>}
-                            </div>
-                          </article>
-                        );
-                      })}
-                      {(detail?.story_events?.length ?? 0) === 0 && <div className="empty-state compact">暂无事件索引。通过章节正文后会自动更新，也可手动更新索引。</div>}
-                    </div>
-                  ) : (
-                    <div className="entity-timeline-layout">
-                      <nav className="entity-list" aria-label={libraryFocus === "characters" ? "角色列表" : "物品与资源列表"}>
-                        {visibleTimelineEntities.map((entity: StoryEntity) => (
-                          <button
-                            key={entity.id}
-                            className={entity.id === selectedLibraryEntity?.id ? "active" : ""}
-                            onClick={() => setSelectedLibraryEntityId(entity.id)}
-                          >
-                            <strong>{entity.name}</strong>
-                            <span>{entity.kind === "character" ? "角色" : entity.kind === "resource" ? "资源" : "物品"}</span>
-                          </button>
-                        ))}
-                        {visibleTimelineEntities.length === 0 && <div className="empty-inline">暂无可用索引</div>}
-                      </nav>
-
-                      <section className="entity-detail">
-                        {selectedLibraryEntity ? (
-                          <>
-                            <header className="entity-detail-head">
-                              <div>
-                                <span>{selectedLibraryEntity?.kind === "character" ? "角色" : selectedLibraryEntity?.kind === "resource" ? "资源" : "物品"}</span>
-                                <h4>{selectedLibraryEntity?.name}</h4>
-                              </div>
-                              <small>截至已索引章节</small>
-                            </header>
-                            {selectedEntityCurrentFacts.length > 0 && (
-                              <div className="entity-current-state">
-                                {selectedEntityCurrentFacts.map((fact) => (
-                                  <div key={fact.dimension}>
-                                    <span>{fact.dimension}</span>
-                                    <strong>{fact.value}</strong>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                            <div className="entity-timeline">
-                              {selectedEntityTimeline.map((entry) => {
-                                const chapter = detail?.chapters.find((item) => item.id === entry.chapterId);
-                                if (entry.type === "event") {
-                                  return (
-                                    <article className="entity-timeline-entry event" key={`event-${entry.id}`}>
-                                      <span className="entity-timeline-chapter">{chapter ? `第 ${chapter.chapter_no} 章` : "章节未定"}</span>
-                                      <strong>{entry.event.title}</strong>
-                                      <p>{entry.event.summary}</p>
-                                      <blockquote>{entry.event.source_quote}</blockquote>
-                                      {chapter && <button className="timeline-source" onClick={() => openTimelineChapter(chapter.id)}>查看正式正文</button>}
-                                    </article>
-                                  );
-                                }
-                                return (
-                                  <article className="entity-timeline-entry" key={`fact-${entry.id}`}>
-                                    <span className="entity-timeline-chapter">{chapter ? `第 ${chapter.chapter_no} 章` : "章节未定"}</span>
-                                    <strong>{entry.fact.dimension}</strong>
-                                    <p>{entry.fact.value}</p>
-                                    <blockquote>{entry.fact.source_quote}</blockquote>
-                                    {chapter && <button className="timeline-source" onClick={() => openTimelineChapter(chapter.id)}>查看正式正文</button>}
-                                  </article>
-                                );
-                              })}
-                              {selectedEntityTimeline.length === 0 && <div className="empty-inline">尚无该实体的状态变化记录</div>}
-                            </div>
-                          </>
-                        ) : <div className="empty-state compact">选择一个{libraryFocus === "characters" ? "角色" : "物品"}查看时间线。</div>}
-                      </section>
-                    </div>
-                  )}
-                </section>
-              )}
-
-              {!["characters", "items", "events"].includes(libraryFocus) && (
-              <div className="library-layout">
-                <nav className="library-nav" aria-label="书籍资料分类">
-                  {foundationStages.map((stage) => (
-                    <button
-                      key={stage.id}
-                      className={librarySection === stage.id ? "active" : ""}
-                      onClick={() => {
-                        setLibrarySection(stage.id as LibrarySection);
-                        setSelectedStage(stage.id);
-                        setSelectedArtifactId(null);
-                        setShowKnowledgeComposer(false);
-                      }}
-                    >
-                      <strong>{stage.label}</strong>
-                      <span>{stage.id === "setting" ? "世界、规则与边界" : stage.id === "outline" ? "章节任务与推进" : "角色卡与关系"}</span>
-                    </button>
-                  ))}
-                </nav>
-
-                <section className="library-canvas">
-                  <div className="library-canvas-head">
-                    <div>
-                      <h3>{librarySection === "setting" ? "设定资料" : librarySection === "outline" ? "章节大纲" : "角色卡"}</h3>
-                      <p>{libraryArtifactSummary ? "当前确认版本已拆分为可阅读卡片。" : "尚未生成该类资料。"}</p>
-                    </div>
-                    <button onClick={() => runAgent(librarySection)} disabled={!detail || Boolean(busy)}>
-                      <RefreshCcw size={14} /> {libraryArtifactSummary ? "迭代资料" : "生成资料"}
-                    </button>
-                  </div>
-
-                  {showKnowledgeComposer && (
-                    <section className="library-composer">
-                      <div className="library-composer-head">
-                        <strong>补充{librarySection === "setting" ? "设定" : librarySection === "outline" ? "大纲任务" : "角色"}</strong>
-                        <button className="icon-btn" onClick={() => setShowKnowledgeComposer(false)} title="关闭">
-                          <ChevronLeft size={15} />
-                        </button>
-                      </div>
-                      {librarySection === "setting" && (
-                        <Select
-                          value={knowledgeCategory}
-                          onChange={setKnowledgeCategory}
-                          options={[
-                            ["world", "世界观"], ["cultivation", "修行体系"], ["map", "地图与地点"],
-                            ["faction", "势力与组织"], ["taboo", "禁忌与边界"], ["item", "重要物件"],
-                          ].map(([value, label]) => ({ value, label }))}
-                        />
-                      )}
-                      <input value={knowledgeTitle} onChange={(event) => setKnowledgeTitle(event.target.value)} placeholder="资料标题" />
-                      <textarea rows={5} value={knowledgeContent} onChange={(event) => setKnowledgeContent(event.target.value)} placeholder="写明可确认的事实、边界和后续可用方式" />
-                      <div className="button-row">
-                        <button onClick={() => saveKnowledgeCard("pending_human_approval")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>保存待确认</button>
-                        <button className="btn-primary" onClick={() => saveKnowledgeCard("approved")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>确认并启用</button>
-                      </div>
-                    </section>
-                  )}
-
-                  <div className="knowledge-grid">
-                    {librarySourceSections.map((section) => <KnowledgeSectionCard key={section.title} section={section} />)}
-                    {libraryCards.map((card) => (
-                      <KnowledgeSectionCard key={card.id} section={{ title: card.title, content: card.content.split("\n") }} />
-                    ))}
-                    {librarySourceSections.length === 0 && libraryCards.length === 0 && (
-                      <div className="empty-state">尚无资料。先生成一版，再由人工逐步补充和确认。</div>
-                    )}
-                  </div>
-                </section>
-
-                <aside className="library-side">
-                  <section className="library-side-panel">
-                    <div className="panel-title"><FileText size={14} /> 当前章节引用</div>
-                    <strong>{selectedChapter?.title ?? "未选择章节"}</strong>
-                    <p>{selectedChapter ? "正文生产会自动读取已确认资料与相关伏笔。" : "选择章节后查看该章会引用的资料。"}</p>
-                  </section>
-                  <section className="library-side-panel foreshadowing-panel">
-                    <div className="panel-title"><Sparkles size={14} /> 伏笔账本</div>
-                    <button onClick={() => setShowForeshadowingComposer((current) => !current)} disabled={!detail || Boolean(busy)}>
-                      <Plus size={14} /> 登记伏笔
-                    </button>
-                    {showForeshadowingComposer && (
-                      <div className="foreshadowing-composer">
-                        <input value={foreshadowingTitle} onChange={(event) => setForeshadowingTitle(event.target.value)} placeholder="伏笔标题" />
-                        <textarea rows={3} value={foreshadowingContent} onChange={(event) => setForeshadowingContent(event.target.value)} placeholder="埋设内容与读者当前应感知到的信息" />
-                        <Select
-                          value={String(foreshadowingPayoffChapterId ?? "")}
-                          onChange={(value) => setForeshadowingPayoffChapterId(Number(value) || null)}
-                          options={[
-                            { value: "", label: "预期回收章节（可稍后指定）" },
-                            ...(detail?.chapters ?? []).map((chapter) => ({ value: String(chapter.id), label: chapter.title })),
-                          ]}
-                        />
-                        <input value={foreshadowingPayoffNote} onChange={(event) => setForeshadowingPayoffNote(event.target.value)} placeholder="或填写回收里程碑" />
-                        <div className="button-row">
-                          <button onClick={() => saveForeshadowing("pending_human_approval")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>保存</button>
-                          <button className="btn-primary" onClick={() => saveForeshadowing("active")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>确认追踪</button>
-                        </div>
-                      </div>
-                    )}
-                    <div className="foreshadowing-list">
-                      {visibleForeshadowings.map((item: Foreshadowing) => {
-                        const payoffChapter = detail?.chapters.find((chapter) => chapter.id === item.planned_payoff_chapter_id);
-                        return (
-                          <article key={item.id} className="foreshadowing-item">
-                            <strong>{item.title}</strong>
-                            <p>{item.content}</p>
-                            <span>{payoffChapter?.title ?? (item.planned_payoff_note || "尚未安排回收")}</span>
-                          </article>
-                        );
-                      })}
-                      {visibleForeshadowings.length === 0 && <div className="empty-inline">还没有登记伏笔</div>}
-                    </div>
-                  </section>
-                </aside>
-              </div>
-              )}
-            </section>
-          ) : (
-            <>
+          ) : (<>
               <div className="sidebar-scroll">
                 <div className="sidebar-header">
                   <div className="brand">
@@ -2865,27 +2741,28 @@ export function BookStudioWorkspace() {
         <header className="topbar">
           <div className="topbar-project">
             <div className="project-title-row">
-              <h1>{detail?.project.title ?? "选择或新建一个小说项目"}</h1>
+      <h1>{detail?.project.title ?? "未选择项目"}</h1>
               {detail && (
                 <div className="project-tags" aria-label="书籍信息">
                   <span>{detail.project.genre || "未设置题材"}</span>
-                  <span>预计 {detail.project.target_words.toLocaleString()} 字</span>
+                  <span>正文 {(detail.formal_char_count ?? 0).toLocaleString()} 字</span>
                   <span>{detail.chapters.length} 章</span>
                 </div>
               )}
             </div>
-            {!detail && <p>设定、大纲、角色、写作、试读、修订，每一步都由人工确认推进。</p>}
             {detail && (
               <div className="surface-switch" role="tablist" aria-label="内容区域">
                 <button
-                  className={visibleContentSurface === "official" ? "active" : ""}
-                  onClick={() => setMainSurface("official")}
+                  className={currentContentSurface() === "official" ? "active" : ""}
+                  onClick={() => switchContentSurface("official")}
                 >
                   <BookOpen size={14} /> 正式内容
                 </button>
                 <button
-                  className={visibleContentSurface === "workbench" ? "active" : ""}
-                  onClick={() => setMainSurface("workbench")}
+                  className={currentContentSurface() === "workbench" ? "active" : ""}
+                  onClick={() => {
+                    enterWorkbench();
+                  }}
                 >
                   <Sparkles size={14} /> 创作工作台
                 </button>
@@ -2898,9 +2775,6 @@ export function BookStudioWorkspace() {
             </button>
             <button onClick={() => setShowProjectEditor(true)} disabled={!detail || Boolean(busy)}>
               <Edit3 size={14} /> 编辑书籍
-            </button>
-            <button className="icon-btn" onClick={() => setShowNewProjectModal(true)} title="新建书籍">
-              <Plus size={18} />
             </button>
             <button onClick={exportMarkdown} disabled={!detail || Boolean(busy)}>
               <Download size={14} /> 导出
@@ -2919,51 +2793,83 @@ export function BookStudioWorkspace() {
           {/* Left: Chapters & Stages */}
           <section className="lane">
             <div className="lane-header">
-              <div className="section-head">
-                <h2>书籍资料</h2>
-              </div>
               <div className="library-shortcuts">
-                {foundationStages.map((stage) => (
-                  <button
-                    key={stage.id}
-                    className={mainSurface === "library" && libraryFocus === stage.id ? "active" : ""}
-                    onClick={() => openLibrary(stage.id as LibrarySection)}
-                  >
-                    <span>{stage.label}</span>
-                  </button>
-                ))}
-                <button
-                  className={mainSurface === "library" && libraryFocus === "items" ? "active" : ""}
-                  onClick={() => openLibrary("items")}
-                >
-                  <span>物品</span>
-                  <small>{detail?.story_entities?.filter((entity) => entity.kind === "item" || entity.kind === "resource").length ?? 0}</small>
-                </button>
-                <button
-                  className={mainSurface === "library" && libraryFocus === "events" ? "active" : ""}
-                  onClick={() => openLibrary("events")}
-                >
-                  <span>事件</span>
-                  <small>{detail?.story_events?.length ?? 0}</small>
-                </button>
-                <button
-                  className={mainSurface === "library" && libraryFocus === "foreshadowing" ? "active" : ""}
-                  onClick={() => openLibrary()}
-                >
-                  <span>伏笔</span>
-                  <small>{detail?.foreshadowings?.filter((item) => item.status !== "resolved").length ?? 0}</small>
-                </button>
+                <div className="section-head">
+                  <h2>书籍资料</h2>
+                  {currentContentSurface() === "official" && <span className="read-only-note">只读</span>}
+                </div>
+                {currentContentSurface() === "workbench" ? (
+                  <>
+                    {foundationStages.map((stage) => (
+                      <button
+                        key={stage.id}
+                        className={mainSurface === "library" && libraryFocus === stage.id ? "active" : ""}
+                        onClick={() => openLibrary(stage.id as LibrarySection, "workbench")}
+                      >
+                        <span>{stage.label}</span>
+                      </button>
+                    ))}
+                  </>
+                ) : (
+                  <>
+                    <button className={mainSurface === "library" && libraryFocus === "setting" ? "active" : ""} onClick={() => openLibrary("setting", "official")}>
+                      <span>世界观</span>
+                    </button>
+                    <button className={mainSurface === "library" && libraryFocus === "outline" ? "active" : ""} onClick={() => openLibrary("outline", "official")}>
+                      <span>大纲</span>
+                    </button>
+                    <button className={mainSurface === "library" && libraryFocus === "characters" ? "active" : ""} onClick={() => openLibrary("characters", "official")}>
+                      <span>角色</span>
+                    </button>
+                    <button className={mainSurface === "library" && libraryFocus === "items" ? "active" : ""} onClick={() => openLibrary("items", "official")}>
+                      <span>物品与事件</span>
+                      <small>{(detail?.story_entities?.filter((entity) => entity.kind === "item" || entity.kind === "resource").length ?? 0) + (detail?.story_events?.length ?? 0)}</small>
+                    </button>
+                    <button className={mainSurface === "library" && libraryFocus === "foreshadowing" ? "active" : ""} onClick={() => openLibrary("foreshadowing", "official")}>
+                      <span>伏笔账本</span>
+                    </button>
+                  </>
+                )}
               </div>
 
               <div className="section-head">
                 <h2>章节</h2>
-                <details
-                  ref={chapterToolsRef}
+                <DropdownMenu
+                  label="管理"
                   className="lane-tools"
-                  onToggle={(event) => setChapterToolsOpen(event.currentTarget.open)}
+                  triggerClassName="lane-tools-trigger"
+                  menuClassName="lane-tools-menu"
+                  menuWidth={168}
                 >
-                  <summary>管理</summary>
-                </details>
+                  {currentContentSurface() === "workbench" && (
+                    <>
+                      <button onClick={createChapter} disabled={!detail || Boolean(busy)}>
+                        <Plus size={14} /> 新增章节
+                      </button>
+                      <button onClick={continueNextChapter} disabled={!detail || Boolean(busy)}>
+                        <Play size={14} /> 下一章
+                      </button>
+                      <button onClick={renameCurrentChapter} disabled={!selectedChapter || Boolean(busy)}>
+                        <Save size={14} /> 重命名
+                      </button>
+                      <button onClick={clearSelectedChapterHistory} disabled={!selectedChapter || Boolean(busy)}>
+                        <Trash2 size={14} /> 清历史
+                      </button>
+                      <input
+                        value={chapterDraft}
+                        onChange={(event) => setChapterDraft(event.target.value)}
+                        placeholder={selectedChapter ? `当前：${selectedChapter.title}` : "新章节标题"}
+                      />
+                    </>
+                  )}
+                  <button
+                    className="danger"
+                    onClick={deleteCurrentChapter}
+                    disabled={!selectedChapter || Boolean(busy)}
+                  >
+                    <Trash2 size={14} /> 删除章节
+                  </button>
+                </DropdownMenu>
               </div>
             </div>
             <div className="lane-scroll">
@@ -2971,15 +2877,11 @@ export function BookStudioWorkspace() {
                 {detail?.chapters.map((chapter) => (
                   <button
                     key={chapter.id}
-                    className={
-                      mainSurface !== "library" && chapter.id === selectedChapterId
-                        ? "chapter active"
-                        : "chapter"
-                    }
+                    className={mainSurface !== "library" && chapter.id === selectedChapterId ? "chapter active" : "chapter"}
                     onClick={() => selectChapter(chapter)}
                   >
                     <span>{chapter.title}</span>
-                    {mainSurface === "workbench" && <small>{chapter.current_artifact_id ? "已采纳" : "待创作"}</small>}
+                    {currentContentSurface() === "workbench" && <small>{chapter.current_artifact_id ? "正式正文" : "待创作"}</small>}
                   </button>
                 ))}
                 {detail && detail.chapters.length === 0 && (
@@ -2987,71 +2889,18 @@ export function BookStudioWorkspace() {
                 )}
               </div>
 
-              {mainSurface === "workbench" && (
-                <>
-                  <div className="section-head">
-                    <h2>流水线</h2>
-                  </div>
-                  <div className="stage-list">
-                    {productionStages.map((stage) => (
-                      <button
-                        key={stage.id}
-                        className={stage.id === selectedStage ? "stage active" : "stage"}
-                        onClick={() => {
-                          setSelectedStage(stage.id);
-                          setSelectedArtifactId(null);
-                        }}
-                      >
-                        <span>{stage.label}</span>
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
             </div>
           </section>
-
-          {chapterToolsOpen && createPortal(
-            <div
-              className="lane-tools-menu"
-              style={{ top: chapterToolsPosition.top, left: chapterToolsPosition.left }}
-            >
-              <button onClick={createChapter} disabled={!detail || Boolean(busy)}>
-                <Plus size={14} /> 新增章节
-              </button>
-              <button onClick={continueNextChapter} disabled={!detail || Boolean(busy)}>
-                <Play size={14} /> 下一章
-              </button>
-              <button onClick={renameCurrentChapter} disabled={!selectedChapter || Boolean(busy)}>
-                <Save size={14} /> 重命名
-              </button>
-              <button
-                className="danger"
-                onClick={deleteCurrentChapter}
-                disabled={!selectedChapter || Boolean(busy)}
-              >
-                <Trash2 size={14} /> 删除章节
-              </button>
-              {mainSurface === "workbench" && (
-                <button onClick={clearSelectedChapterHistory} disabled={!selectedChapter || Boolean(busy)}>
-                  <Trash2 size={14} /> 清历史
-                </button>
-              )}
-              <input
-                value={chapterDraft}
-                onChange={(event) => setChapterDraft(event.target.value)}
-                placeholder={selectedChapter ? `当前：${selectedChapter.title}` : "新章节标题"}
-              />
-            </div>,
-            document.body
-          )}
 
           {mainSurface === "official" ? (
             <section className="editor official-editor">
               <div className="editor-toolbar">
                 <div>
-                  <h2>正式内容</h2>
-                  <p>{selectedChapter ? selectedChapter.title : "选择章节查看已采纳正文"}</p>
+                  <div className="editor-title-line">
+                    <h2>正式正文</h2>
+                    <span className="workspace-mode-badge official">已审核 · 只读</span>
+                  </div>
+                  <p>{selectedChapter ? selectedChapter.title : "选择章节"}</p>
                 </div>
                 <div className="button-row">
                   {currentChapterBody && (
@@ -3059,8 +2908,8 @@ export function BookStudioWorkspace() {
                       <Copy size={16} />
                     </button>
                   )}
-                  <button onClick={() => setMainSurface("workbench")} disabled={!detail}>
-                    <Sparkles size={14} /> 进入创作工作台
+                  <button onClick={enterWorkbench} disabled={!detail}>
+                    <Sparkles size={14} /> 去工作台
                   </button>
                 </div>
               </div>
@@ -3077,17 +2926,15 @@ export function BookStudioWorkspace() {
                     </div>
                   ) : (
                     <div className="official-empty">
-                      <strong>本章还没有正式正文</strong>
-                      <span>草稿和修订稿需要在创作工作台里人工采纳后，才会进入这里。</span>
-                      <button onClick={() => setMainSurface("workbench")}>
-                        <Sparkles size={14} /> 去工作台处理候选稿
+                      <strong>暂无正式正文</strong>
+                      <button onClick={enterWorkbench}>
+                        <Sparkles size={14} /> 去工作台
                       </button>
                     </div>
                   )
                 ) : (
                   <div className="official-empty">
                     <strong>未选择章节</strong>
-                    <span>选择章节后可查看已采纳正文。</span>
                   </div>
                 )}
               </article>
@@ -3095,6 +2942,7 @@ export function BookStudioWorkspace() {
           ) : mainSurface === "library" && ["characters", "items", "events"].includes(libraryFocus) ? (
             <ContinuityLibraryPanel
               focus={libraryFocus as "characters" | "items" | "events"}
+              readOnly={libraryMode === "official"}
               detail={detail}
               busy={Boolean(busy)}
               status={storyIndexStatus}
@@ -3114,48 +2962,52 @@ export function BookStudioWorkspace() {
           ) : mainSurface === "library" ? (
             <section className="library-workspace">
               <header className="library-header">
-                <div>
-                  <h2>创作基准</h2>
-                  <p>故事架构 Agent 统一维护世界、阶段大纲、角色与伏笔；资料视图会随创作逐步扩展。</p>
-                </div>
-                <button onClick={() => (showKnowledgeComposer ? resetKnowledgeComposer() : setShowKnowledgeComposer(true))} disabled={!detail || Boolean(busy)}>
-                  <Plus size={14} /> 补充资料
-                </button>
-              </header>
-
-              <section className="story-bible-overview">
-                <div className="story-bible-summary">
+                <div className="library-header-title">
                   <div>
-                    <span className={`library-status ${detail?.story_bible?.status ?? "draft"}`}>
-                      {detail?.story_bible?.status === "confirmed" ? "已确认" : "待确认"}
-                    </span>
-                    <h3>故事架构 Agent</h3>
-                    <p>{activeStoryArc ? `当前阶段：${activeStoryArc.title}` : "尚未确认进行中的故事阶段"}</p>
-                  </div>
-                  <div className="story-bible-actions">
-                    <button
-                      className="btn-primary"
-                      onClick={() => runStoryArchitect(libraryArtifactSummary ? "refine_canon" : "initialize")}
-                      disabled={!detail || Boolean(busy)}
-                    >
-                      <Sparkles size={14} /> {libraryArtifactSummary ? "补充创作基准" : "初始化创作基准"}
-                    </button>
-                    <button onClick={() => runStoryArchitect("plan_current_arc")} disabled={!detail || Boolean(busy)}>
-                      <Rows3 size={14} /> 细化当前阶段
-                    </button>
-                    <details className="toolbar-more">
-                      <summary>更多</summary>
-                      <div className="toolbar-more-menu">
-                        <button onClick={() => runStoryArchitect("extend_next_arc")} disabled={!detail || Boolean(busy)}><ChevronRight size={14} /> 扩展下一阶段</button>
-                        <button onClick={() => runStoryArchitect("design_characters")} disabled={!detail || Boolean(busy)}><MessageSquare size={14} /> 补充角色</button>
-                      </div>
-                    </details>
+                    <h2>{libraryFocus === "foreshadowing" ? "伏笔账本" : librarySection === "setting" ? "世界观" : librarySection === "outline" ? "大纲" : "角色"}</h2>
                   </div>
                 </div>
-                <div className="story-bible-status-row">
-                  <span>基准版本 v{detail?.story_bible?.canon_version ?? 0}</span>
-                  <span>{detail?.story_arcs?.length ?? 0} 个故事阶段</span>
-                  <span>{detail?.story_bible_review?.status === "confirmed" ? "一致性已确认" : "一致性待审校"}</span>
+                {libraryMode === "workbench" && (
+                  <button onClick={() => (showKnowledgeComposer ? resetKnowledgeComposer() : setShowKnowledgeComposer(true))} disabled={!detail || Boolean(busy)}>
+                    <Plus size={14} /> 补充资料
+                  </button>
+                )}
+              </header>
+              {libraryMode === "workbench" && libraryFocus === "setting" && <section className="story-bible-overview">
+                <div className="story-bible-summary">
+                  <div className="story-bible-actions">
+                    {libraryMode === "workbench" ? (
+                      <>
+                        <button
+                          className="icon-btn btn-primary tooltip-button"
+                          onClick={() => runStoryArchitect(libraryArtifactSummary ? "refine_canon" : "initialize")}
+                          disabled={!detail || Boolean(busy)}
+                          data-tooltip={libraryArtifactSummary ? "补充世界观" : "整理世界观"}
+                          aria-label={libraryArtifactSummary ? "补充世界观" : "整理世界观"}
+                        >
+                          <Sparkles size={14} />
+                        </button>
+                        <button
+                          className="icon-btn tooltip-button"
+                          onClick={() => runStoryArchitect("plan_current_arc")}
+                          disabled={!detail || Boolean(busy)}
+                          data-tooltip="细化当前阶段"
+                          aria-label="细化当前阶段"
+                        >
+                          <Rows3 size={14} />
+                        </button>
+                        <button
+                          className="icon-btn tooltip-button"
+                          onClick={() => runStoryArchitect("extend_next_arc")}
+                          disabled={!detail || Boolean(busy)}
+                          data-tooltip="扩展下一阶段"
+                          aria-label="扩展下一阶段"
+                        >
+                          <CalendarPlus size={14} />
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
                 </div>
                 {detail?.story_arcs?.length ? (
                   <div className="story-arc-list">
@@ -3166,16 +3018,17 @@ export function BookStudioWorkspace() {
                     ))}
                   </div>
                 ) : null}
-                <div className="story-bible-review-row">
-                  <input value={storyBibleNote} onChange={(event) => setStoryBibleNote(event.target.value)} placeholder="人工确认备注，可为空" />
-                  {!detail?.story_bible || detail.story_bible.status !== "confirmed" ? (
-                    <button onClick={confirmStoryBible} disabled={!detail || Boolean(busy)}><Check size={14} /> 确认创作基准</button>
-                  ) : detail.story_bible_review?.status === "pending_human_confirmation" ? (
-                    <button onClick={confirmStoryBibleReview} disabled={Boolean(busy)}><Check size={14} /> 确认审校结论</button>
-                  ) : (
-                    <button onClick={reviewStoryBible} disabled={Boolean(busy)}><Eye size={14} /> 审校一致性</button>
-                  )}
-                </div>
+                {libraryMode === "workbench" ? (
+                  <div className="story-bible-review-row">
+                    {!detail?.story_bible || detail.story_bible.status !== "confirmed" ? (
+                      <button onClick={confirmStoryBible} disabled={!detail || Boolean(busy)}><Check size={14} /> 确认世界观</button>
+                    ) : detail.story_bible_review?.status === "pending_human_confirmation" ? (
+                      <button onClick={confirmStoryBibleReview} disabled={Boolean(busy)}><Check size={14} /> 确认审校结论</button>
+                    ) : (
+                      <button onClick={reviewStoryBible} disabled={Boolean(busy)}><Eye size={14} /> 审校一致性</button>
+                    )}
+                  </div>
+                ) : null}
                 {detail?.story_bible_review && (
                   <details className="story-bible-review" open={detail.story_bible_review.status === "pending_human_confirmation"}>
                     <summary>一致性审校 · {detail.story_bible_review.verdict} · {detail.story_bible_review.issues.length} 项</summary>
@@ -3184,26 +3037,18 @@ export function BookStudioWorkspace() {
                       <article key={`${issue.title}-${index}`} className={`canon-issue ${issue.severity}`}>
                         <strong>{issue.title}</strong><span>{issue.domain} · {issue.severity}</span>
                         <p>{issue.conflict}</p><p>{issue.impact}</p>
-                        <button onClick={() => createTargetedRework(issue)} disabled={Boolean(busy)}><RefreshCcw size={14} /> 交给故事架构 Agent 修复</button>
+                        {libraryMode === "workbench" ? (
+                          <button onClick={() => createTargetedRework(issue)} disabled={Boolean(busy)}><RefreshCcw size={14} /> 交给故事架构 Agent 修复</button>
+                        ) : null}
                       </article>
                     ))}
                   </details>
                 )}
-              </section>
+              </section>}
 
               <div className="library-layout">
                 <section className="library-canvas">
-                  <div className="library-canvas-head">
-                    <div>
-                      <h3>{librarySection === "setting" ? "设定资料" : librarySection === "outline" ? "章节大纲" : "角色卡"}</h3>
-                      <p>{libraryArtifactSummary ? "当前确认版本已拆分为可阅读卡片。" : "尚未生成该类资料。"}</p>
-                    </div>
-                    <button onClick={() => runAgent(librarySection)} disabled={!detail || Boolean(busy)}>
-                      <RefreshCcw size={14} /> {libraryArtifactSummary ? "用故事架构 Agent 迭代" : "用故事架构 Agent 生成"}
-                    </button>
-                  </div>
-
-                  {showKnowledgeComposer && (
+                  {libraryMode === "workbench" && showKnowledgeComposer && (
                     <section className="library-composer">
                       <div className="library-composer-head">
                         <strong>{editingKnowledgeCardId ? "编辑资料卡" : `补充${librarySection === "setting" ? "设定" : librarySection === "outline" ? "大纲任务" : "角色"}`}</strong>
@@ -3220,7 +3065,7 @@ export function BookStudioWorkspace() {
                         />
                       )}
                       <input value={knowledgeTitle} onChange={(event) => setKnowledgeTitle(event.target.value)} placeholder="资料标题" />
-                      <textarea rows={5} value={knowledgeContent} onChange={(event) => setKnowledgeContent(event.target.value)} placeholder="写明可确认的事实、边界和后续可用方式" />
+                      <textarea rows={5} value={knowledgeContent} onChange={(event) => setKnowledgeContent(event.target.value)} placeholder="资料内容" />
                       <div className="button-row">
                         <button onClick={() => saveKnowledgeCard("pending_human_approval")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>保存待确认</button>
                         <button className="btn-primary" onClick={() => saveKnowledgeCard("approved")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>确认并启用</button>
@@ -3229,28 +3074,100 @@ export function BookStudioWorkspace() {
                   )}
 
                   <div className="knowledge-grid">
-                    {librarySourceSections.map((section) => <KnowledgeSectionCard key={section.title} section={section} />)}
-                    {libraryCards.map((card) => (
+                    {libraryFocus !== "foreshadowing" && librarySourceSections.length > 0 && (
+                      <details className={libraryMode === "official" ? "source-artifact-reference official-source-reference" : "source-artifact-reference"} open>
+                        {libraryMode === "workbench" ? (
+                          <summary>
+                            <span>候选原稿（Markdown 参考）</span>
+                            <span className="source-artifact-reference-meta">
+                              <small>{librarySourceSections.length} 个章节 · 卡片来自同一份原稿</small>
+                              {libraryArtifactSummary && (
+                                <button
+                                  type="button"
+                                  className="icon-btn danger"
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    void deleteLibrarySourceArtifact();
+                                  }}
+                                  title="清空全部世界观内容"
+                                  aria-label="清空全部世界观内容"
+                                >
+                                  <Trash2 size={14} />
+                                </button>
+                              )}
+                            </span>
+                          </summary>
+                        ) : <summary className="official-source-reference-summary" aria-hidden="true" />}
+                        <div className="source-artifact-reference-body">
+                          {librarySourceSections.map((section, index) => (
+                            <article className="managed-knowledge-card source-knowledge-card" key={`${section.title}-${index}`}>
+                              <div className="managed-card-head">
+                                {libraryMode === "workbench" && (
+                                  <div className="managed-card-actions">
+                                    <button className="secondary-action" onClick={() => editKnowledgeSection(section)}>
+                                      <Edit3 size={14} /> 编辑为设定卡
+                                    </button>
+                                    <button className="project-delete-btn" onClick={() => void deleteLibrarySourceSection(section)} title="删除候选卡片" aria-label={`删除候选卡片 ${section.title}`}>
+                                      <Trash2 size={14} />
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                              <KnowledgeSectionCard section={section} />
+                            </article>
+                          ))}
+                        </div>
+                      </details>
+                    )}
+                    {libraryFocus === "foreshadowing" && visibleForeshadowings.map((item) => (
+                      <article className="managed-knowledge-card" key={`foreshadowing-${item.id}`}>
+                        <KnowledgeSectionCard section={{ title: item.title, content: item.content.split("\n") }} />
+                      </article>
+                    ))}
+                    {libraryFocus !== "foreshadowing" && libraryCards.map((card) => (
                       <article className="managed-knowledge-card" key={card.id}>
                         <div className="managed-card-head">
                           <span className={`library-status ${card.status}`}>{card.status === "approved" ? "已确认" : card.status === "pending_human_approval" ? "待确认" : "已归档"}</span>
                           <div className="managed-card-actions">
-                            <button className="icon-btn" onClick={() => editKnowledgeCard(card)} title="编辑资料卡"><Edit3 size={14} /></button>
-                            {card.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "approved")} title="确认并启用"><Check size={14} /></button>}
-                            {card.status !== "archived" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "archived")} title="归档资料卡"><Trash2 size={14} /></button>}
-                          </div>
+                              {libraryMode === "workbench" && (
+                              <button className="icon-btn" onClick={() => editKnowledgeCard(card)} title="编辑资料卡"><Edit3 size={14} /></button>
+                              )}
+                              {libraryMode === "workbench" && card.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "approved")} title="确认并启用"><Check size={14} /></button>}
+                              {libraryMode === "workbench" && card.status !== "archived" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "archived")} title="归档资料卡"><Trash2 size={14} /></button>}
+                              <button className="icon-btn danger" onClick={() => deleteKnowledgeCard(card)} title="彻底删除资料卡"><Trash2 size={14} /></button>
+                            </div>
                         </div>
                         <KnowledgeSectionCard section={{ title: card.title, content: card.content.split("\n") }} />
                       </article>
                     ))}
-                    {librarySourceSections.length === 0 && libraryCards.length === 0 && <div className="empty-state">尚无资料。先生成一版，再由人工逐步补充和确认。</div>}
+                    {libraryFocus === "foreshadowing" && visibleForeshadowings.length === 0 && <div className="empty-state">暂无伏笔</div>}
+                    {libraryFocus !== "foreshadowing" && librarySourceSections.length === 0 && libraryCards.length === 0 && <div className="empty-state">暂无资料</div>}
                   </div>
                 </section>
 
-                <aside className="library-side">
-                  <section className="library-side-panel reference-panel">
-                    <div className="panel-title"><BookOpen size={14} /> 仿写参考</div>
-                    <p className="reference-session-note">仅保存在本次应用运行期间；启用的片段会发送给当前 AI 服务。</p>
+                {libraryMode === "workbench" && libraryFocus !== "setting" && <aside className="library-side">
+                  <details className="library-side-panel reference-panel reference-drawer">
+                    <summary className="reference-drawer-summary">
+                      <span className="reference-drawer-label"><BookOpen size={14} /> 仿写参考</span>
+                      <span className="reference-drawer-meta">
+                        <small>{referenceMaterials.length > 0 ? `${referenceMaterials.length} 个文件` : "未导入"}</small>
+                        <button
+                          type="button"
+                          className="reference-import-trigger"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            referenceFileInputRef.current?.click();
+                          }}
+                          disabled={!detail || Boolean(busy)}
+                        >
+                          <Plus size={13} /> 导入文件
+                        </button>
+                      </span>
+                    </summary>
+                    <div className="reference-drawer-body">
+                      <span className="reference-session-note">本次运行有效</span>
                     <input
                       ref={referenceFileInputRef}
                       className="visually-hidden"
@@ -3258,12 +3175,6 @@ export function BookStudioWorkspace() {
                       accept=".txt,text/plain"
                       onChange={importReferenceFile}
                     />
-                    <button
-                      onClick={() => referenceFileInputRef.current?.click()}
-                      disabled={!detail || Boolean(busy)}
-                    >
-                      <Plus size={14} /> 导入 TXT
-                    </button>
                     <div className="reference-material-list">
                       {referenceMaterials.map((material) => (
                         <article className="reference-material" key={material.id}>
@@ -3273,7 +3184,7 @@ export function BookStudioWorkspace() {
                               <small>{material.char_count.toLocaleString()} 字 · {material.chunk_count} 个片段</small>
                             </div>
                             <div className="managed-card-actions">
-                              <label className="reference-enabled-toggle" title="是否允许本书写作使用">
+                              <label className="reference-enabled-toggle" title="启用参考">
                                 <input
                                   type="checkbox"
                                   checked={material.enabled}
@@ -3317,77 +3228,91 @@ export function BookStudioWorkspace() {
                         <div className="empty-inline">尚未导入临时参考</div>
                       )}
                     </div>
-                  </section>
-                  <section className="library-side-panel">
-                    <div className="panel-title"><FileText size={14} /> 当前章节引用</div>
-                    <strong>{selectedChapter?.title ?? "未选择章节"}</strong>
-                    <p>{selectedChapter ? "正文生产会自动读取已确认资料与相关伏笔。" : "选择章节后查看该章会引用的资料。"}</p>
-                  </section>
-                  <section className="library-side-panel foreshadowing-panel">
-                    <div className="panel-title"><Sparkles size={14} /> 伏笔账本</div>
-                    <button onClick={() => (showForeshadowingComposer ? resetForeshadowingComposer() : setShowForeshadowingComposer(true))} disabled={!detail || Boolean(busy)}><Plus size={14} /> 登记伏笔</button>
-                    {showForeshadowingComposer && (
-                      <div className="foreshadowing-composer">
-                        <strong>{editingForeshadowingId ? "编辑伏笔" : "登记伏笔"}</strong>
-                        <input value={foreshadowingTitle} onChange={(event) => setForeshadowingTitle(event.target.value)} placeholder="伏笔标题" />
-                        <textarea rows={3} value={foreshadowingContent} onChange={(event) => setForeshadowingContent(event.target.value)} placeholder="埋设内容与读者当前应感知到的信息" />
-                        <Select
-                          value={String(foreshadowingPayoffChapterId ?? "")}
-                          onChange={(value) => setForeshadowingPayoffChapterId(Number(value) || null)}
-                          options={[
-                            { value: "", label: "预期回收章节（可稍后指定）" },
-                            ...(detail?.chapters ?? []).map((chapter) => ({ value: String(chapter.id), label: chapter.title })),
-                          ]}
-                        />
-                        <input value={foreshadowingPayoffNote} onChange={(event) => setForeshadowingPayoffNote(event.target.value)} placeholder="或填写回收里程碑" />
-                        <div className="button-row">
-                          <button onClick={() => saveForeshadowing("pending_human_approval")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>保存</button>
-                          <button className="btn-primary" onClick={() => saveForeshadowing("active")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>确认追踪</button>
-                        </div>
-                      </div>
-                    )}
-                    <div className="foreshadowing-list">
-                      {visibleForeshadowings.map((item: Foreshadowing) => {
-                        const payoffChapter = detail?.chapters.find((chapter) => chapter.id === item.planned_payoff_chapter_id);
-                        const statusLabel = item.status === "active" ? "追踪中" : item.status === "ready_for_payoff" ? "可回收" : item.status === "resolved" ? "已回收" : "待确认";
-                        return (
-                          <article key={item.id} className="foreshadowing-item">
-                            <div className="managed-card-head"><span className={`library-status ${item.status}`}>{statusLabel}</span><div className="managed-card-actions">
-                              <button className="icon-btn" onClick={() => editForeshadowing(item)} title="编辑伏笔"><Edit3 size={14} /></button>
-                              {item.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "active")} title="确认追踪"><Check size={14} /></button>}
-                              {item.status === "active" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "ready_for_payoff")} title="标记可回收"><Sparkles size={14} /></button>}
-                              {item.status === "ready_for_payoff" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "resolved")} title="标记已回收"><Check size={14} /></button>}
-                            </div></div>
-                            <strong>{item.title}</strong><p>{item.content}</p><span>{payoffChapter?.title ?? (item.planned_payoff_note || "尚未安排回收")}</span>
-                          </article>
-                        );
-                      })}
-                      {visibleForeshadowings.length === 0 && <div className="empty-inline">还没有登记伏笔</div>}
+                    <div className="reference-context-line">
+                      <FileText size={13} />
+                      <span>当前章节：{selectedChapter?.title ?? "未选择"}</span>
+                      <small>{selectedChapter ? "自动关联已确认资料" : "未选择章节"}</small>
                     </div>
-                  </section>
-                </aside>
+                    </div>
+                  </details>
+                  <details className="library-side-panel foreshadowing-panel library-side-disclosure">
+                    <summary className="library-side-summary">
+                      <span><Sparkles size={14} /> 伏笔账本</span>
+                      <small>{visibleForeshadowings.length} 条</small>
+                    </summary>
+                    <div className="foreshadowing-panel-body">
+                      {libraryMode === "workbench" ? (
+                        <button onClick={() => (showForeshadowingComposer ? resetForeshadowingComposer() : setShowForeshadowingComposer(true))} disabled={!detail || Boolean(busy)}><Plus size={14} /> 登记伏笔</button>
+                      ) : (
+                        <span className="read-only-note">只读</span>
+                      )}
+                      {libraryMode === "workbench" && showForeshadowingComposer && (
+                        <div className="foreshadowing-composer">
+                          <strong>{editingForeshadowingId ? "编辑伏笔" : "登记伏笔"}</strong>
+                          <input value={foreshadowingTitle} onChange={(event) => setForeshadowingTitle(event.target.value)} placeholder="伏笔标题" />
+                          <textarea rows={3} value={foreshadowingContent} onChange={(event) => setForeshadowingContent(event.target.value)} placeholder="伏笔内容" />
+                          <Select
+                            value={String(foreshadowingPayoffChapterId ?? "")}
+                            onChange={(value) => setForeshadowingPayoffChapterId(Number(value) || null)}
+                            options={[
+                              { value: "", label: "回收章节（可选）" },
+                              ...(detail?.chapters ?? []).map((chapter) => ({ value: String(chapter.id), label: chapter.title })),
+                            ]}
+                          />
+                          <input value={foreshadowingPayoffNote} onChange={(event) => setForeshadowingPayoffNote(event.target.value)} placeholder="回收里程碑" />
+                          <div className="button-row">
+                            <button onClick={() => saveForeshadowing("pending_human_approval")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>保存</button>
+                            <button className="btn-primary" onClick={() => saveForeshadowing("active")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>确认追踪</button>
+                          </div>
+                        </div>
+                      )}
+                      <div className="foreshadowing-list">
+                        {visibleForeshadowings.map((item: Foreshadowing) => {
+                          const payoffChapter = detail?.chapters.find((chapter) => chapter.id === item.planned_payoff_chapter_id);
+                          const statusLabel = item.status === "active" ? "追踪中" : item.status === "ready_for_payoff" ? "可回收" : item.status === "resolved" ? "已回收" : "待确认";
+                          return (
+                            <article key={item.id} className="foreshadowing-item">
+                              <div className="managed-card-head"><span className={`library-status ${item.status}`}>{statusLabel}</span>{libraryMode === "workbench" && <div className="managed-card-actions">
+                                <button className="icon-btn" onClick={() => editForeshadowing(item)} title="编辑伏笔"><Edit3 size={14} /></button>
+                                {item.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "active")} title="确认追踪"><Check size={14} /></button>}
+                                {item.status === "active" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "ready_for_payoff")} title="标记可回收"><Sparkles size={14} /></button>}
+                                {item.status === "ready_for_payoff" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "resolved")} title="标记已回收"><Check size={14} /></button>}
+                              </div>}</div>
+                              <strong>{item.title}</strong><p>{item.content}</p><span>{payoffChapter?.title ?? (item.planned_payoff_note || "尚未安排回收")}</span>
+                            </article>
+                          );
+                        })}
+                        {visibleForeshadowings.length === 0 && <div className="empty-inline">还没有登记伏笔</div>}
+                      </div>
+                    </div>
+                  </details>
+                </aside>}
               </div>
-            </section>
-          ) : (
-            <>
+            </section>) : null}
+          <>
           {/* Center: Editor */}
-          <section className="editor">
+          {mainSurface === "workbench" && (<section className="editor">
             <div className="editor-toolbar">
               <div>
-                <h2>{stages.find((stage) => stage.id === selectedStage)?.label}</h2>
+                <div className="editor-title-line">
+                  <h2>{stages.find((stage) => stage.id === selectedStage)?.label}</h2>
+                  <span className="workspace-mode-badge draft">草稿 / 候选</span>
+                </div>
                 <p>{selectedChapter ? selectedChapter.title : "整书资料"}</p>
               </div>
               <div className="button-row">
                 <button onClick={() => runAgent(selectedStage)} disabled={!detail || Boolean(busy)}>
-                  <Play size={14} /> {selectedBookArtifactCanIterate ? "基于当前版本迭代" : "生成"}
+                  <Play size={14} /> {selectedBookArtifactCanIterate ? "基于当前版本迭代" : selectedStage === "revision" ? "生成修订" : selectedStage === "draft" ? "生成草稿" : "生成"}
                 </button>
-                <button
-                  className="btn-primary"
-                  onClick={approveArtifact}
-                  disabled={!selectedArtifact || selectedArtifactApproved || Boolean(busy)}
-                >
-                  <Check size={14} /> {selectedArtifactApproved ? "已通过" : "人工通过"}
-                </button>
+                {selectedArtifact?.stage !== "review" && (
+                  <button
+                    className="btn-primary"
+                    onClick={approveArtifact}
+                    disabled={!selectedArtifact || selectedArtifactApproved || Boolean(busy)}
+                  >
+                    <Check size={14} /> {selectedArtifactApproved ? "已通过" : "审核通过"}
+                  </button>
+                )}
                 {selectedArtifactSupportsAdoption && (
                   <button
                     onClick={() => selectedArtifactProposals.length > 0 ? setShowAdoptionDrawer(true) : prepareArtifactAdoptions()}
@@ -3399,14 +3324,19 @@ export function BookStudioWorkspace() {
                       : ""}
                   </button>
                 )}
-                <details className="toolbar-more">
-                  <summary>更多</summary>
-                  <div className="toolbar-more-menu">
+                <DropdownMenu
+                  label="更多"
+                  className="toolbar-more"
+                  triggerClassName="toolbar-more-trigger"
+                  menuClassName="toolbar-more-menu"
+                  menuWidth={168}
+                  align="end"
+                >
                     <button
                       onClick={() => runAgent(selectedStage, "fresh")}
                       disabled={!detail || Boolean(busy)}
                     >
-                      <RefreshCcw size={14} /> {selectedBookArtifactCanIterate ? "整版重写" : "重新生成"}
+                      <RefreshCcw size={14} /> {selectedBookArtifactCanIterate ? "整版重写" : selectedStage === "revision" ? "整版重写" : "重新生成"}
                     </button>
                     <button
                       onClick={deleteSelectedArtifact}
@@ -3416,8 +3346,28 @@ export function BookStudioWorkspace() {
                       <Trash2 size={14} />
                       {selectedArtifactDeleteBlockReason ?? "删除当前版本"}
                     </button>
+                </DropdownMenu>
+              </div>
+            </div>
+
+            <div className="workflow-strip" aria-label="章节创作流程">
+              <div className="workflow-steps">
+                {productionStages.map((stage, index) => (
+                  <div className="workflow-step-group" key={stage.id}>
+                    <button
+                      type="button"
+                      className={stage.id === selectedStage ? "workflow-step active" : "workflow-step"}
+                      onClick={() => {
+                        setSelectedStage(stage.id);
+                        setSelectedArtifactId(null);
+                      }}
+                    >
+                      <span className="workflow-step-index">{index + 1}</span>
+                      <span>{stage.label}</span>
+                    </button>
+                    {index < productionStages.length - 1 && <ChevronRight className="workflow-step-arrow" size={14} />}
                   </div>
-                </details>
+                ))}
               </div>
             </div>
 
@@ -3438,7 +3388,7 @@ export function BookStudioWorkspace() {
                       );
                     }}
                   >
-                    v{artifact.version} · {artifact.status}
+                    v{artifact.version} · {stageLabel(artifact.stage)} · {artifact.status}
                     {selectedChapter?.current_artifact_id === artifact.id ? " · 当前正文" : ""}
                   </button>
                 ))}
@@ -3466,7 +3416,7 @@ export function BookStudioWorkspace() {
                 <>
                   <div className="artifact-meta">
                     <strong>{stageLabel(streamingRun.stage)}正在生成</strong>
-                    <span>实时草稿，完成后才会形成待人工确认版本</span>
+                    <span>实时输出 · 待确认</span>
                     <button
                       type="button"
                       className="secondary-action"
@@ -3489,16 +3439,23 @@ export function BookStudioWorkspace() {
                     <span>{new Date(selectedArtifact.created_at).toLocaleString()}</span>
                   </div>
                   {selectedBookArtifactCanIterate && (
-                    <div className="empty-inline">
-                      当前阶段支持局部 agent 迭代：左侧这个版本会作为上下文保留，配合右侧人工指令只改局部；点“整版重写”则忽略当前版本重做。
+                    <div className="empty-inline">局部迭代模式</div>
+                  )}
+                  {selectedArtifact.stage === "review" && reviewSourceArtifact && (
+                    <div className="artifact-meta-sub">
+                      <span>被审原文 · v{reviewSourceArtifact.version}</span>
                     </div>
                   )}
-                  <pre>{selectedArtifact.content}</pre>
+                  {selectedArtifact.stage === "review" && reviewSourceArtifact ? (
+                    <pre className="review-source-content">{reviewSourceArtifact.content}</pre>
+                  ) : (
+                    <pre>{selectedArtifact.content}</pre>
+                  )}
                 </>
               ) : selectedArtifactSummary && selectedArtifactQuery.isFetching ? (
                 <div className="empty-state"><Loader2 size={18} className="spin" /> 正在加载产物正文…</div>
               ) : (
-                <div className="empty-state">当前阶段还没有产物</div>
+                <div className="empty-state">暂无产物</div>
               )}
             </article>
 
@@ -3521,16 +3478,16 @@ export function BookStudioWorkspace() {
                     <p><b>建议：</b>{issue.suggestion}</p>
                 </section>
               )) : (
-                <div className="empty-state compact">试读结果还不是结构化 JSON，先看原文。</div>
+                <div className="empty-state compact">结果非结构化，显示原文</div>
               )}
             </div>
             )}
             {selectedArtifact?.stage === "review" &&
               ledgerContinuityReport &&
               selectedArtifact.parent_artifact_id === ledgerContinuityReport.artifact_id && (
-              <section className="ledger-report" aria-label="状态账本核对结果">
+              <section className="ledger-report" aria-label="连续性核对结果">
                 <div className="ledger-report-head">
-                  <strong>状态账本核对</strong>
+                  <strong>连续性核对</strong>
                   <span>{ledgerContinuityReport.issues.length > 0 ? `${ledgerContinuityReport.issues.length} 条需核对` : "未发现直接冲突"}</span>
                 </div>
                 <p>{ledgerContinuityReport.summary}</p>
@@ -3546,29 +3503,24 @@ export function BookStudioWorkspace() {
                 ))}
               </section>
             )}
-          </section>
+          </section>)}
 
           {/* Right: Assistant Panel */}
+          {mainSurface === "workbench" && (
           <aside className="assistant-panel">
             <section className="panel next-action-panel">
               <div className="panel-title">
-                <MessageSquare size={14} />
-                下一步：{stageLabel(selectedStage)}
+                <PenLine size={14} />
+                创作指令
               </div>
-              <p className="next-action-copy">
-                {selectedArtifactApproved
-                  ? "这个版本已由人工确认。选择下一阶段，或继续做小范围迭代。"
-                  : selectedArtifact
-                    ? "先阅读当前候选稿，补充必要指令后再生成或人工确认。"
-                    : "给 Agent 一条清晰的本章目标，再生成第一个候选版本。"}
-              </p>
+              <div className="stage-hint">当前阶段：{stageLabel(selectedStage)}</div>
               <textarea
                 rows={4}
                 value={instruction}
                 placeholder={
                   selectedBookArtifactCanIterate
-                    ? "追加局部修改指令，例如：只调整第 3 节的修炼规则，不改前两节结构"
-                    : "追加给下一次 Agent 的人工指令"
+                    ? "例如：只调整第 3 节"
+                    : "人工指令"
                 }
                 onChange={(event) => setInstruction(event.target.value)}
               />
@@ -3577,7 +3529,7 @@ export function BookStudioWorkspace() {
                   <div className="reference-selection-head">
                     <div>
                       <strong>仿写参考</strong>
-                      <span>{activeReferenceSelection.enabled ? `${selectedReferenceIds.size} 份资料参与本次生成` : "本章已关闭"}</span>
+                      <span>{activeReferenceSelection.enabled ? `${selectedReferenceIds.size} 份资料参与本次生成` : "未启用"}</span>
                     </div>
                     <label>
                       <input
@@ -3624,14 +3576,14 @@ export function BookStudioWorkspace() {
                 onClick={() => runAgent(selectedStage)}
                 disabled={!detail || Boolean(busy)}
               >
-                <Sparkles size={14} /> {selectedBookArtifactCanIterate ? "带指令局部迭代" : "带指令运行"}
+                <Sparkles size={14} /> {selectedBookArtifactCanIterate ? "生成修订" : selectedStage === "revision" ? "生成修订" : selectedStage === "draft" ? "生成草稿" : "生成候选"}
               </button>
               <button
                 className="secondary-action"
                 onClick={previewAgentContext}
                 disabled={!detail || Boolean(busy)}
               >
-                <Eye size={14} /> 查看生成上下文
+                <Eye size={14} /> 预览生成上下文
               </button>
               {contextPreview && (
                 <section className="context-preview-panel">
@@ -3642,7 +3594,7 @@ export function BookStudioWorkspace() {
                     </div>
                     <button className="icon-btn" onClick={() => setContextPreview(null)} title="关闭上下文预览" aria-label="关闭上下文预览">×</button>
                   </div>
-                  <p className="context-preview-note">预览执行与正式运行相同的上下文准备和读取工具，可能产生模型调用、联网和费用；不会创建写入提案或修改业务数据。该上下文 15 分钟内可被正式运行复用。</p>
+                  <p className="context-preview-note">预览 · 可能产生费用 · 只读</p>
                   <details className="context-preview-section">
                     <summary>Agent 角色规则</summary>
                     <pre>{contextPreview.system_prompt}</pre>
@@ -3658,28 +3610,27 @@ export function BookStudioWorkspace() {
                   ))}
                 </section>
               )}
-              <AgentRunInspector
-                run={lastAgentRun}
-                proposals={actionProposals}
-                busy={Boolean(busy)}
-                onApplyProposal={(proposal) => void applyAgentProposal(proposal)}
-                onRejectProposal={(proposal) => void rejectAgentProposal(proposal)}
-              />
-              {canRunReview && selectedArtifact?.stage !== "review" && (
-                <button
-                  className="secondary-action"
-                  onClick={() => runAgent("review")}
-                  disabled={!detail || Boolean(busy)}
-                >
-                  <Play size={14} /> 提交试读
-                </button>
-              )}
+            </section>
+
+            <AgentRunInspector
+              run={lastAgentRun}
+              proposals={actionProposals}
+              busy={Boolean(busy)}
+              onApplyProposal={(proposal) => void applyAgentProposal(proposal)}
+              onRejectProposal={(proposal) => void rejectAgentProposal(proposal)}
+            />
+
+            <section className="panel next-action-panel confirm-panel">
+              <div className="panel-title">
+                <Check size={14} />
+                确认与修订
+              </div>
               {selectedArtifact?.stage === "review" && (
                 <>
                   <textarea
                     rows={4}
                     value={revisionFeedback}
-                    placeholder="决定采纳哪些试读意见，或写下你的修订要求"
+                    placeholder="修订要求"
                     onChange={(event) => setRevisionFeedback(event.target.value)}
                   />
                   <button
@@ -3691,6 +3642,57 @@ export function BookStudioWorkspace() {
                   </button>
                 </>
               )}
+              {canRunReview && selectedArtifact?.stage !== "review" && (
+                <button
+                  className="secondary-action"
+                  onClick={() => runAgent("review")}
+                  disabled={!detail || Boolean(busy)}
+                >
+                  <Play size={14} /> 提交试读
+                </button>
+              )}
+              <div className="local-patch-tool">
+                <div className="tool-subtitle">局部改写</div>
+                <textarea
+                  rows={4}
+                  value={patchFindText}
+                  placeholder="原文片段"
+                  onChange={(event) => setPatchFindText(event.target.value)}
+                />
+                <textarea
+                  rows={4}
+                  value={aiPatchInstruction}
+                  placeholder="局部改写要求"
+                  onChange={(event) => setAiPatchInstruction(event.target.value)}
+                />
+                <button
+                  onClick={reviseSelectedArtifactSpanWithAi}
+                  disabled={
+                    !selectedArtifactSupportsLocalPatch ||
+                    !patchFindText.trim() ||
+                    !aiPatchInstruction.trim() ||
+                    Boolean(busy)
+                  }
+                >
+                  <Sparkles size={14} /> AI 局部改写
+                </button>
+                <textarea
+                  rows={4}
+                  value={patchReplaceText}
+                  placeholder="替换文本（留空删除）"
+                  onChange={(event) => setPatchReplaceText(event.target.value)}
+                />
+                <button
+                  onClick={replaceSelectedArtifactSpan}
+                  disabled={
+                    !selectedArtifactSupportsLocalPatch ||
+                    !patchFindText.trim() ||
+                    Boolean(busy)
+                  }
+                >
+                  <Edit3 size={14} /> 局部替换
+                </button>
+              </div>
               {selectedArtifact && !selectedArtifactApproved && (
                 <>
                   <textarea
@@ -3704,75 +3706,15 @@ export function BookStudioWorkspace() {
                     onClick={approveArtifact}
                     disabled={Boolean(busy)}
                   >
-                    <Check size={14} /> 人工通过{selectedArtifact.stage === "draft" || selectedArtifact.stage === "revision" ? "并应用正文" : ""}
+                    <Check size={14} /> 通过当前产物
                   </button>
                 </>
               )}
             </section>
 
-            <details className="advanced-tools">
-              <summary>检查、版本、检索与更多工具</summary>
-              <div className="advanced-tools-content">
-            <section className="panel">
-              <div className="panel-title">
-                <RefreshCcw size={14} />
-                修订与局部修改
-              </div>
-              <button onClick={() => runAgent("review")} disabled={!detail || !canRunReview || Boolean(busy)}>
-                <Play size={14} /> 提交试读
-              </button>
-              <textarea
-                rows={5}
-                value={revisionFeedback}
-                placeholder="人工修订要求，或对试读意见的取舍"
-                onChange={(event) => setRevisionFeedback(event.target.value)}
-              />
-              <button onClick={requestRevision} disabled={!canRequestRevision || Boolean(busy)}>
-                <RefreshCcw size={14} /> 请求修订
-              </button>
-              <div className="local-patch-tool">
-                <div className="tool-subtitle">局部版本修订</div>
-                <textarea
-                  rows={4}
-                  value={patchFindText}
-                  placeholder="原文片段：从当前产物里复制一段唯一文本"
-                  onChange={(event) => setPatchFindText(event.target.value)}
-                />
-                <textarea
-                  rows={4}
-                  value={aiPatchInstruction}
-                  placeholder="AI 局部修订要求：例如只加强这段对白对撞，不改其他段落"
-                  onChange={(event) => setAiPatchInstruction(event.target.value)}
-                />
-                <button
-                  onClick={reviseSelectedArtifactSpanWithAi}
-                  disabled={
-                    !selectedArtifactSupportsLocalPatch ||
-                    !patchFindText.trim() ||
-                    !aiPatchInstruction.trim() ||
-                    Boolean(busy)
-                  }
-                >
-                  <Sparkles size={14} /> AI 局部修订
-                </button>
-                <textarea
-                  rows={4}
-                  value={patchReplaceText}
-                  placeholder="替换为：只写这段的新文本，可留空表示删除"
-                  onChange={(event) => setPatchReplaceText(event.target.value)}
-                />
-                <button
-                  onClick={replaceSelectedArtifactSpan}
-                  disabled={
-                    !selectedArtifactSupportsLocalPatch ||
-                    !patchFindText.trim() ||
-                    Boolean(busy)
-                  }
-                >
-                  <Edit3 size={14} /> 生成局部版本
-                </button>
-              </div>
-            </section>
+            <details className="tools-group" open>
+              <summary>质量与连续性</summary>
+              <div className="tools-group-content">
 
             <section className="panel">
               <div className="panel-title">
@@ -3792,7 +3734,7 @@ export function BookStudioWorkspace() {
                   Boolean(busy)
                 }
               >
-                <Check size={14} /> 检查通过前状态
+                <Check size={14} /> 通过前检查
               </button>
               {chapterGateReport?.recommended_action === "split" && (
                 <button
@@ -3827,7 +3769,7 @@ export function BookStudioWorkspace() {
                       </article>
                     ))}
                     {chapterGateReport.blockers.length === 0 && (
-                      <div className="empty-inline">没有发现硬阻断，仍需人工判断是否可用</div>
+                      <div className="empty-inline">无硬阻断</div>
                     )}
                   </div>
                 </div>
@@ -3969,6 +3911,12 @@ export function BookStudioWorkspace() {
               )}
             </section>
 
+            </div>
+            </details>
+
+            <details className="tools-group">
+              <summary>资料检索</summary>
+              <div className="tools-group-content">
             <section className="panel">
               <div className="panel-title">
                 <Search size={14} />
@@ -3985,7 +3933,7 @@ export function BookStudioWorkspace() {
               />
               <div className="context-search-actions">
                 <button onClick={searchContext} disabled={!detail || !contextQuery.trim() || Boolean(busy)}>
-                  <Search size={14} /> 搜索数据库上下文
+                  <Search size={14} /> 检索全书资料
                 </button>
                 <button
                   className="secondary-action"
@@ -3998,7 +3946,7 @@ export function BookStudioWorkspace() {
               {contextSnippets.length > 0 && (
                 <div className="context-result-group">
                   <div className="context-result-group-head">
-                    <strong>原始混合召回</strong>
+                    <strong>原始召回结果</strong>
                     <span>{contextSnippets.length} 条</span>
                   </div>
                   <div className="context-results">
@@ -4034,31 +3982,18 @@ export function BookStudioWorkspace() {
                         </article>
                       ))}
                     </div>
-                  ) : <p className="context-rerank-empty">没有候选通过 AI 相关性筛选。</p>}
+                  ) : <p className="context-rerank-empty">暂无相关候选</p>}
                 </div>
               )}
             </section>
 
-            <section className="panel">
-              <div className="panel-title">
-                <Check size={14} />
-                人工确认
-              </div>
-              <textarea
-                rows={3}
-                value={approvalNote}
-                placeholder="确认备注，可为空"
-                onChange={(event) => setApprovalNote(event.target.value)}
-              />
-              <button
-                className="btn-primary"
-                onClick={approveArtifact}
-                disabled={!selectedArtifact || selectedArtifactApproved || Boolean(busy)}
-              >
-                <Check size={14} /> {selectedArtifactApproved ? "当前产物已通过" : "通过当前产物"}
-              </button>
-            </section>
 
+            </div>
+            </details>
+
+            <details className="tools-group">
+              <summary>协作记录</summary>
+              <div className="tools-group-content">
             <section className="panel">
               <div className="panel-title">
                 <MessageSquare size={14} />
@@ -4107,7 +4042,7 @@ export function BookStudioWorkspace() {
               <section className="panel">
                 <div className="panel-title">
                   <Download size={14} />
-                  Markdown
+                  导出
                 </div>
                 <textarea readOnly rows={6} value={exportText} />
                 <button className="secondary-action" onClick={downloadExportedMarkdown}>
@@ -4118,8 +4053,8 @@ export function BookStudioWorkspace() {
               </div>
             </details>
           </aside>
-            </>
           )}
+          </>
         </div>
       </section>
 

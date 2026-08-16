@@ -7,24 +7,23 @@ use crate::{
         ActionProposal, ActiveAgentRun, AdoptionBatchResult, AdoptionProposal, Agent,
         AgentRunRequest, AgentRunSummary, AgentStepResult, AgentToolDefinition, AiProvider,
         AiSettings, AiSpanRevisionRequest, Approval, Artifact, ArtifactFilters, ArtifactSummary,
-        Chapter, ChapterGateReport, ChapterGateRequest, ChapterMemoryRecord, ChapterSplitPlan,
-        ChapterSplitPlanRequest, ChapterUpdate, ClearChapterHistoryRequest,
-        ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest, ContextPreview, ContinuityReport,
-        ContinuityReviewRequest, DecideActionProposalRequest, DecideAdoptionProposalsRequest,
-        DeleteArtifactRequest, DerivedIndexJob, Foreshadowing, HistoryCleanupResult,
-        ImportReferenceTextRequest, KnowledgeCard, LedgerContinuityCheckRequest,
-        LedgerContinuityReport, LegacyAgentPrompt, ListActionProposalsRequest,
-        ListAdoptionProposalsRequest, ListModelsInput, NewChapter, NewProject,
-        PrepareArtifactAdoptionsRequest, PreparedContext, Project, ProjectDetail, ProjectUpdate,
-        ProjectWorkspace, ProposalApplyResult, ProviderCapabilities, QualityReport,
-        RebuildChapterMemoryRequest, RebuildStoryIndexRequest, RebuildStorySearchIndexRequest,
-        ReferenceMaterial, RetryIndexJobsRequest, RevisionRequest, RunAgentRequest, RunEvent,
-        RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider, SaveAiSettings,
-        SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest, StoryBible,
-        StoryBibleReview, StoryBibleReviewRequest, StoryContextRerankRequest,
-        StoryContextRerankResult, StoryContextSearchInput, StoryContextSnippet, StoryIndexSummary,
-        TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
-        WritingSkill,
+        Chapter, ChapterGateReport, ChapterGateRequest, ChapterSplitPlan, ChapterSplitPlanRequest,
+        ChapterUpdate, ClearChapterHistoryRequest, ConfirmStoryBibleRequest,
+        ConfirmStoryBibleReviewRequest, ContinuityReport, ContinuityReviewRequest,
+        DecideActionProposalRequest, DecideAdoptionProposalsRequest, DeleteArtifactRequest,
+        DeleteKnowledgeCardRequest, DerivedIndexJob, Foreshadowing, HistoryCleanupResult,
+        ImportReferenceTextRequest,
+        KnowledgeCard, LedgerContinuityCheckRequest, LedgerContinuityReport,
+        ListActionProposalsRequest, ListAdoptionProposalsRequest, ListModelsInput, NewChapter,
+        NewProject, PrepareArtifactAdoptionsRequest, PreparedContext, Project, ProjectDetail,
+        ProjectUpdate, ProjectWorkspace, ProposalApplyResult, ProviderCapabilities, QualityReport,
+        RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, ReferenceMaterial,
+        RetryIndexJobsRequest, RevisionRequest, RunEvent, RunStoryArchitectRequest,
+        SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
+        SaveWritingSkill, SpanReplacementRequest, StoryBible, StoryBibleReview,
+        StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextRerankResult,
+        StoryContextSearchInput, StoryContextSnippet, StoryIndexSummary, TestAiConnectionInput,
+        UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest, WritingSkill,
     },
 };
 
@@ -202,6 +201,14 @@ pub fn save_knowledge_card(
 }
 
 #[tauri::command]
+pub fn delete_knowledge_card(
+    gateway: State<'_, ApplicationGateway>,
+    input: DeleteKnowledgeCardRequest,
+) -> AppResult<()> {
+    gateway.delete_knowledge_card(input)
+}
+
+#[tauri::command]
 pub fn save_foreshadowing(
     gateway: State<'_, ApplicationGateway>,
     input: SaveForeshadowing,
@@ -266,38 +273,6 @@ pub async fn list_models(
 }
 
 #[tauri::command]
-pub async fn run_agent_step(
-    gateway: State<'_, ApplicationGateway>,
-    input: RunAgentRequest,
-) -> AppResult<AgentStepResult> {
-    gateway.run_agent_step(input).await
-}
-
-#[tauri::command]
-pub async fn rebuild_chapter_memory(
-    gateway: State<'_, ApplicationGateway>,
-    input: RebuildChapterMemoryRequest,
-) -> AppResult<ChapterMemoryRecord> {
-    gateway.rebuild_chapter_memory(input).await
-}
-
-#[tauri::command]
-pub async fn run_story_architect(
-    gateway: State<'_, ApplicationGateway>,
-    input: RunStoryArchitectRequest,
-) -> AppResult<AgentStepResult> {
-    gateway.run_story_architect(input).await
-}
-
-#[tauri::command]
-pub async fn create_targeted_rework(
-    gateway: State<'_, ApplicationGateway>,
-    input: RunStoryArchitectRequest,
-) -> AppResult<AgentStepResult> {
-    gateway.create_targeted_rework(input).await
-}
-
-#[tauri::command]
 pub fn confirm_story_bible(
     gateway: State<'_, ApplicationGateway>,
     input: ConfirmStoryBibleRequest,
@@ -327,14 +302,6 @@ pub fn list_story_arcs(
     project_id: i64,
 ) -> AppResult<Vec<crate::models::StoryArc>> {
     gateway.list_story_arcs(project_id)
-}
-
-#[tauri::command]
-pub fn preview_agent_context(
-    gateway: State<'_, ApplicationGateway>,
-    input: RunAgentRequest,
-) -> AppResult<ContextPreview> {
-    gateway.preview_agent_context(input)
 }
 
 #[tauri::command]
@@ -381,14 +348,6 @@ pub fn get_story_search_status(
 }
 
 #[tauri::command]
-pub async fn request_revision(
-    gateway: State<'_, ApplicationGateway>,
-    input: RevisionRequest,
-) -> AppResult<AgentStepResult> {
-    gateway.request_revision(input).await
-}
-
-#[tauri::command]
 pub fn replace_artifact_span(
     gateway: State<'_, ApplicationGateway>,
     input: SpanReplacementRequest,
@@ -418,14 +377,6 @@ pub fn clear_chapter_history(
     input: ClearChapterHistoryRequest,
 ) -> AppResult<HistoryCleanupResult> {
     gateway.clear_chapter_history(input)
-}
-
-#[tauri::command]
-pub fn list_artifacts(
-    gateway: State<'_, ApplicationGateway>,
-    filters: ArtifactFilters,
-) -> AppResult<Vec<Artifact>> {
-    gateway.list_artifacts(filters)
 }
 
 #[tauri::command]
@@ -492,11 +443,6 @@ pub async fn rerank_story_context(
     input: StoryContextRerankRequest,
 ) -> AppResult<StoryContextRerankResult> {
     gateway.rerank_story_context(input).await
-}
-
-#[tauri::command]
-pub fn list_tool_definitions(gateway: State<'_, ApplicationGateway>) -> Vec<AgentToolDefinition> {
-    gateway.list_agent_tools()
 }
 
 #[tauri::command]
@@ -595,13 +541,6 @@ pub fn list_index_jobs(
     project_id: i64,
 ) -> AppResult<Vec<DerivedIndexJob>> {
     gateway.list_index_jobs(project_id)
-}
-
-#[tauri::command]
-pub fn list_legacy_agent_prompts(
-    gateway: State<'_, ApplicationGateway>,
-) -> AppResult<Vec<LegacyAgentPrompt>> {
-    gateway.list_legacy_agent_prompts()
 }
 
 #[tauri::command]

@@ -21,13 +21,15 @@ use crate::{
     genre_skill,
     models::{
         Agent, AgentStepResult, AiSpanRevisionRequest, Artifact, ChapterSplitPlan,
-        ChapterSplitPlanRequest, ContextPreview, ContextPreviewSegment, ContinuityIssue,
-        ContinuityReport, ContinuityReviewRequest, Project, ReviewIssue, RevisionRequest,
-        RunAgentRequest, SpanReplacementRequest, Stage, StoryContextSearchInput,
-        StoryContextSnippet, WorkflowRun,
+        ChapterSplitPlanRequest, ContinuityIssue, ContinuityReport, ContinuityReviewRequest,
+        Project, ReviewIssue, RunAgentRequest, SpanReplacementRequest, Stage,
+        StoryContextSearchInput, StoryContextSnippet, WorkflowRun,
     },
     quality, story_architecture,
 };
+
+#[cfg(test)]
+use crate::models::RevisionRequest;
 
 #[derive(Debug, Clone)]
 struct ChapterTaskContract {
@@ -202,6 +204,7 @@ fn normalize_evidence_text(text: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 pub async fn run_agent_step(
     state: &AppState,
     input: RunAgentRequest,
@@ -700,136 +703,10 @@ async fn run_agent_step_impl(
     }
 }
 
-pub fn preview_agent_context(
-    state: &AppState,
-    input: RunAgentRequest,
-) -> AppResult<ContextPreview> {
-    state.get_project(input.project_id)?;
-    let chapter = state.ensure_chapter(input.project_id, input.chapter_id)?;
-    validate_stage_scope(&input.stage, chapter.is_some())?;
-    let source_artifact = input
-        .source_artifact_id
-        .map(|artifact_id| state.get_artifact(artifact_id))
-        .transpose()?;
+// Agent context is persisted as PreparedContext and read through the background-run API.
+// The former standalone preview endpoint intentionally no longer has a second representation.
 
-    if let Some(source) = source_artifact.as_ref() {
-        if source.project_id != input.project_id {
-            return Err(AppError::Validation("候选稿不属于当前项目".to_string()));
-        }
-        let valid_source = match input.stage {
-            Stage::Setting | Stage::Outline | Stage::Characters => {
-                source.chapter_id.is_none() && source.stage == input.stage.as_str()
-            }
-            Stage::Review => {
-                source.chapter_id == input.chapter_id
-                    && (source.stage == "draft" || source.stage == "revision")
-            }
-            _ => false,
-        };
-        if !valid_source {
-            return Err(AppError::Validation(
-                "当前阶段不支持把这个产物作为上下文来源".to_string(),
-            ));
-        }
-    }
-
-    validate_prerequisites(
-        state,
-        input.project_id,
-        &input.stage,
-        input.chapter_id,
-        source_artifact.as_ref(),
-    )?;
-
-    let agent = state.get_agent_for_project_stage(input.project_id, input.stage.as_str())?;
-    let mut prompt = build_prompt_for_agent(
-        state,
-        input.project_id,
-        &input.stage,
-        input.chapter_id,
-        input.user_instruction.as_deref(),
-        source_artifact.as_ref(),
-        None,
-        &agent,
-    )?;
-    if agent.has_tool(agent_tools::REFERENCE_MATERIALS) {
-        if let Some(reference_context) = crate::reference::render_context(
-            state,
-            input.project_id,
-            &input.stage,
-            input.reference_selection.as_ref(),
-            &reference_query(
-                state,
-                input.project_id,
-                &input.stage,
-                input.chapter_id,
-                input.user_instruction.as_deref(),
-                source_artifact.as_ref(),
-            )?,
-        )? {
-            prompt.push_str("\n\n");
-            prompt.push_str(&reference_context);
-        }
-    }
-    let genre_agent = state.get_genre_agent_for_project(input.project_id)?;
-    let segments = split_context_prompt(&prompt);
-    let total_chars = prompt.chars().count();
-
-    Ok(ContextPreview {
-        stage: input.stage.as_str().to_string(),
-        genre_agent,
-        system_prompt: agent.system_prompt,
-        segments,
-        total_chars,
-        estimated_tokens: total_chars.div_ceil(4),
-    })
-}
-
-fn split_context_prompt(prompt: &str) -> Vec<ContextPreviewSegment> {
-    const MAX_PREVIEW_CHARS: usize = 2400;
-    let mut segments: Vec<(String, String)> = Vec::new();
-
-    for line in prompt.lines() {
-        let is_heading = line.starts_with("# ");
-        if is_heading {
-            segments.push((
-                line.trim_start_matches("# ").trim().to_string(),
-                String::new(),
-            ));
-        } else if let Some((_, content)) = segments.last_mut() {
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str(line);
-        }
-    }
-
-    if segments.is_empty() {
-        segments.push(("生成上下文".to_string(), prompt.to_string()));
-    }
-
-    segments
-        .into_iter()
-        .filter(|(_, content)| !content.trim().is_empty())
-        .map(|(label, content)| {
-            let chars = content.chars().count();
-            let truncated = chars > MAX_PREVIEW_CHARS;
-            let preview = if truncated {
-                content.chars().take(MAX_PREVIEW_CHARS).collect::<String>()
-                    + "\n…（预览已截断，实际内容仍按完整上下文发送）"
-            } else {
-                content
-            };
-            ContextPreviewSegment {
-                label,
-                content: preview,
-                chars,
-                truncated,
-            }
-        })
-        .collect()
-}
-
+#[cfg(test)]
 pub async fn request_revision(
     state: &AppState,
     input: RevisionRequest,
@@ -1152,6 +1029,21 @@ pub fn replace_artifact_span(
         .content
         .replacen(&input.find_text, &input.replace_text, 1);
     let note = input.note.as_deref().unwrap_or("").trim();
+    if note.starts_with("删除候选卡片") && matches!(source.stage.as_str(), "setting" | "outline" | "characters") {
+        let artifact = state.update_artifact_content(input.project_id, source.id, &patched_content)?;
+        let run_input = format!("# in-place-candidate-card-delete\n\nsource_artifact_id: {}\nnote: {}", source.id, note);
+        let run = state.insert_workflow_run(
+            input.project_id,
+            source.chapter_id,
+            "revision_patch",
+            &run_input,
+            &patched_content,
+            "completed",
+            None,
+            0,
+        )?;
+        return Ok(AgentStepResult { artifact, run });
+    }
     let run_input = format!(
         "# local-span-replacement\n\nsource_artifact_id: {}\nfind_chars: {}\nreplace_chars: {}\nnote: {}\n\n## find_text\n{}\n\n## replace_text\n{}",
         source.id,
@@ -1824,6 +1716,7 @@ fn agent_search_source(
     Ok(parts.join("\n\n"))
 }
 
+#[cfg(test)]
 fn revision_search_source(
     revision_source: &Artifact,
     requested_source: &Artifact,

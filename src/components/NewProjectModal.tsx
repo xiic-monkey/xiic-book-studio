@@ -56,7 +56,7 @@ export function NewProjectModal({ isOpen, onClose, onSubmit, formData, onFormCha
               type="text"
               value={formData.title}
               onChange={(e) => onFormChange({ ...formData, title: e.target.value })}
-              placeholder="小说标题"
+              placeholder="书名"
               required
             />
           </div>
@@ -89,7 +89,7 @@ export function NewProjectModal({ isOpen, onClose, onSubmit, formData, onFormCha
               rows={4}
               value={formData.premise}
               onChange={(e) => onFormChange({ ...formData, premise: e.target.value })}
-              placeholder="一句话概括核心冲突与爽点..."
+              placeholder="一句话梗概"
             />
           </div>
         </form>

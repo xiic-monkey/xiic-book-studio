@@ -785,6 +785,7 @@ pub struct ProjectWorkspace {
     pub project: Project,
     pub genre_agent: GenreAgentProfile,
     pub chapters: Vec<Chapter>,
+    pub formal_char_count: i64,
     pub artifacts: Vec<ArtifactSummary>,
     pub approvals: Vec<Approval>,
     pub messages: Vec<Message>,
@@ -962,24 +963,6 @@ pub struct RebuildChapterMemoryRequest {
     pub chapter_id: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextPreviewSegment {
-    pub label: String,
-    pub content: String,
-    pub chars: usize,
-    pub truncated: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextPreview {
-    pub stage: String,
-    pub genre_agent: GenreAgentProfile,
-    pub system_prompt: String,
-    pub segments: Vec<ContextPreviewSegment>,
-    pub total_chars: usize,
-    pub estimated_tokens: usize,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AgentRunRequest {
     pub project_id: i64,
@@ -1125,17 +1108,6 @@ pub struct ActionProposal {
     pub decided_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-pub struct LegacyAgentPrompt {
-    pub id: i64,
-    pub legacy_agent_id: Option<i64>,
-    pub stage: String,
-    pub name: String,
-    pub role: String,
-    pub system_prompt: String,
-    pub imported_at: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListActionProposalsRequest {
     pub project_id: i64,
@@ -1214,6 +1186,7 @@ pub struct ArtifactSummary {
     pub status: String,
     pub parent_artifact_id: Option<i64>,
     pub created_at: String,
+    pub char_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1246,6 +1219,12 @@ pub struct AiSpanRevisionRequest {
 pub struct DeleteArtifactRequest {
     pub project_id: i64,
     pub artifact_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteKnowledgeCardRequest {
+    pub project_id: i64,
+    pub card_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

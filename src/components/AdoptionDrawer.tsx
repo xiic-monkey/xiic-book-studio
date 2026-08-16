@@ -105,7 +105,6 @@ export function AdoptionDrawer({
         <header className="adoption-drawer-head">
           <div>
             <h2>资料变更</h2>
-            <p>只有勾选并人工采纳的内容会进入后续写作依据。</p>
           </div>
           <div className="button-row">
             <button onClick={onExtract} disabled={busy}>
@@ -119,7 +118,7 @@ export function AdoptionDrawer({
 
         <div className="adoption-drawer-body">
           {grouped.pending.length === 0 && (
-            <div className="adoption-empty">当前产物没有待采纳资料。可以重新整理，或直接关闭。</div>
+            <div className="adoption-empty">暂无待采纳资料</div>
           )}
           {grouped.pending.map((proposal) => {
             const data = drafts[proposal.id] ?? proposal.data;
@@ -147,7 +146,7 @@ export function AdoptionDrawer({
                   />
                 )}
                 <input value={text(data, "title")} onChange={(event) => setField(proposal.id, "title", event.target.value)} placeholder="标题" />
-                <textarea rows={5} value={text(data, "content")} onChange={(event) => setField(proposal.id, "content", event.target.value)} placeholder="确认后的事实内容" />
+                <textarea rows={5} value={text(data, "content")} onChange={(event) => setField(proposal.id, "content", event.target.value)} placeholder="资料内容" />
 
                 {proposal.target_kind === "knowledge_card" ? (
                   <Select
@@ -183,7 +182,7 @@ export function AdoptionDrawer({
                 <blockquote>{proposal.evidence_quote}</blockquote>
                 {proposal.validation_error && <p className="adoption-error">{proposal.validation_error}</p>}
                 <button className="adoption-save" onClick={() => onSave(proposal.id, data)} disabled={busy}>
-                  <Edit3 size={14} /> 保存修改并重新校验
+                  <Edit3 size={14} /> 保存并校验
                 </button>
               </section>
             );
@@ -203,7 +202,7 @@ export function AdoptionDrawer({
         </div>
 
         <footer className="adoption-drawer-foot">
-          <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="人工确认备注，可为空" />
+          <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="备注（可选）" />
           <div className="button-row">
             <button onClick={() => onReject(selectedIds, note)} disabled={selectedIds.length === 0 || busy}>
               <Trash2 size={14} /> 拒绝所选

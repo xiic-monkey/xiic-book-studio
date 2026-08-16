@@ -127,7 +127,7 @@ async fn prepare_proposals_after_run(
         return Ok(());
     }
     let proposal_prompt = format!(
-        "# 已完成的 Agent 产物\n阶段：{}\n标题：{}\n\n{}\n\n# 人工原始指令\n{}\n\n只在产物明确需要创建章节、重命名章节、生成资料候选、知识卡或伏笔候选时创建写入提案。不得提议删除、批准或直接应用正文。",
+        "# 已完成的 Agent 产物\n阶段：{}\n标题：{}\n\n{}\n\n# 人工原始指令\n{}\n\n只在产物明确需要创建章节、重命名章节、生成资料候选、更新或删除知识卡、生成伏笔候选时创建写入提案。不得提议删除章节或正文、批准或直接应用正文。",
         request.stage.as_str(),
         result.artifact.title,
         result.artifact.content,

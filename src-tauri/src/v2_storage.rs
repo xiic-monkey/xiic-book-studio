@@ -1,8 +1,3 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
@@ -12,9 +7,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         ActionProposal, ActiveAgentRun, ArtifactFilters, ArtifactSummary, ContextSegment,
-        LegacyAgentPrompt, PreparedContext, ProposalApplyResult, ProposalStatus,
-        ProviderCapabilities, RunEvent, ToolInvocation, ToolProtocol, WorkflowRun,
-        WorkflowRunSummary,
+        PreparedContext, ProposalApplyResult, ProposalStatus, ProviderCapabilities, RunEvent,
+        ToolInvocation, ToolProtocol, WorkflowRun, WorkflowRunSummary,
     },
 };
 
@@ -89,17 +83,7 @@ fn migrate_v1(conn: &Connection) -> AppResult<()> {
         )?;
     }
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS legacy_agent_prompts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            legacy_agent_id INTEGER,
-            stage TEXT NOT NULL,
-            name TEXT NOT NULL,
-            role TEXT NOT NULL,
-            system_prompt TEXT NOT NULL,
-            imported_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS prepared_contexts (
+        "CREATE TABLE IF NOT EXISTS prepared_contexts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER NOT NULL,
             chapter_id INTEGER,
@@ -230,164 +214,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> AppResult<bool
     Ok(conn.query_row(&sql, [column], |row| row.get(0))?)
 }
 
-pub(crate) fn backup_legacy_database(path: &Path) -> AppResult<PathBuf> {
-    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-    let backup = path.with_file_name(format!("book-studio-v1-backup-{timestamp}.sqlite3"));
-    fs::copy(path, &backup)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&backup, fs::Permissions::from_mode(0o444))?;
-    }
-    Ok(backup)
-}
-
-pub(crate) fn remove_new_database_files(path: &Path) {
-    let _ = fs::remove_file(path);
-    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        for suffix in ["-wal", "-shm"] {
-            let _ = fs::remove_file(path.with_file_name(format!("{name}{suffix}")));
-        }
-    }
-}
-
-pub(crate) fn import_legacy_configuration(state: &AppState, legacy_path: &Path) -> AppResult<()> {
-    if !legacy_path.is_file() {
-        return Ok(());
-    }
-    let already_imported = state.with_conn(|conn| {
-        conn.query_row(
-            "SELECT 1 FROM settings WHERE key = 'migration.v1.completed'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|value| value.is_some())
-        .map_err(AppError::from)
-    })?;
-    if already_imported {
-        return Ok(());
-    }
-    let legacy = Connection::open_with_flags(
-        legacy_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let imported_at = Utc::now().to_rfc3339();
-    let providers = read_legacy_providers(&legacy)?;
-    let prompts = read_legacy_prompts(&legacy)?;
-
-    state.with_conn(|conn| {
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| {
-            for (label, base_url, api_key) in &providers {
-                if base_url.trim().is_empty() {
-                    continue;
-                }
-                conn.execute(
-                    "INSERT INTO ai_providers
-                        (label, base_url, model, temperature, thinking_enabled, thinking_level,
-                         api_key, tool_protocol, created_at, updated_at)
-                     VALUES (?1, ?2, '', 0.75, 0, 'off', ?3, 'auto', ?4, ?4)
-                     ON CONFLICT(base_url) DO UPDATE SET
-                        label = CASE WHEN trim(excluded.label) = '' THEN ai_providers.label ELSE excluded.label END,
-                        api_key = CASE WHEN trim(excluded.api_key) = '' THEN ai_providers.api_key ELSE excluded.api_key END,
-                        updated_at = excluded.updated_at",
-                    params![label, base_url.trim(), api_key, imported_at],
-                )?;
-            }
-            for (legacy_agent_id, stage, name, role, system_prompt) in &prompts {
-                conn.execute(
-                    "INSERT INTO legacy_agent_prompts
-                        (legacy_agent_id, stage, name, role, system_prompt, imported_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![legacy_agent_id, stage, name, role, system_prompt, imported_at],
-                )?;
-            }
-            conn.execute(
-                "INSERT INTO settings(key, value) VALUES ('migration.v1.completed', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [&imported_at],
-            )?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
-    })
-}
-
-fn read_legacy_providers(conn: &Connection) -> AppResult<Vec<(String, String, String)>> {
-    let has_table: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ai_providers')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_table {
-        return Ok(Vec::new());
-    }
-    let has_key = column_exists(conn, "ai_providers", "api_key")?;
-    let sql = if has_key {
-        "SELECT label, base_url, COALESCE(api_key, '') FROM ai_providers ORDER BY id"
-    } else {
-        "SELECT label, base_url, '' FROM ai_providers ORDER BY id"
-    };
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-fn read_legacy_prompts(conn: &Connection) -> AppResult<Vec<(i64, String, String, String, String)>> {
-    let has_table: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agents')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_table {
-        return Ok(Vec::new());
-    }
-    let mut stmt =
-        conn.prepare("SELECT id, stage, name, role, system_prompt FROM agents ORDER BY id")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-        ))
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
 impl AppState {
-    pub fn list_legacy_agent_prompts(&self) -> AppResult<Vec<LegacyAgentPrompt>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, legacy_agent_id, stage, name, role, system_prompt, imported_at
-                 FROM legacy_agent_prompts ORDER BY id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok(LegacyAgentPrompt {
-                    id: row.get(0)?,
-                    legacy_agent_id: row.get(1)?,
-                    stage: row.get(2)?,
-                    name: row.get(3)?,
-                    role: row.get(4)?,
-                    system_prompt: row.get(5)?,
-                    imported_at: row.get(6)?,
-                })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-    }
-
     pub fn get_active_agent_run(&self, project_id: i64) -> AppResult<Option<ActiveAgentRun>> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -422,7 +249,7 @@ impl AppState {
         self.with_conn(|conn| {
             let mut sql = String::from(
                 "SELECT id, project_id, chapter_id, stage, title, version, status,
-                        parent_artifact_id, created_at
+                        parent_artifact_id, created_at, content
                  FROM artifacts WHERE project_id = ?",
             );
             let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(filters.project_id)];
@@ -438,6 +265,7 @@ impl AppState {
             let params = rusqlite::params_from_iter(values.iter().map(|value| &**value));
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params, |row| {
+                let content: String = row.get(9)?;
                 Ok(ArtifactSummary {
                     id: row.get(0)?,
                     project_id: row.get(1)?,
@@ -448,9 +276,33 @@ impl AppState {
                     status: row.get(6)?,
                     parent_artifact_id: row.get(7)?,
                     created_at: row.get(8)?,
+                    char_count: content.chars().filter(|ch| !ch.is_whitespace()).count() as i64,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn formal_char_count(&self, project_id: i64) -> AppResult<i64> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.content
+                 FROM chapters c
+                 JOIN artifacts a ON a.id = c.current_artifact_id
+                 WHERE c.project_id = ?1
+                   AND a.project_id = ?1
+                   AND (a.status = 'approved' OR EXISTS (
+                     SELECT 1 FROM approvals p
+                     WHERE p.project_id = ?1 AND p.artifact_id = a.id
+                   ))",
+            )?;
+            let mut rows = stmt.query(params![project_id])?;
+            let mut total = 0_i64;
+            while let Some(row) = rows.next()? {
+                let content: String = row.get(0)?;
+                total += content.chars().filter(|ch| !ch.is_whitespace()).count() as i64;
+            }
+            Ok(total)
         })
     }
 
@@ -814,6 +666,22 @@ impl AppState {
         note: &str,
     ) -> AppResult<ProposalApplyResult> {
         self.with_conn(|conn| {
+            let needs_vector_runtime = conn
+                .query_row(
+                    "SELECT proposal_type FROM action_proposals WHERE id = ?1",
+                    [proposal_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .is_some_and(|proposal_type| {
+                    matches!(
+                        proposal_type.as_str(),
+                        "knowledge_card_update" | "knowledge_card_delete"
+                    )
+                });
+            if needs_vector_runtime {
+                crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, conn)?;
+            }
             let tx = conn.unchecked_transaction()?;
             let proposal = query_action_proposal(&tx, proposal_id)?;
             if proposal.project_id != project_id || proposal.status != ProposalStatus::Pending {
@@ -960,20 +828,30 @@ impl AppState {
 }
 
 fn proposal_is_stale(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResult<bool> {
-    if proposal.proposal_type != "rename_chapter" {
-        return Ok(false);
-    }
     let Some(expected) = proposal.expected_version.as_deref() else {
         return Ok(false);
     };
-    let chapter_id = json_i64(&proposal.payload, "chapter_id")?;
-    let current = tx
-        .query_row(
-            "SELECT updated_at FROM chapters WHERE id = ?1 AND project_id = ?2",
-            params![chapter_id, proposal.project_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
+    let current = match proposal.proposal_type.as_str() {
+        "rename_chapter" => {
+            let chapter_id = json_i64(&proposal.payload, "chapter_id")?;
+            tx.query_row(
+                "SELECT updated_at FROM chapters WHERE id = ?1 AND project_id = ?2",
+                params![chapter_id, proposal.project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        }
+        "knowledge_card_update" | "knowledge_card_delete" => {
+            let card_id = json_i64(&proposal.payload, "card_id")?;
+            tx.query_row(
+                "SELECT updated_at FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                params![card_id, proposal.project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        }
+        _ => return Ok(false),
+    };
     Ok(current.as_deref() != Some(expected))
 }
 
@@ -983,6 +861,8 @@ fn validate_proposal_payload(proposal_type: &str, payload: &Value) -> AppResult<
         "rename_chapter" => &["chapter_id", "title"][..],
         "artifact_candidate" => &["stage", "title", "content"][..],
         "knowledge_card" => &["category", "title", "content"][..],
+        "knowledge_card_update" => &["card_id", "category", "title", "content"][..],
+        "knowledge_card_delete" => &["card_id"][..],
         "foreshadowing" => &["title", "content"][..],
         _ => {
             return Err(AppError::Validation(format!(
@@ -1068,6 +948,8 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
             let category = json_string(&proposal.payload, "category")?;
             let title = json_string(&proposal.payload, "title")?;
             let content = json_string(&proposal.payload, "content")?;
+            let source_chapter_id =
+                existing_chapter_id(tx, proposal.project_id, proposal.chapter_id)?;
             tx.execute(
                 "INSERT INTO knowledge_cards
                     (project_id, category, title, content, status, source_artifact_id,
@@ -1078,11 +960,81 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
                     category.trim(),
                     title.trim(),
                     content,
-                    proposal.chapter_id,
+                    source_chapter_id,
                     now,
                 ],
             )?;
             Ok(("knowledge_card".to_string(), tx.last_insert_rowid()))
+        }
+        "knowledge_card_update" => {
+            let card_id = json_i64(&proposal.payload, "card_id")?;
+            let category = json_string(&proposal.payload, "category")?;
+            let title = json_string(&proposal.payload, "title")?;
+            let content = json_string(&proposal.payload, "content")?;
+            let status = tx
+                .query_row(
+                    "SELECT status FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                    params![card_id, proposal.project_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("知识卡不存在或不属于当前项目".to_string()))?;
+            let changed = tx.execute(
+                "UPDATE knowledge_cards
+                 SET category = ?1, title = ?2, content = ?3, updated_at = ?4
+                 WHERE id = ?5 AND project_id = ?6",
+                params![
+                    category.trim(),
+                    title.trim(),
+                    content,
+                    now,
+                    card_id,
+                    proposal.project_id
+                ],
+            )?;
+            if changed == 0 {
+                return Err(AppError::Validation(
+                    "知识卡不存在或不属于当前项目".to_string(),
+                ));
+            }
+            crate::story_search::delete_source(tx, proposal.project_id, "knowledge_card", card_id)?;
+            tx.execute(
+                "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                params![now, proposal.project_id],
+            )?;
+            if status == "approved" {
+                crate::db::mark_story_bible_changed_tx(tx, proposal.project_id, &now)?;
+            }
+            Ok(("knowledge_card".to_string(), card_id))
+        }
+        "knowledge_card_delete" => {
+            let card_id = json_i64(&proposal.payload, "card_id")?;
+            let status = tx
+                .query_row(
+                    "SELECT status FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                    params![card_id, proposal.project_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("知识卡不存在或不属于当前项目".to_string()))?;
+            crate::story_search::delete_source(tx, proposal.project_id, "knowledge_card", card_id)?;
+            let changed = tx.execute(
+                "DELETE FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                params![card_id, proposal.project_id],
+            )?;
+            if changed == 0 {
+                return Err(AppError::Validation(
+                    "知识卡不存在或不属于当前项目".to_string(),
+                ));
+            }
+            tx.execute(
+                "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                params![now, proposal.project_id],
+            )?;
+            if status == "approved" {
+                crate::db::mark_story_bible_changed_tx(tx, proposal.project_id, &now)?;
+            }
+            Ok(("knowledge_card".to_string(), card_id))
         }
         "foreshadowing" => {
             let title = json_string(&proposal.payload, "title")?;
@@ -1092,6 +1044,8 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
                 .get("planned_payoff_note")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let planted_chapter_id =
+                existing_chapter_id(tx, proposal.project_id, proposal.chapter_id)?;
             tx.execute(
                 "INSERT INTO foreshadowings
                     (project_id, title, content, status, planted_chapter_id,
@@ -1102,7 +1056,7 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
                     proposal.project_id,
                     title.trim(),
                     content,
-                    proposal.chapter_id,
+                    planted_chapter_id,
                     payoff.trim(),
                     now,
                 ],
@@ -1127,6 +1081,26 @@ fn json_i64(payload: &Value, key: &str) -> AppResult<i64> {
         .and_then(Value::as_i64)
         .filter(|value| *value > 0)
         .ok_or_else(|| AppError::Validation(format!("提案字段 {key} 不合法")))
+}
+
+/// Resolves a chapter id to `Some(id)` only if that chapter still exists in the
+/// project. Returns `None` otherwise so callers can fall back to a NULL FK column
+/// instead of failing the whole write with `FOREIGN KEY constraint failed`
+/// (the referenced chapter may have been deleted after the proposal was created).
+fn existing_chapter_id(
+    tx: &Transaction<'_>,
+    project_id: i64,
+    chapter_id: Option<i64>,
+) -> AppResult<Option<i64>> {
+    let Some(chapter_id) = chapter_id else {
+        return Ok(None);
+    };
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM chapters WHERE id = ?1 AND project_id = ?2)",
+        params![chapter_id, project_id],
+        |row| row.get(0),
+    )?;
+    Ok(if exists { Some(chapter_id) } else { None })
 }
 
 fn query_prepared_context(conn: &Connection, id: i64) -> AppResult<PreparedContext> {
@@ -1303,7 +1277,7 @@ fn json_sql_error(error: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NewChapter, NewProject};
+    use crate::models::{NewChapter, NewProject, SaveKnowledgeCard};
 
     #[test]
     fn proposal_does_not_mutate_until_applied() {
@@ -1389,57 +1363,153 @@ mod tests {
     }
 
     #[test]
-    fn legacy_import_only_copies_provider_credentials_and_prompt_archive_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy_path = dir.path().join("book-studio.sqlite3");
-        let legacy = Connection::open(&legacy_path).unwrap();
-        legacy
-            .execute_batch(
-                "CREATE TABLE ai_providers (
-                    id INTEGER PRIMARY KEY,
-                    label TEXT NOT NULL,
-                    base_url TEXT NOT NULL,
-                    api_key TEXT NOT NULL
-                 );
-                 CREATE TABLE agents (
-                    id INTEGER PRIMARY KEY,
-                    stage TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    system_prompt TEXT NOT NULL
-                 );
-                 CREATE TABLE projects (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
-                 INSERT INTO ai_providers VALUES
-                    (1, '旧供应商', 'https://legacy.example/v1', 'legacy-secret');
-                 INSERT INTO agents VALUES
-                    (9, 'draft', '旧写作 Agent', '写正文', '旧版完整 Prompt');
-                 INSERT INTO projects VALUES (7, '不得迁移的旧项目');",
+    fn knowledge_card_proposal_detects_version_conflict() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "资料卡冲突测试".to_string(),
+                genre: "测试".to_string(),
+                target_words: 10_000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let card = state
+            .save_knowledge_card(SaveKnowledgeCard {
+                id: None,
+                project_id: project.id,
+                category: "人物".to_string(),
+                title: "旧称".to_string(),
+                content: "旧内容".to_string(),
+                status: "approved".to_string(),
+                source_artifact_id: None,
+                source_chapter_id: None,
+            })
+            .unwrap();
+        let proposal = state
+            .create_action_proposal(
+                project.id,
+                None,
+                None,
+                "knowledge_card_update",
+                "更新资料卡",
+                &serde_json::json!({
+                    "card_id": card.id,
+                    "category": "人物",
+                    "title": "新称",
+                    "content": "提案内容"
+                }),
+                Some(&card.updated_at),
             )
             .unwrap();
-        drop(legacy);
-
-        let state = AppState::from_path(dir.path().join("book-studio-v2.sqlite3")).unwrap();
-        import_legacy_configuration(&state, &legacy_path).unwrap();
-        import_legacy_configuration(&state, &legacy_path).unwrap();
-
-        assert!(state.list_projects().unwrap().is_empty());
-        let provider = state
-            .list_ai_providers()
-            .unwrap()
-            .into_iter()
-            .find(|item| item.base_url == "https://legacy.example/v1")
+        state
+            .save_knowledge_card(SaveKnowledgeCard {
+                id: Some(card.id),
+                project_id: project.id,
+                category: "人物".to_string(),
+                title: "人工修改".to_string(),
+                content: "人工内容".to_string(),
+                status: "approved".to_string(),
+                source_artifact_id: None,
+                source_chapter_id: None,
+            })
             .unwrap();
-        assert!(provider.has_api_key);
+
+        assert!(state
+            .apply_action_proposal(project.id, proposal.id, "确认")
+            .is_err());
         assert_eq!(
             state
-                .get_api_key_for_base_url("https://legacy.example/v1")
+                .get_knowledge_card(project.id, card.id)
                 .unwrap()
-                .as_deref(),
-            Some("legacy-secret")
+                .content,
+            "人工内容"
         );
-        let prompts = state.list_legacy_agent_prompts().unwrap();
-        assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0].system_prompt, "旧版完整 Prompt");
+        assert_eq!(
+            state
+                .list_action_proposals(project.id, None)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == proposal.id)
+                .unwrap()
+                .status,
+            ProposalStatus::Expired
+        );
+    }
+
+    #[test]
+    fn deleting_a_knowledge_card_proposal_removes_search_documents() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "资料卡删除测试".to_string(),
+                genre: "测试".to_string(),
+                target_words: 10_000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let card = state
+            .save_knowledge_card(SaveKnowledgeCard {
+                id: None,
+                project_id: project.id,
+                category: "world".to_string(),
+                title: "待删除资料".to_string(),
+                content: "过期检索内容".to_string(),
+                status: "approved".to_string(),
+                source_artifact_id: None,
+                source_chapter_id: None,
+            })
+            .unwrap();
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO story_search_documents
+                        (project_id, source_kind, source_id, chapter_id, chapter_no_sort, stage,
+                         title, content, search_text, chunk_no, chunk_start, chunk_end,
+                         visibility_cutoff_chapter_no, source_text_hash, normalization_version,
+                         updated_at)
+                     VALUES (?1, 'knowledge_card', ?2, NULL, NULL, NULL, ?3, ?4, ?4,
+                             0, 0, 6, NULL, 'test-hash', 'test-v1', ?5)",
+                    params![
+                        project.id,
+                        card.id,
+                        card.title,
+                        card.content,
+                        card.updated_at,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let proposal = state
+            .create_action_proposal(
+                project.id,
+                None,
+                None,
+                "knowledge_card_delete",
+                "删除资料卡",
+                &serde_json::json!({"card_id": card.id}),
+                Some(&card.updated_at),
+            )
+            .unwrap();
+
+        state
+            .apply_action_proposal(project.id, proposal.id, "确认")
+            .unwrap();
+        assert!(state.get_knowledge_card(project.id, card.id).is_err());
+        state
+            .with_conn(|conn| {
+                let remaining: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM story_search_documents
+                     WHERE project_id = ?1 AND source_kind = 'knowledge_card' AND source_id = ?2",
+                    params![project.id, card.id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(remaining, 0);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

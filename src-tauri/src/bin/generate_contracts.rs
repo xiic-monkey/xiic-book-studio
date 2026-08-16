@@ -50,7 +50,6 @@ fn render() -> String {
     output.push_str(&declaration::<ToolInvocation>());
     output.push_str(&declaration::<ProposalStatus>());
     output.push_str(&declaration::<ActionProposal>());
-    output.push_str(&declaration::<LegacyAgentPrompt>());
     output.push_str(&declaration::<ProposalApplyResult>());
     output.push_str(&declaration::<ProviderCapabilities>());
     output.push_str(&declaration::<AgentRunSummary>());

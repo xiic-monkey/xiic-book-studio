@@ -1,6 +1,6 @@
 use super::ApplicationGateway;
 use crate::{
-    adoption, ai, chapter_memory, context_search, continuity_ledger,
+    adoption, ai, context_search, continuity_ledger,
     error::{AppError, AppResult},
     gate, index_jobs,
     models::*,
@@ -126,6 +126,11 @@ impl ApplicationGateway {
         Ok(card)
     }
 
+    pub fn delete_knowledge_card(&self, input: DeleteKnowledgeCardRequest) -> AppResult<()> {
+        self.state
+            .delete_knowledge_card(input.project_id, input.card_id)
+    }
+
     pub fn save_foreshadowing(&self, input: SaveForeshadowing) -> AppResult<Foreshadowing> {
         let item = self.state.save_foreshadowing(input)?;
         if let Err(error) = index_jobs::enqueue_project_search_job(&self.state, item.project_id) {
@@ -239,46 +244,6 @@ impl ApplicationGateway {
         ai::list_models(&settings, &api_key).await
     }
 
-    pub async fn run_agent_step(&self, input: RunAgentRequest) -> AppResult<AgentStepResult> {
-        workflow::run_agent_step(&self.state, input).await
-    }
-
-    pub async fn rebuild_chapter_memory(
-        &self,
-        input: RebuildChapterMemoryRequest,
-    ) -> AppResult<ChapterMemoryRecord> {
-        let settings = self.state.get_ai_settings_for_agent("chapter_memory")?;
-        let api_key = self
-            .state
-            .get_api_key_for_base_url(&settings.base_url)?
-            .ok_or_else(|| {
-                AppError::Validation("请先在设置里为当前供应商保存 AI API Key".to_string())
-            })?;
-        chapter_memory::rebuild_chapter_memory(
-            &self.state,
-            input.project_id,
-            input.chapter_id,
-            &settings,
-            &api_key,
-            None,
-        )
-        .await
-    }
-
-    pub async fn run_story_architect(
-        &self,
-        input: RunStoryArchitectRequest,
-    ) -> AppResult<AgentStepResult> {
-        story_architecture::run_story_architect(&self.state, input).await
-    }
-
-    pub async fn create_targeted_rework(
-        &self,
-        input: RunStoryArchitectRequest,
-    ) -> AppResult<AgentStepResult> {
-        story_architecture::create_targeted_rework(&self.state, input).await
-    }
-
     pub fn confirm_story_bible(&self, input: ConfirmStoryBibleRequest) -> AppResult<StoryBible> {
         story_architecture::confirm_story_bible(&self.state, input)
     }
@@ -299,10 +264,6 @@ impl ApplicationGateway {
 
     pub fn list_story_arcs(&self, project_id: i64) -> AppResult<Vec<StoryArc>> {
         self.state.list_story_arcs(project_id)
-    }
-
-    pub fn preview_agent_context(&self, input: RunAgentRequest) -> AppResult<ContextPreview> {
-        workflow::preview_agent_context(&self.state, input)
     }
 
     pub fn approve_stage(
@@ -344,10 +305,6 @@ impl ApplicationGateway {
         story_search::get_story_search_status(&self.state, project_id)
     }
 
-    pub async fn request_revision(&self, input: RevisionRequest) -> AppResult<AgentStepResult> {
-        workflow::request_revision(&self.state, input).await
-    }
-
     pub fn replace_artifact_span(
         &self,
         input: SpanReplacementRequest,
@@ -376,10 +333,6 @@ impl ApplicationGateway {
             input.chapter_id,
             input.keep_artifact_ids.as_deref().unwrap_or(&[]),
         )
-    }
-
-    pub fn list_artifacts(&self, filters: ArtifactFilters) -> AppResult<Vec<Artifact>> {
-        self.state.list_artifacts(filters)
     }
 
     pub fn export_project(&self, project_id: i64, format: &str) -> AppResult<String> {

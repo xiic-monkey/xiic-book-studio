@@ -82,39 +82,12 @@ impl AppState {
         if let Ok(resource_dir) = app.path().resource_dir() {
             resource_roots.push(resource_dir);
         }
-        let legacy_path = data_dir.join("book-studio.sqlite3");
         let v2_path = data_dir.join("book-studio-v2.sqlite3");
-        let first_v2_start = !v2_path.exists();
-        if first_v2_start && legacy_path.is_file() {
-            crate::v2_storage::backup_legacy_database(&legacy_path)?;
-        }
-        let state = match Self::from_path_with_resources(v2_path.clone(), resource_roots) {
-            Ok(state) => state,
-            Err(error) => {
-                if first_v2_start {
-                    crate::v2_storage::remove_new_database_files(&v2_path);
-                }
-                return Err(error);
-            }
-        };
-        if first_v2_start && legacy_path.is_file() {
-            if let Err(error) = crate::v2_storage::import_legacy_configuration(&state, &legacy_path)
-            {
-                drop(state);
-                crate::v2_storage::remove_new_database_files(&v2_path);
-                return Err(error);
-            }
-        }
-        state.migrate_legacy_api_keys()?;
-        Ok(state)
+        Self::from_path_with_resources(v2_path, resource_roots)
     }
 
     pub fn from_path(path: PathBuf) -> AppResult<Self> {
         Self::from_path_with_resources(path, Vec::new())
-    }
-
-    pub fn migrate_legacy_api_keys(&self) -> AppResult<()> {
-        lifecycle::migrate_legacy_api_keys(self)
     }
 
     fn from_path_with_resources(
@@ -938,6 +911,14 @@ impl AppState {
             crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, conn)?;
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| {
+                // agent_run_contexts keeps a RESTRICT reference to prepared_contexts.
+                // Remove the join rows explicitly before project cascades run so
+                // SQLite cannot fail depending on cascade deletion order.
+                conn.execute(
+                    "DELETE FROM agent_run_contexts
+                     WHERE run_id IN (SELECT id FROM workflow_runs WHERE project_id = ?1)",
+                    params![id],
+                )?;
                 delete_project_search_data_tx(conn, id)?;
                 conn.execute(
                     "DELETE FROM derived_index_jobs WHERE project_id = ?1",
@@ -1532,6 +1513,16 @@ impl AppState {
                     )
                     .optional()?
                     .ok_or_else(|| AppError::Validation("章节不存在".to_string()))?;
+
+                // See delete_project: this association uses ON DELETE RESTRICT.
+                conn.execute(
+                    "DELETE FROM agent_run_contexts
+                     WHERE run_id IN (
+                       SELECT id FROM workflow_runs
+                       WHERE project_id = ?1 AND chapter_id = ?2
+                     )",
+                    params![project_id, chapter_id],
+                )?;
 
                 delete_chapter_search_data_tx(conn, project_id, chapter_id, chapter_no)?;
                 conn.execute(
@@ -2241,11 +2232,29 @@ impl AppState {
         unreachable!("artifact insert retry loop always returns")
     }
 
+    pub fn update_artifact_content(&self, project_id: i64, artifact_id: i64, content: &str) -> AppResult<Artifact> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE artifacts SET content = ?1 WHERE id = ?2 AND project_id = ?3",
+                params![content, artifact_id, project_id],
+            )?;
+            if changed == 0 {
+                return Err(AppError::Validation("产物不存在或不属于当前项目".to_string()));
+            }
+            query_artifact_by_id(conn, artifact_id)
+        })
+    }
+
     pub fn delete_artifact(&self, project_id: i64, artifact_id: i64) -> AppResult<()> {
         let artifact = self.get_artifact(artifact_id)?;
         if artifact.project_id != project_id {
             return Err(AppError::Validation("产物不属于当前项目".to_string()));
         }
+        let deletes_approved_foundation = artifact.chapter_id.is_none()
+            && matches!(artifact.stage.as_str(), "setting" | "outline" | "characters")
+            && self
+                .approved_artifact(project_id, &artifact.stage, None)?
+                .is_some_and(|approved| approved.id == artifact.id);
         if let Some(reason) = self.protected_artifact_reason(&artifact)? {
             return Err(AppError::Validation(reason));
         }
@@ -2266,6 +2275,15 @@ impl AppState {
                 )?;
                 if deleted == 0 {
                     return Err(AppError::Validation("产物不存在".to_string()));
+                }
+                if deletes_approved_foundation {
+                    let timestamp = now();
+                    crate::index_jobs::enqueue_project_search_job_tx(conn, project_id, &timestamp)?;
+                    mark_story_bible_changed_tx(conn, project_id, &timestamp)?;
+                    conn.execute(
+                        "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                        params![&timestamp, project_id],
+                    )?;
                 }
                 conn.execute(
                     "INSERT INTO messages (project_id, chapter_id, role, content, created_at)
@@ -2386,15 +2404,6 @@ impl AppState {
                 return Ok(Some("当前正式正文不能删除".to_string()));
             }
             return Ok(None);
-        }
-        if self
-            .approved_artifact(artifact.project_id, &artifact.stage, None)?
-            .is_some_and(|approved| approved.id == artifact.id)
-        {
-            return Ok(Some(format!(
-                "当前已批准的{}不能删除",
-                stage_label(&artifact.stage)
-            )));
         }
         Ok(None)
     }
@@ -2566,8 +2575,70 @@ impl AppState {
         })
     }
 
+    pub fn get_knowledge_card(&self, project_id: i64, card_id: i64) -> AppResult<KnowledgeCard> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, project_id, category, title, content, status, source_artifact_id,
+                        source_chapter_id, created_at, updated_at
+                 FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                params![card_id, project_id],
+                map_knowledge_card,
+            )
+            .optional()?
+            .ok_or_else(|| AppError::Validation("知识卡不存在或不属于当前项目".to_string()))
+        })
+    }
+
     pub fn save_knowledge_card(&self, input: SaveKnowledgeCard) -> AppResult<KnowledgeCard> {
         crate::adoption::save_human_knowledge_card(self, input)
+    }
+
+    pub fn delete_knowledge_card(&self, project_id: i64, card_id: i64) -> AppResult<()> {
+        self.with_conn(|conn| {
+            crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, conn)?;
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let status = conn
+                    .query_row(
+                        "SELECT status FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                        params![card_id, project_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        AppError::Validation("知识卡不存在或不属于当前项目".to_string())
+                    })?;
+                crate::story_search::delete_source(conn, project_id, "knowledge_card", card_id)?;
+                let deleted = conn.execute(
+                    "DELETE FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                    params![card_id, project_id],
+                )?;
+                if deleted == 0 {
+                    return Err(AppError::Validation(
+                        "知识卡不存在或不属于当前项目".to_string(),
+                    ));
+                }
+                let timestamp = now();
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![timestamp, project_id],
+                )?;
+                if status == "approved" {
+                    mark_story_bible_changed_tx(conn, project_id, &timestamp)?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
     }
 
     pub fn list_foreshadowings(&self, project_id: i64) -> AppResult<Vec<Foreshadowing>> {
@@ -5299,6 +5370,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("当前正式正文"));
+    }
+
+    #[test]
+    fn deletes_approved_foundation_artifact() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "删除设定".to_string(),
+                genre: "玄幻".to_string(),
+                target_words: 100000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let artifact = state
+            .insert_artifact(
+                project.id,
+                None,
+                "setting",
+                "世界设定",
+                "旧设定",
+                None,
+            )
+            .unwrap();
+        state
+            .approve_stage(project.id, "setting", artifact.id, "通过")
+            .unwrap();
+
+        state.delete_artifact(project.id, artifact.id).unwrap();
+
+        assert!(state.get_artifact(artifact.id).is_err());
     }
 
     #[test]

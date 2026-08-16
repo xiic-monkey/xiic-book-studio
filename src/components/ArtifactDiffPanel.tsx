@@ -36,7 +36,7 @@ export function ArtifactDiffPanel({ selectedArtifact, compareArtifact }: Artifac
             <div className="empty-inline">两个版本内容一致</div>
           )}
           {visibleDiffLines.length > 160 && (
-            <div className="empty-inline">差异较多，当前仅显示前 160 行及其上下文。</div>
+            <div className="empty-inline">差异已截断</div>
           )}
         </div>
       </section>

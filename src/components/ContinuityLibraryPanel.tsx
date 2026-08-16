@@ -1,4 +1,4 @@
-import { Box, CalendarDays, RefreshCcw, Users } from "lucide-react";
+import { RefreshCcw } from "lucide-react";
 import type {
   Chapter,
   ProjectWorkspace,
@@ -23,6 +23,7 @@ export type EntityTimelineEntry =
 
 type ContinuityLibraryPanelProps = {
   focus: "characters" | "items" | "events";
+  readOnly?: boolean;
   detail: ProjectWorkspace | null;
   busy: boolean;
   status: StoryIndexStatus;
@@ -39,6 +40,7 @@ type ContinuityLibraryPanelProps = {
 
 export function ContinuityLibraryPanel({
   focus,
+  readOnly = true,
   detail,
   busy,
   status,
@@ -52,7 +54,7 @@ export function ContinuityLibraryPanel({
   onOpenEntity,
   onOpenChapter,
 }: ContinuityLibraryPanelProps) {
-  const title = focus === "characters" ? "角色时间线" : focus === "items" ? "物品与资源" : "事件时间线";
+  const title = focus === "characters" ? "角色" : focus === "items" ? "物品与资源" : "事件";
   const isCharacterView = focus === "characters";
   const indexJobs = detail?.index_jobs ?? [];
   const pendingJobs = indexJobs.filter((job) => job.status === "pending");
@@ -69,12 +71,7 @@ export function ContinuityLibraryPanel({
     <section className="library-workspace continuity-workspace">
       <header className="library-header">
         <div>
-          <div className="panel-title">
-            {focus === "characters" ? <Users size={15} /> : focus === "items" ? <Box size={15} /> : <CalendarDays size={15} />}
-            连续性资料
-          </div>
           <h2>{title}</h2>
-          <p>仅显示已通过正式正文中有原文出处的记录。点击章节可回到正式内容。</p>
           {status.approved > 0 && (
             <div className={status.failed.length > 0 ? "library-index-status has-error" : "library-index-status"}>
               <span>资料索引</span>
@@ -146,7 +143,7 @@ export function ContinuityLibraryPanel({
                 </article>
               );
             })}
-            {(detail?.story_events?.length ?? 0) === 0 && <div className="empty-state compact">暂无事件索引。通过章节正文后会自动更新，也可手动更新索引。</div>}
+            {(detail?.story_events?.length ?? 0) === 0 && <div className="empty-state compact">暂无事件</div>}
           </div>
         ) : (
           <div className="entity-timeline-layout">
@@ -172,7 +169,7 @@ export function ContinuityLibraryPanel({
                       <span>{selectedEntity.kind === "character" ? "角色" : selectedEntity.kind === "resource" ? "资源" : "物品"}</span>
                       <h4>{selectedEntity.name}</h4>
                     </div>
-                    <small>截至已索引章节</small>
+                    <small>已索引</small>
                   </header>
                   {currentFacts.length > 0 && (
                     <div className="entity-current-state">
@@ -211,7 +208,7 @@ export function ContinuityLibraryPanel({
                     {timeline.length === 0 && <div className="empty-inline">尚无该实体的状态变化记录</div>}
                   </div>
                 </>
-              ) : <div className="empty-state compact">选择一个{isCharacterView ? "角色" : "物品"}查看时间线。</div>}
+              ) : <div className="empty-state compact">选择{isCharacterView ? "角色" : "物品"}</div>}
             </section>
           </div>
         )}

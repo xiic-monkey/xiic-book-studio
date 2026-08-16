@@ -14,6 +14,8 @@ pub const PROPOSE_CREATE_CHAPTER: &str = "propose_create_chapter";
 pub const PROPOSE_RENAME_CHAPTER: &str = "propose_rename_chapter";
 pub const PROPOSE_ARTIFACT_CANDIDATE: &str = "propose_artifact_candidate";
 pub const PROPOSE_KNOWLEDGE_CARD: &str = "propose_knowledge_card";
+pub const PROPOSE_UPDATE_KNOWLEDGE_CARD: &str = "propose_update_knowledge_card";
+pub const PROPOSE_DELETE_KNOWLEDGE_CARD: &str = "propose_delete_knowledge_card";
 pub const PROPOSE_FORESHADOWING: &str = "propose_foreshadowing";
 
 const BOOK_STAGES: &[&str] = &["setting", "outline", "characters"];
@@ -223,6 +225,43 @@ pub fn definitions() -> Vec<AgentToolDefinition> {
                     "content": {"type": "string", "minLength": 1}
                 },
                 "required": ["category", "title", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            PROPOSE_UPDATE_KNOWLEDGE_CARD,
+            "更新知识卡",
+            "更新已存在知识卡的标题、类型或内容，创建待人工确认的提案。",
+            "编辑提案",
+            "proposal",
+            ALL_STAGES,
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "card_id": {"type": "integer", "minimum": 1},
+                    "category": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "content": {"type": "string", "minLength": 1}
+                },
+                "required": ["card_id", "category", "title", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            PROPOSE_DELETE_KNOWLEDGE_CARD,
+            "删除知识卡",
+            "删除已存在的知识卡，创建待人工确认的提案。",
+            "编辑提案",
+            "proposal",
+            ALL_STAGES,
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "card_id": {"type": "integer", "minimum": 1}
+                },
+                "required": ["card_id"],
                 "additionalProperties": false
             }),
         ),

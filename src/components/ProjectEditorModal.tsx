@@ -62,7 +62,7 @@ export function ProjectEditorModal({
               type="text"
               value={formData.title}
               onChange={(event) => onFormChange({ ...formData, title: event.target.value })}
-              placeholder="小说标题"
+              placeholder="书名"
               required
             />
           </div>
@@ -73,7 +73,7 @@ export function ProjectEditorModal({
               type="text"
               value={formData.genre}
               onChange={(event) => onFormChange({ ...formData, genre: event.target.value })}
-              placeholder="例如：都市异能 / 玄幻 / 科幻"
+                placeholder="题材"
               required
             />
           </div>
@@ -110,7 +110,7 @@ export function ProjectEditorModal({
               rows={5}
               value={formData.premise}
               onChange={(event) => onFormChange({ ...formData, premise: event.target.value })}
-              placeholder="一句话概括故事引擎、核心冲突、卖点和写作方向..."
+              placeholder="一句话梗概"
             />
           </div>
         </form>

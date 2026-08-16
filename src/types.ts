@@ -7,7 +7,6 @@ export type {
   AgentToolDefinition,
   ArtifactSummary,
   ContextSegment,
-  LegacyAgentPrompt,
   PreparedContext,
   ProposalApplyResult,
   ProposalStatus,
@@ -210,6 +209,11 @@ export interface AiSpanRevisionInput {
 export interface DeleteArtifactInput {
   project_id: number;
   artifact_id: number;
+}
+
+export interface DeleteKnowledgeCardInput {
+  project_id: number;
+  card_id: number;
 }
 
 export interface ClearChapterHistoryInput {
@@ -565,22 +569,6 @@ export interface AgentStepResult {
     status: string;
     elapsed_ms: number;
   };
-}
-
-export interface ContextPreviewSegment {
-  label: string;
-  content: string;
-  chars: number;
-  truncated: boolean;
-}
-
-export interface ContextPreview {
-  stage: string;
-  genre_agent: GenreAgentProfile;
-  system_prompt: string;
-  segments: ContextPreviewSegment[];
-  total_chars: number;
-  estimated_tokens: number;
 }
 
 export interface ReviewIssue {

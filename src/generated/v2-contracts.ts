@@ -77,8 +77,6 @@ export type ProposalStatus = "pending" | "applied" | "rejected" | "expired";
 
 export type ActionProposal = { id: number, project_id: number, chapter_id: number | null, source_run_id: number | null, proposal_type: string, summary: string, payload: Record<string, unknown>, expected_version: string | null, status: ProposalStatus, decision_note: string, created_at: string, decided_at: string | null, };
 
-export type LegacyAgentPrompt = { id: number, legacy_agent_id: number | null, stage: string, name: string, role: string, system_prompt: string, imported_at: string, };
-
 export type ProposalApplyResult = { proposal: ActionProposal, entity_kind: string, entity_id: number, };
 
 export type ProviderCapabilities = { provider_base_url: string, configured_protocol: ToolProtocol, detected_protocol: ToolProtocol | null, last_error: string | null, updated_at: string | null, };
@@ -89,12 +87,11 @@ export type RunEvent = { run_id: number, project_id: number, chapter_id: number 
 
 export type ActiveAgentRun = { id: number, project_id: number, chapter_id: number | null, stage: string, output: string, status: string, error: string | null, elapsed_ms: number, created_at: string, };
 
-export type ArtifactSummary = { id: number, project_id: number, chapter_id: number | null, stage: Stage, title: string, version: number, status: string, parent_artifact_id: number | null, created_at: string, };
+export type ArtifactSummary = { id: number, project_id: number, chapter_id: number | null, stage: Stage, title: string, version: number, status: string, parent_artifact_id: number | null, created_at: string, char_count: number, };
 
-export type ProjectWorkspace = { project: Project, genre_agent: GenreAgentProfile, chapters: Array<Chapter>, artifacts: Array<ArtifactSummary>, approvals: Array<Approval>, messages: Array<Message>, workflow_runs: Array<WorkflowRunSummary>, story_threads: Array<StoryThread>, knowledge_cards: Array<KnowledgeCard>, foreshadowings: Array<Foreshadowing>, story_entities: Array<StoryEntity>, story_events: Array<StoryEvent>, story_event_participants: Array<StoryEventParticipant>, story_facts: Array<StoryFact>, story_index_sources: Array<StoryIndexSource>, story_search_sources: Array<StorySearchSource>, index_jobs: Array<DerivedIndexJob>, adoption_proposals: Array<AdoptionProposal>, story_bible: StoryBible | null, story_arcs: Array<StoryArc>, story_bible_review: StoryBibleReview | null, canonical_fingerprint: string, settings: AiSettings, };
+export type ProjectWorkspace = { project: Project, genre_agent: GenreAgentProfile, chapters: Array<Chapter>, formal_char_count: number, artifacts: Array<ArtifactSummary>, approvals: Array<Approval>, messages: Array<Message>, workflow_runs: Array<WorkflowRunSummary>, story_threads: Array<StoryThread>, knowledge_cards: Array<KnowledgeCard>, foreshadowings: Array<Foreshadowing>, story_entities: Array<StoryEntity>, story_events: Array<StoryEvent>, story_event_participants: Array<StoryEventParticipant>, story_facts: Array<StoryFact>, story_index_sources: Array<StoryIndexSource>, story_search_sources: Array<StorySearchSource>, index_jobs: Array<DerivedIndexJob>, adoption_proposals: Array<AdoptionProposal>, story_bible: StoryBible | null, story_arcs: Array<StoryArc>, story_bible_review: StoryBibleReview | null, canonical_fingerprint: string, settings: AiSettings, };
 
 export const V2_COMMANDS = {
-  listToolDefinitions: "list_tool_definitions",
   previewAgentRun: "preview_agent_run",
   startAgentRun: "start_agent_run",
   startStoryArchitectRun: "start_story_architect_run",
@@ -110,7 +107,6 @@ export const V2_COMMANDS = {
   listActionProposals: "list_action_proposals_v2",
   applyActionProposal: "apply_action_proposal",
   rejectActionProposal: "reject_action_proposal",
-  listLegacyAgentPrompts: "list_legacy_agent_prompts",
   getProviderCapabilities: "get_provider_capabilities",
   resetAgentPrompt: "reset_agent_prompt",
 } as const;
