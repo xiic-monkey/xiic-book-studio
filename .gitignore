@@ -7,8 +7,11 @@ src-tauri/target
 *.db-*
 *.log
 .env
+.env.*
+!.env.example
 .DS_Store
 npm-debug.log*
+*.tsbuildinfo
 
 # Large local-search resources are fetched and checksum-verified by
 # `npm run prepare:local-search` (also invoked by the release workflow).
