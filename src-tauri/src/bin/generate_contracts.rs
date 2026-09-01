@@ -30,6 +30,7 @@ fn render() -> String {
     output.push_str(&declaration::<StoryEvent>());
     output.push_str(&declaration::<StoryEventParticipant>());
     output.push_str(&declaration::<StoryFact>());
+    output.push_str(&declaration::<StoryFactSearchResult>());
     output.push_str(&declaration::<StoryIndexSource>());
     output.push_str(&declaration::<StorySearchSource>());
     output.push_str(&declaration::<DerivedIndexJob>());

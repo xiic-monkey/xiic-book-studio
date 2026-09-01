@@ -306,10 +306,12 @@ pub fn selection_fingerprint(
 }
 
 pub fn clear_project(state: &AppState, project_id: i64) {
-    let _ = state.with_reference_store(|store| {
+    if let Err(error) = state.with_reference_store(|store| {
         store.clear_project(project_id);
         Ok(())
-    });
+    }) {
+        eprintln!("清理项目引用库失败 (project_id={project_id}): {error}");
+    }
 }
 
 pub fn render_context(

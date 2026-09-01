@@ -234,8 +234,7 @@ pub async fn refresh_knowledge_card(
         .find(|card| card.id == card_id && card.status == "approved")
     {
         let chapter_id = existing_chapter_id(state, project_id, card.source_chapter_id)?;
-        let source_artifact_id =
-            existing_artifact_id(state, project_id, card.source_artifact_id)?;
+        let source_artifact_id = existing_artifact_id(state, project_id, card.source_artifact_id)?;
         replace_source_with_runtime(
             state,
             &SearchSourcePayload {
@@ -279,8 +278,7 @@ pub async fn refresh_foreshadowing(
         })
     {
         let chapter_id = existing_chapter_id(state, project_id, item.planted_chapter_id)?;
-        let source_artifact_id =
-            existing_artifact_id(state, project_id, item.source_artifact_id)?;
+        let source_artifact_id = existing_artifact_id(state, project_id, item.source_artifact_id)?;
         replace_source_with_runtime(
             state,
             &SearchSourcePayload {
@@ -681,8 +679,7 @@ fn collect_project_sources(
         .filter(|card| card.status == "approved")
     {
         let chapter_id = existing_chapter_id(state, project_id, card.source_chapter_id)?;
-        let source_artifact_id =
-            existing_artifact_id(state, project_id, card.source_artifact_id)?;
+        let source_artifact_id = existing_artifact_id(state, project_id, card.source_artifact_id)?;
         sources.push(SearchSourcePayload {
             project_id,
             source_kind: "knowledge_card",
@@ -711,8 +708,7 @@ fn collect_project_sources(
         })
     {
         let chapter_id = existing_chapter_id(state, project_id, item.planted_chapter_id)?;
-        let source_artifact_id =
-            existing_artifact_id(state, project_id, item.source_artifact_id)?;
+        let source_artifact_id = existing_artifact_id(state, project_id, item.source_artifact_id)?;
         sources.push(SearchSourcePayload {
             project_id,
             source_kind: "foreshadowing",

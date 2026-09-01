@@ -56,7 +56,8 @@ struct ChatChoice {
 
 const MAX_AI_RETRIES: usize = 10;
 const AI_REQUEST_TIMEOUT_SECONDS: u64 = 240;
-const AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: u64 = 45;
+const AI_STREAM_MAX_ATTEMPTS: usize = 2;
+const AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: u64 = 30;
 const AI_RETRY_DELAY_MILLIS: u64 = 1_000;
 
 #[derive(Debug)]
@@ -217,6 +218,7 @@ pub async fn plan_tool_calls_native(
     let response = timeout(
         Duration::from_secs(AI_REQUEST_TIMEOUT_SECONDS),
         build_client()
+            .map_err(ToolPlanningError::Other)?
             .post(format!("{normalized_base_url}/chat/completions"))
             .bearer_auth(api_key)
             .json(&request)
@@ -413,7 +415,7 @@ async fn complete_chat_with_format(
         });
     }
     let url = format!("{}/chat/completions", normalized_base_url);
-    let client = build_client();
+    let client = build_client()?;
     let mut last_error = None;
     let max_attempts = MAX_AI_RETRIES + 1;
 
@@ -491,7 +493,7 @@ pub async fn complete_chat_streaming<F>(
     mut on_update: F,
 ) -> AppResult<String>
 where
-    F: FnMut(&str) -> AppResult<()>,
+    F: FnMut(&str, &str) -> AppResult<()>,
 {
     let normalized_base_url = normalize_base_url(&settings.base_url);
     if normalized_base_url.is_empty() {
@@ -504,8 +506,8 @@ where
     let mut request = build_chat_request(settings, system_prompt, user_prompt, temperature);
     request.stream = Some(true);
     let url = format!("{}/chat/completions", normalized_base_url);
-    let client = build_client();
-    let max_attempts = MAX_AI_RETRIES + 1;
+    let client = build_client()?;
+    let max_attempts = AI_STREAM_MAX_ATTEMPTS;
     let mut last_error = None;
 
     for attempt in 1..=max_attempts {
@@ -567,7 +569,7 @@ where
             Err(error) => {
                 last_error = Some(error);
                 if should_retry(attempt, max_attempts) {
-                    on_update("")?;
+                    on_update("", "")?;
                     sleep(Duration::from_millis(AI_RETRY_DELAY_MILLIS)).await;
                 }
             }
@@ -586,7 +588,7 @@ pub async fn list_models(settings: &AiSettings, api_key: &str) -> AppResult<Vec<
     }
 
     let url = format!("{}/models", normalized_base_url);
-    let client = build_client();
+    let client = build_client()?;
     let mut last_error = None;
     let max_attempts = MAX_AI_RETRIES + 1;
 
@@ -669,7 +671,7 @@ pub fn parse_review_issues(raw: &str) -> Vec<ReviewIssue> {
     Vec::new()
 }
 
-fn build_client() -> reqwest::Client {
+fn build_client() -> AppResult<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 
@@ -681,7 +683,7 @@ fn build_client() -> reqwest::Client {
         .no_brotli()
         .no_deflate()
         .build()
-        .expect("failed to build reqwest client")
+        .map_err(AppError::from)
 }
 
 async fn read_response_text(response: reqwest::Response) -> AppResult<String> {
@@ -694,11 +696,12 @@ async fn read_stream_completion<F>(
     on_update: &mut F,
 ) -> AppResult<String>
 where
-    F: FnMut(&str) -> AppResult<()>,
+    F: FnMut(&str, &str) -> AppResult<()>,
 {
     let mut buffer = String::new();
     let mut raw_response = String::new();
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut saw_sse_event = false;
     let mut saw_terminal_event = false;
 
@@ -742,9 +745,14 @@ where
             if let Some(message) = value.get("error").and_then(extract_error_message) {
                 return Err(AppError::Validation(format!("AI 返回错误：{message}")));
             }
+            if let Some(delta) = extract_stream_delta_reasoning(&value) {
+                reasoning.push_str(&delta);
+            }
             if let Some(delta) = extract_stream_delta_content(&value) {
                 content.push_str(&delta);
-                on_update(&content)?;
+            }
+            if !content.is_empty() || !reasoning.is_empty() {
+                on_update(&content, &reasoning)?;
             }
             if let Some(reason) = value
                 .pointer("/choices/0/finish_reason")
@@ -773,7 +781,7 @@ where
     if normalized.trim().is_empty() {
         return Err(AppError::Validation("AI 没有返回可用内容".to_string()));
     }
-    on_update(&normalized)?;
+    on_update(&normalized, &reasoning)?;
     Ok(normalized)
 }
 
@@ -928,6 +936,20 @@ fn extract_stream_delta_content(value: &Value) -> Option<String> {
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("delta"))
         .and_then(|delta| delta.get("content"))
+        .and_then(extract_message_content)
+}
+
+fn extract_stream_delta_reasoning(value: &Value) -> Option<String> {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| {
+            delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+        })
         .and_then(extract_message_content)
 }
 

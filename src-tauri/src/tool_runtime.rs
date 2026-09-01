@@ -13,8 +13,9 @@ use crate::{
     quality, workflow,
 };
 
-const MAX_TOOL_ROUNDS: usize = 4;
-const MAX_TOOL_CALLS: usize = 12;
+// The model decides when the tool loop is complete. This is only a circuit
+// breaker for a malfunctioning provider repeatedly requesting new calls.
+const MAX_TOOL_CALLS: usize = 64;
 const MAX_RENDERED_CONTEXT_CHARS: usize = 24_000;
 
 pub struct ToolExecutionContext<'a> {
@@ -79,7 +80,33 @@ pub async fn prepare_tools(
     let mut seen = HashSet::new();
     let mut total_calls = 0usize;
 
-    for round in 0..MAX_TOOL_ROUNDS {
+    let mut round = 0usize;
+    loop {
+        round += 1;
+        if let Some(run_id) = context.run_id {
+            let _ = context.state.insert_run_event(
+                run_id,
+                context.project_id,
+                context.chapter_id,
+                "thinking_start",
+                "",
+                "thinking",
+                None,
+            );
+            let _ = context.state.insert_run_event(
+                run_id,
+                context.project_id,
+                context.chapter_id,
+                "thinking_delta",
+                if round == 0 {
+                    "正在分析任务并决定是否需要调用工具……"
+                } else {
+                    "正在结合工具结果继续分析……"
+                },
+                "thinking",
+                None,
+            );
+        }
         let (calls, protocol) = plan_calls(
             context.state,
             &settings,
@@ -96,6 +123,17 @@ pub async fn prepare_tools(
         }
         preparation.protocol = Some(protocol.clone());
         if calls.is_empty() {
+            if let Some(run_id) = context.run_id {
+                let _ = context.state.insert_run_event(
+                    run_id,
+                    context.project_id,
+                    context.chapter_id,
+                    "thinking_end",
+                    "",
+                    "thinking",
+                    None,
+                );
+            }
             break;
         }
 
@@ -119,6 +157,27 @@ pub async fn prepare_tools(
         }
         for (call, _) in &pending_calls {
             if let Err(error) = validate_call(&context, &definitions, call) {
+                let error_message = error.to_string();
+                emit_tool_event(
+                    &context,
+                    "tool_started",
+                    &call.tool_key,
+                    None,
+                    "",
+                    "running",
+                    None,
+                    None,
+                );
+                emit_tool_event(
+                    &context,
+                    "tool_completed",
+                    &call.tool_key,
+                    None,
+                    &error_message,
+                    "rejected",
+                    Some(&error_message),
+                    Some(0),
+                );
                 context.state.insert_tool_invocation(
                     context.run_id,
                     None,
@@ -130,7 +189,7 @@ pub async fn prepare_tools(
                     &call.arguments,
                     &json!({}),
                     "rejected",
-                    Some(&error.to_string()),
+                    Some(&error_message),
                     0,
                 )?;
                 return Err(error);
@@ -141,6 +200,16 @@ pub async fn prepare_tools(
         for (call, dedup_key) in pending_calls {
             seen.insert(dedup_key);
             total_calls += 1;
+            emit_tool_event(
+                &context,
+                "tool_started",
+                &call.tool_key,
+                None,
+                "",
+                "running",
+                None,
+                None,
+            );
             let started = Instant::now();
             let execution = execute_call(&context, &call).await;
             let elapsed_ms = started.elapsed().as_millis() as i64;
@@ -187,6 +256,16 @@ pub async fn prepare_tools(
                 result.elapsed_ms,
             )?;
             preparation.invocation_ids.push(record.id);
+            emit_tool_event(
+                &context,
+                "tool_completed",
+                &call.tool_key,
+                Some(record.id),
+                &tool_result_summary(&result),
+                &result.status,
+                result.error.as_deref(),
+                Some(result.elapsed_ms),
+            );
             if let Some(proposal) = proposal {
                 preparation.proposals.push(proposal);
             }
@@ -195,15 +274,30 @@ pub async fn prepare_tools(
         if round_results.is_empty() {
             break;
         }
+        if let Some(run_id) = context.run_id {
+            let _ = context.state.insert_run_event(
+                run_id,
+                context.project_id,
+                context.chapter_id,
+                "thinking_delta",
+                "工具结果已返回，正在整理并生成最终答复……",
+                "thinking",
+                None,
+            );
+            let _ = context.state.insert_run_event(
+                run_id,
+                context.project_id,
+                context.chapter_id,
+                "thinking_end",
+                "",
+                "thinking",
+                None,
+            );
+        }
         planning_context.push_str("\n\n# 已执行工具结果\n");
         planning_context.push_str(&serde_json::to_string_pretty(&round_results)?);
         if planning_context.chars().count() > MAX_RENDERED_CONTEXT_CHARS {
             planning_context = sample(&planning_context, MAX_RENDERED_CONTEXT_CHARS);
-        }
-        if round + 1 == MAX_TOOL_ROUNDS {
-            return Err(AppError::Validation(format!(
-                "Agent 工具交互达到单次运行上限 {MAX_TOOL_ROUNDS} 轮"
-            )));
         }
     }
 
@@ -238,6 +332,65 @@ pub async fn prepare_tools(
     }
 
     Ok(preparation)
+}
+
+fn emit_tool_event(
+    context: &ToolExecutionContext<'_>,
+    kind: &str,
+    tool_key: &str,
+    tool_invocation_id: Option<i64>,
+    delta: &str,
+    status: &str,
+    error: Option<&str>,
+    elapsed_ms: Option<i64>,
+) {
+    let Some(run_id) = context.run_id else {
+        return;
+    };
+    if let Err(event_error) = context.state.insert_tool_run_event(
+        run_id,
+        context.project_id,
+        context.chapter_id,
+        kind,
+        tool_key,
+        tool_invocation_id,
+        delta,
+        status,
+        error,
+        elapsed_ms,
+    ) {
+        eprintln!("记录工具运行事件失败: {event_error}");
+    }
+}
+
+fn tool_result_summary(result: &ToolResult) -> String {
+    if let Some(error) = result.error.as_deref() {
+        return compact_tool_text(error);
+    }
+    for key in ["summary", "message", "description"] {
+        if let Some(value) = result.data.get(key).and_then(Value::as_str) {
+            if !value.trim().is_empty() {
+                return compact_tool_text(value);
+            }
+        }
+    }
+    for key in ["count", "total", "result_count", "source_count"] {
+        if let Some(value) = result.data.get(key).and_then(Value::as_i64) {
+            return format!("返回 {value} 条结果");
+        }
+    }
+    "已返回结构化结果".to_string()
+}
+
+fn compact_tool_text(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let summary: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        format!("{summary}…")
+    } else {
+        summary
+    }
 }
 
 async fn plan_calls(
@@ -437,7 +590,7 @@ async fn execute_call(
     call: &ToolCall,
 ) -> AppResult<(Value, Vec<String>, bool, Option<ActionProposal>)> {
     match call.tool_key.as_str() {
-        agent_tools::HISTORY_CONTEXT => {
+        agent_tools::SEARCH_STORY | agent_tools::HISTORY_CONTEXT => {
             let query = required_string(&call.arguments, "query")?;
             let limit = call
                 .arguments
@@ -460,6 +613,27 @@ async fn execute_call(
                 .map(|snippet| snippet.source_label.clone())
                 .collect();
             Ok((serde_json::to_value(snippets)?, citations, false, None))
+        }
+        agent_tools::SEARCH_STORY_FACTS => {
+            let query = required_string(&call.arguments, "query")?;
+            let limit = call
+                .arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(8)
+                .clamp(1, 12) as usize;
+            let facts = workflow::search_story_facts(
+                context.state,
+                StoryContextSearchInput {
+                    project_id: context.project_id,
+                    chapter_id: context.chapter_id,
+                    query: query.to_string(),
+                    limit: Some(limit),
+                    include_immediate_previous: true,
+                },
+            )?;
+            let citations = facts.iter().map(|fact| fact.source_label.clone()).collect();
+            Ok((serde_json::to_value(facts)?, citations, false, None))
         }
         agent_tools::REFERENCE_MATERIALS => {
             let query = call
@@ -498,6 +672,26 @@ async fn execute_call(
             } else {
                 None
             };
+            Ok((serde_json::to_value(memory)?, Vec::new(), false, None))
+        }
+        agent_tools::REQUEST_CHAPTER_MEMORY => {
+            let chapter_id = required_i64(&call.arguments, "chapter_id")?;
+            if context
+                .state
+                .ensure_chapter(context.project_id, Some(chapter_id))?
+                .is_none()
+            {
+                return Err(AppError::Validation(
+                    "章节不存在或不属于当前项目".to_string(),
+                ));
+            }
+            let memory = chapter_memory::generate_for_approved_chapter(
+                context.state,
+                context.project_id,
+                chapter_id,
+            )
+            .await?
+            .ok_or_else(|| AppError::Validation("章节记忆无需重新生成".to_string()))?;
             Ok((serde_json::to_value(memory)?, Vec::new(), false, None))
         }
         agent_tools::CONTINUITY_CHECK => {
@@ -564,6 +758,46 @@ async fn execute_call(
             let results = crate::web_search::search_summaries(context.state, &query).await?;
             let citations = results.iter().map(|result| result.url.clone()).collect();
             Ok((serde_json::to_value(results)?, citations, false, None))
+        }
+        agent_tools::REPLACE_TEXT
+        | agent_tools::INSERT_AFTER
+        | agent_tools::DELETE_RANGE
+        | agent_tools::APPLY_PATCH => {
+            let artifact_id = required_i64(&call.arguments, "artifact_id")?;
+            let artifact = context.state.get_artifact(artifact_id)?;
+            if artifact.project_id != context.project_id
+                || artifact.chapter_id != context.chapter_id
+            {
+                return Err(AppError::Validation(
+                    "章节修订工具只能修改当前章节候选稿".to_string(),
+                ));
+            }
+            if !matches!(artifact.stage.as_str(), "draft" | "revision") {
+                return Err(AppError::Validation(
+                    "章节修订工具只能修改章节草稿或修订稿".to_string(),
+                ));
+            }
+            let mut payload = call.arguments.clone();
+            payload["source_artifact_id"] = json!(artifact.id);
+            payload["type"] = json!(match call.tool_key.as_str() {
+                agent_tools::REPLACE_TEXT => "replace_text",
+                agent_tools::INSERT_AFTER => "insert_after",
+                agent_tools::DELETE_RANGE => "delete_range",
+                _ => "apply_patch",
+            });
+            let summary = match call.tool_key.as_str() {
+                agent_tools::REPLACE_TEXT => "替换章节文本",
+                agent_tools::INSERT_AFTER => "在章节中插入文本",
+                agent_tools::DELETE_RANGE => "删除章节文本范围",
+                _ => "应用多处章节修订",
+            };
+            create_proposal(
+                context,
+                "chapter_revision",
+                summary,
+                &payload,
+                Some(&artifact.created_at),
+            )
         }
         agent_tools::PROPOSE_CREATE_CHAPTER => {
             let title = required_string(&call.arguments, "title")?;

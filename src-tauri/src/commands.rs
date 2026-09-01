@@ -12,17 +12,17 @@ use crate::{
         ConfirmStoryBibleReviewRequest, ContinuityReport, ContinuityReviewRequest,
         DecideActionProposalRequest, DecideAdoptionProposalsRequest, DeleteArtifactRequest,
         DeleteKnowledgeCardRequest, DerivedIndexJob, Foreshadowing, HistoryCleanupResult,
-        ImportReferenceTextRequest,
-        KnowledgeCard, LedgerContinuityCheckRequest, LedgerContinuityReport,
-        ListActionProposalsRequest, ListAdoptionProposalsRequest, ListModelsInput, NewChapter,
-        NewProject, PrepareArtifactAdoptionsRequest, PreparedContext, Project, ProjectDetail,
-        ProjectUpdate, ProjectWorkspace, ProposalApplyResult, ProviderCapabilities, QualityReport,
-        RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, ReferenceMaterial,
-        RetryIndexJobsRequest, RevisionRequest, RunEvent, RunStoryArchitectRequest,
-        SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
-        SaveWritingSkill, SpanReplacementRequest, StoryBible, StoryBibleReview,
-        StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextRerankResult,
-        StoryContextSearchInput, StoryContextSnippet, StoryIndexSummary, TestAiConnectionInput,
+        ImportReferenceTextRequest, KnowledgeCard, LedgerContinuityCheckRequest,
+        LedgerContinuityReport, ListActionProposalsRequest, ListAdoptionProposalsRequest,
+        ListModelsInput, NewChapter, NewProject, PrepareArtifactAdoptionsRequest, PreparedContext,
+        Project, ProjectDetail, ProjectUpdate, ProjectWorkspace, ProposalApplyResult,
+        ProviderCapabilities, QualityReport, RebuildStoryIndexRequest,
+        RebuildStorySearchIndexRequest, ReferenceMaterial, RetryIndexJobsRequest, RevisionRequest,
+        RunEvent, RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider, SaveAiSettings,
+        SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest, StoryBible,
+        StoryBibleReview, StoryBibleReviewRequest, StoryContextRerankRequest,
+        StoryContextRerankResult, StoryContextSearchInput, StoryContextSnippet,
+        StoryFactSearchResult, StoryIndexSummary, TestAiConnectionInput,
         UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest, WritingSkill,
     },
 };
@@ -435,6 +435,22 @@ pub fn search_story_context(
     input: StoryContextSearchInput,
 ) -> AppResult<Vec<StoryContextSnippet>> {
     gateway.search_story_context(input)
+}
+
+#[tauri::command]
+pub fn search_story(
+    gateway: State<'_, ApplicationGateway>,
+    input: StoryContextSearchInput,
+) -> AppResult<Vec<StoryContextSnippet>> {
+    gateway.search_story(input)
+}
+
+#[tauri::command]
+pub fn search_story_facts(
+    gateway: State<'_, ApplicationGateway>,
+    input: StoryContextSearchInput,
+) -> AppResult<Vec<StoryFactSearchResult>> {
+    gateway.search_story_facts(input)
 }
 
 #[tauri::command]

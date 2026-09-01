@@ -154,6 +154,7 @@ impl Agent {
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     Read,
+    Delegate,
     Proposal,
 }
 
@@ -161,6 +162,8 @@ impl ToolKind {
     pub fn parse(value: &str) -> Self {
         if value == "proposal" {
             Self::Proposal
+        } else if value == "delegate" {
+            Self::Delegate
         } else {
             Self::Read
         }
@@ -1154,10 +1157,16 @@ pub struct RunEvent {
     pub chapter_id: Option<i64>,
     pub stage: String,
     pub sequence: i64,
+    #[ts(
+        type = "\"completed\" | \"failed\" | \"cancelled\" | \"started\" | \"output_delta\" | \"output_reset\" | \"thinking_start\" | \"thinking_delta\" | \"thinking_end\" | \"cancellation_requested\" | \"proposal_warning\" | \"tool_started\" | \"tool_completed\""
+    )]
     pub kind: String,
     pub delta: String,
     pub status: String,
     pub error: Option<String>,
+    pub tool_key: Option<String>,
+    pub tool_invocation_id: Option<i64>,
+    pub elapsed_ms: Option<i64>,
     pub created_at: String,
 }
 
@@ -1465,5 +1474,18 @@ pub struct StoryContextSnippet {
     pub source_label: String,
     pub matched_term: String,
     pub content: String,
+    pub score: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct StoryFactSearchResult {
+    pub fact_type: String,
+    pub source_label: String,
+    pub chapter_id: Option<i64>,
+    pub entity_label: Option<String>,
+    pub dimension: String,
+    pub value: String,
+    pub status: String,
+    pub evidence_quote: String,
     pub score: usize,
 }

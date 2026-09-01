@@ -70,21 +70,7 @@ pub fn confirm_story_bible(
             )));
         }
     }
-    let setting = state
-        .approved_artifact(input.project_id, "setting", None)?
-        .ok_or_else(|| AppError::Validation("缺少已通过设定资料".to_string()))?;
-    let outline = state
-        .approved_artifact(input.project_id, "outline", None)?
-        .ok_or_else(|| AppError::Validation("缺少已通过阶段大纲".to_string()))?;
-    let bible = state.upsert_story_bible_from_artifact(input.project_id, &setting, "confirmed")?;
-    state.ensure_active_story_arc_from_outline(input.project_id, &outline)?;
-    state.insert_message(
-        input.project_id,
-        None,
-        "approval_note",
-        &format!("人工确认创作基准。{}", input.note.trim()),
-    )?;
-    Ok(bible)
+    state.confirm_story_bible_atomic(input.project_id, &input.note)
 }
 
 pub async fn review_story_bible(

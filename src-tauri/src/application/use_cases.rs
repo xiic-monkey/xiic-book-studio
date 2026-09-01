@@ -1,6 +1,6 @@
 use super::ApplicationGateway;
 use crate::{
-    adoption, ai, context_search, continuity_ledger,
+    adoption, ai, chapter_memory, context_search, continuity_ledger,
     error::{AppError, AppResult},
     gate, index_jobs,
     models::*,
@@ -277,6 +277,22 @@ impl ApplicationGateway {
             self.state
                 .approve_stage(project_id, stage, artifact_id, note.unwrap_or(""))?;
         self.state.wake_index_worker();
+        if matches!(stage, "draft" | "revision") {
+            if let Some(chapter_id) = self.state.get_artifact(artifact_id)?.chapter_id {
+                let state = self.state.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if let Err(error) = chapter_memory::generate_for_approved_chapter(
+                            &state, project_id, chapter_id,
+                        )
+                        .await
+                        {
+                            eprintln!("chapter memory generation unavailable: {error}");
+                        }
+                    });
+                }
+            }
+        }
         Ok(approval)
     }
 
@@ -386,6 +402,20 @@ impl ApplicationGateway {
         input: StoryContextSearchInput,
     ) -> AppResult<Vec<StoryContextSnippet>> {
         workflow::search_story_context(&self.state, input)
+    }
+
+    pub fn search_story(
+        &self,
+        input: StoryContextSearchInput,
+    ) -> AppResult<Vec<StoryContextSnippet>> {
+        workflow::search_story(&self.state, input)
+    }
+
+    pub fn search_story_facts(
+        &self,
+        input: StoryContextSearchInput,
+    ) -> AppResult<Vec<StoryFactSearchResult>> {
+        workflow::search_story_facts(&self.state, input)
     }
 
     pub async fn rerank_story_context(

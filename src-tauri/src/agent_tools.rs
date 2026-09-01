@@ -4,8 +4,11 @@ use crate::models::{AgentToolDefinition, ToolKind};
 use serde_json::json;
 
 pub const HISTORY_CONTEXT: &str = "history_context";
+pub const SEARCH_STORY: &str = "search_story";
+pub const SEARCH_STORY_FACTS: &str = "search_story_facts";
 pub const REFERENCE_MATERIALS: &str = "reference_materials";
 pub const CHAPTER_MEMORY: &str = "chapter_memory";
+pub const REQUEST_CHAPTER_MEMORY: &str = "request_chapter_memory";
 pub const CONTINUITY_CHECK: &str = "continuity_check";
 pub const QUALITY_ANALYSIS: &str = "quality_analysis";
 pub const CHAPTER_SPLIT: &str = "chapter_split";
@@ -17,6 +20,10 @@ pub const PROPOSE_KNOWLEDGE_CARD: &str = "propose_knowledge_card";
 pub const PROPOSE_UPDATE_KNOWLEDGE_CARD: &str = "propose_update_knowledge_card";
 pub const PROPOSE_DELETE_KNOWLEDGE_CARD: &str = "propose_delete_knowledge_card";
 pub const PROPOSE_FORESHADOWING: &str = "propose_foreshadowing";
+pub const REPLACE_TEXT: &str = "replace_text";
+pub const INSERT_AFTER: &str = "insert_after";
+pub const DELETE_RANGE: &str = "delete_range";
+pub const APPLY_PATCH: &str = "apply_patch";
 
 const BOOK_STAGES: &[&str] = &["setting", "outline", "characters"];
 const CHAPTER_STAGES: &[&str] = &["draft", "review", "revision"];
@@ -57,22 +64,34 @@ fn definition(
 pub fn definitions() -> Vec<AgentToolDefinition> {
     vec![
         definition(
-            HISTORY_CONTEXT,
-            "历史上下文检索",
-            "检索已批准章节、故事索引和历史事实，为当前任务补充证据。",
+            SEARCH_STORY,
+            "故事原文检索",
+            "检索已生效的章节正文、设定、提纲和故事原文片段；需要查找事件经过或人物出现位置时使用。",
             "上下文",
             "read",
             CHAPTER_STAGES,
             true,
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "minLength": 1, "maxLength": 240},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 12}
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
+            json!({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":240},"limit":{"type":"integer","minimum":1,"maximum":12}},"required":["query"],"additionalProperties":false}),
+        ),
+        definition(
+            SEARCH_STORY_FACTS,
+            "故事事实检索",
+            "只检索已确认的结构化事实、连续性状态和有效章节记忆，不替代正文检索。",
+            "连续性",
+            "read",
+            CHAPTER_STAGES,
+            true,
+            json!({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":240},"limit":{"type":"integer","minimum":1,"maximum":12}},"required":["query"],"additionalProperties":false}),
+        ),
+        definition(
+            HISTORY_CONTEXT,
+            "历史上下文检索（兼容）",
+            "兼容旧 Agent 配置，等价于故事原文检索。",
+            "上下文",
+            "read",
+            CHAPTER_STAGES,
+            true,
+            json!({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":240},"limit":{"type":"integer","minimum":1,"maximum":12}},"required":["query"],"additionalProperties":false}),
         ),
         definition(
             REFERENCE_MATERIALS,
@@ -97,6 +116,21 @@ pub fn definitions() -> Vec<AgentToolDefinition> {
             CHAPTER_STAGES,
             true,
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        ),
+        definition(
+            REQUEST_CHAPTER_MEMORY,
+            "委托生成章节记忆",
+            "委托章节记忆 Agent 从已生效正文提取事实交接记忆；主 Agent 不直接写入记忆。",
+            "连续性",
+            "delegate",
+            CHAPTER_STAGES,
+            false,
+            json!({
+                "type": "object",
+                "properties": {"chapter_id": {"type": "integer", "minimum": 1}},
+                "required": ["chapter_id"],
+                "additionalProperties": false
+            }),
         ),
         definition(
             CONTINUITY_CHECK,
@@ -158,10 +192,103 @@ pub fn definitions() -> Vec<AgentToolDefinition> {
             }),
         ),
         definition(
+            REPLACE_TEXT,
+            "替换文本",
+            "在当前章节候选稿中，按唯一原文锚点替换一处文本；生成章节修订候选，不直接覆盖正文。",
+            "章节修订",
+            "proposal",
+            &["draft", "revision"],
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": {"type": "integer", "minimum": 1},
+                    "find_text": {"type": "string", "minLength": 1},
+                    "replace_text": {"type": "string"},
+                    "note": {"type": "string", "maxLength": 500}
+                },
+                "required": ["artifact_id", "find_text", "replace_text"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            INSERT_AFTER,
+            "插入文本",
+            "在当前章节候选稿的唯一原文锚点后插入文本；生成章节修订候选。",
+            "章节修订",
+            "proposal",
+            &["draft", "revision"],
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": {"type": "integer", "minimum": 1},
+                    "anchor_text": {"type": "string", "minLength": 1},
+                    "insert_text": {"type": "string", "minLength": 1},
+                    "note": {"type": "string", "maxLength": 500}
+                },
+                "required": ["artifact_id", "anchor_text", "insert_text"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            DELETE_RANGE,
+            "删除范围",
+            "删除当前章节候选稿中唯一匹配的原文范围；生成章节修订候选。",
+            "章节修订",
+            "proposal",
+            &["draft", "revision"],
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": {"type": "integer", "minimum": 1},
+                    "find_text": {"type": "string", "minLength": 1},
+                    "note": {"type": "string", "maxLength": 500}
+                },
+                "required": ["artifact_id", "find_text"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            APPLY_PATCH,
+            "应用多处修订",
+            "按顺序应用多条基于唯一原文锚点的章节修订；生成一个章节修订候选。",
+            "章节修订",
+            "proposal",
+            &["draft", "revision"],
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": {"type": "integer", "minimum": 1},
+                    "operations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["replace_text", "insert_after", "delete_range"]},
+                                "find_text": {"type": "string"},
+                                "anchor_text": {"type": "string"},
+                                "replace_text": {"type": "string"},
+                                "insert_text": {"type": "string"}
+                            },
+                            "required": ["type"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "note": {"type": "string", "maxLength": 500}
+                },
+                "required": ["artifact_id", "operations"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
             PROPOSE_CREATE_CHAPTER,
             "提议创建章节",
             "创建一个待人工确认的新章节提案，不直接写入章节表。",
-            "编辑提案",
+            "章节创建",
             "proposal",
             BOOK_STAGES,
             false,
@@ -176,7 +303,7 @@ pub fn definitions() -> Vec<AgentToolDefinition> {
             PROPOSE_RENAME_CHAPTER,
             "提议重命名章节",
             "创建章节重命名提案，不直接修改章节。",
-            "编辑提案",
+            "章节修订",
             "proposal",
             ALL_STAGES,
             false,
@@ -290,7 +417,8 @@ pub fn definitions() -> Vec<AgentToolDefinition> {
 pub fn default_keys() -> Vec<String> {
     definitions()
         .into_iter()
-        .filter(|tool| tool.kind == ToolKind::Read)
+        .filter(|tool| matches!(tool.kind, ToolKind::Read | ToolKind::Delegate))
+        .filter(|tool| tool.key != HISTORY_CONTEXT)
         .map(|tool| tool.key)
         .collect()
 }

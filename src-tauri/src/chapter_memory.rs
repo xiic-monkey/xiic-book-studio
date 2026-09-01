@@ -15,12 +15,12 @@ pub const NORMALIZATION_VERSION: &str = "chapter-text-v8";
 pub fn is_enabled() -> bool {
     std::env::var("XIIC_CHAPTER_MEMORY")
         .map(|value| {
-            matches!(
+            !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on"
+                "0" | "false" | "off"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,6 +88,7 @@ pub async fn ensure_predecessor_memory(
     settings: &AiSettings,
     api_key: &str,
     previous_plan: Option<&str>,
+    system_prompt: &str,
 ) -> AppResult<Option<ChapterMemoryRecord>> {
     let chapters = state.list_chapters(project_id)?;
     let Some(current) = chapters
@@ -120,6 +121,36 @@ pub async fn ensure_predecessor_memory(
         settings,
         api_key,
         previous_plan,
+        system_prompt,
+    )
+    .await
+    .map(Some)
+}
+
+pub async fn generate_for_approved_chapter(
+    state: &AppState,
+    project_id: i64,
+    chapter_id: i64,
+) -> AppResult<Option<ChapterMemoryRecord>> {
+    if !is_enabled() {
+        return Ok(None);
+    }
+    if current_memory_for_chapter(state, project_id, chapter_id)?.is_some() {
+        return Ok(None);
+    }
+    let agent = state.get_agent("chapter_memory")?;
+    let settings = agent.ai_settings();
+    let api_key = state
+        .get_api_key_for_base_url(&settings.base_url)?
+        .ok_or_else(|| AppError::Validation("请先为章节记忆 Agent 配置 API Key".to_string()))?;
+    rebuild_chapter_memory(
+        state,
+        project_id,
+        chapter_id,
+        &settings,
+        &api_key,
+        None,
+        &agent.system_prompt,
     )
     .await
     .map(Some)
@@ -132,6 +163,7 @@ pub async fn rebuild_chapter_memory(
     settings: &AiSettings,
     api_key: &str,
     chapter_plan: Option<&str>,
+    system_prompt: &str,
 ) -> AppResult<ChapterMemoryRecord> {
     let chapter = state
         .ensure_chapter(project_id, Some(chapter_id))?
@@ -158,15 +190,7 @@ pub async fn rebuild_chapter_memory(
         0,
     )?;
 
-    let raw = match ai::complete_json_chat(
-        settings,
-        api_key,
-        "你是长篇小说的事实交接记录员。宁可漏记，也不能推断、合并或补写正文没有明确证明的事实。",
-        &prompt,
-        0.1,
-    )
-    .await
-    {
+    let raw = match ai::complete_json_chat(settings, api_key, system_prompt, &prompt, 0.1).await {
         Ok(raw) => raw,
         Err(error) => {
             state.update_workflow_run(

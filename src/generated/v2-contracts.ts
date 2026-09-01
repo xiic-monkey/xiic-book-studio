@@ -37,6 +37,8 @@ export type StoryEventParticipant = { event_id: number, entity_id: number, entit
 
 export type StoryFact = { id: number, project_id: number, entity_id: number, event_id: number | null, dimension: string, value: string, visibility: string, status: string, narrative_chapter_id: number | null, source_artifact_id: number, source_quote: string, supersedes_fact_id: number | null, created_at: string, };
 
+export type StoryFactSearchResult = { fact_type: string, source_label: string, chapter_id: number | null, entity_label: string | null, dimension: string, value: string, status: string, evidence_quote: string, score: number, };
+
 export type StoryIndexSource = { project_id: number, chapter_id: number, source_artifact_id: number, status: string, error: string | null, indexed_at: string, };
 
 export type StorySearchSource = { project_id: number, source_kind: string, source_id: number, chapter_id: number | null, chapter_no_sort: number | null, stage: string | null, source_artifact_id: number | null, source_text_hash: string, normalization_version: string, status: string, error: string | null, indexed_at: string, };
@@ -55,7 +57,7 @@ export type StoryBibleReview = { id: number, project_id: number, canon_fingerpri
 
 export type AiSettings = { base_url: string, model: string, temperature: number, thinking_enabled: boolean, thinking_level: "off" | "low" | "medium" | "high", has_api_key: boolean, };
 
-export type ToolKind = "read" | "proposal";
+export type ToolKind = "read" | "delegate" | "proposal";
 
 export type AgentToolDefinition = { key: string, name: string, description: string, category: string, kind: ToolKind, supported_stages: Array<string>, previewable: boolean, parameters_schema: Record<string, unknown>, };
 
@@ -83,7 +85,7 @@ export type ProviderCapabilities = { provider_base_url: string, configured_proto
 
 export type AgentRunSummary = { run: WorkflowRun, artifact: Artifact | null, prepared_context_id: number | null, tool_invocations: Array<ToolInvocation>, proposals: Array<ActionProposal>, };
 
-export type RunEvent = { run_id: number, project_id: number, chapter_id: number | null, stage: string, sequence: number, kind: string, delta: string, status: string, error: string | null, created_at: string, };
+export type RunEvent = { run_id: number, project_id: number, chapter_id: number | null, stage: string, sequence: number, kind: "completed" | "failed" | "cancelled" | "started" | "output_delta" | "output_reset" | "thinking_start" | "thinking_delta" | "thinking_end" | "cancellation_requested" | "proposal_warning" | "tool_started" | "tool_completed", delta: string, status: string, error: string | null, tool_key: string | null, tool_invocation_id: number | null, elapsed_ms: number | null, created_at: string, };
 
 export type ActiveAgentRun = { id: number, project_id: number, chapter_id: number | null, stage: string, output: string, status: string, error: string | null, elapsed_ms: number, created_at: string, };
 

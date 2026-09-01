@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Xiic Book Studio",
+        "title": "Xiic Book Studio · 开发版",
         "width": 1440,
         "height": 960,
         "minWidth": 1120,

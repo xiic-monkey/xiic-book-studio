@@ -5,14 +5,52 @@ interface AgentRunInspectorProps {
   run: AgentRunSummary | null;
   proposals: ActionProposal[];
   busy: boolean;
+  mode?: "full" | "compact";
   onApplyProposal: (proposal: ActionProposal) => void;
   onRejectProposal: (proposal: ActionProposal) => void;
+}
+
+const toolLabels: Record<string, string> = {
+  story_context_search: "检索故事资料",
+  prepare_agent_context: "准备创作上下文",
+  check_continuity: "检查连续性",
+  create_artifact: "生成候选版本",
+  get_current_artifact: "读取当前版本",
+  get_story_bible: "读取创作基准",
+  get_chapter_context: "读取当前章节",
+  search_story: "检索故事内容",
+};
+
+function toolLabel(toolKey: string) {
+  return toolLabels[toolKey] ?? toolKey.replace(/[_-]+/g, " ").replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
 }
 
 function invocationStatusLabel(invocation: ToolInvocation) {
   if (invocation.status === "success") return "成功";
   if (invocation.status === "rejected") return "已拒绝";
-  return invocation.error ? "失败" : invocation.status;
+  if (["running", "started", "pending"].includes(invocation.status)) return "执行中";
+  return invocation.error ? "失败" : invocation.status || "已完成";
+}
+
+function invocationStatusClass(invocation: ToolInvocation) {
+  if (invocation.error || invocation.status === "failed") return "failed";
+  if (["running", "started", "pending"].includes(invocation.status)) return "running";
+  return "success";
+}
+
+function resultSummary(invocation: ToolInvocation) {
+  if (invocation.error) return invocation.error;
+  const result = invocation.result ?? {};
+  const record = result as Record<string, unknown>;
+  const summary = [record.summary, record.message, record.description].find(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
+  if (summary) return summary;
+  const count = [record.count, record.total, record.result_count, record.source_count].find(
+    (value): value is number => typeof value === "number",
+  );
+  if (count !== undefined) return `返回 ${count.toLocaleString()} 条结果`;
+  return "已返回结构化结果";
 }
 
 function proposalTypeLabel(proposalType: string) {
@@ -26,16 +64,64 @@ function proposalTypeLabel(proposalType: string) {
   return labels[proposalType] ?? proposalType;
 }
 
+function CompactRunInspector({ run }: { run: AgentRunSummary }) {
+  const invocations = run.tool_invocations ?? [];
+  return (
+    <section className="agent-run-inspector agent-run-inspector-compact">
+      <header className="agent-run-inspector-head">
+        <div>
+          <strong>执行记录</strong>
+          <span>{invocations.length > 0 ? `${invocations.length} 个工具调用` : "本次未调用额外工具"} · {run.run.elapsed_ms.toLocaleString()} ms</span>
+        </div>
+        <Wrench size={15} />
+      </header>
+      {invocations.length > 0 ? (
+        <div className="agent-run-tool-list">
+          {invocations.map((invocation) => (
+            <details key={invocation.id} className={`agent-run-tool-item agent-run-tool-item-${invocationStatusClass(invocation)}`}>
+              <summary>
+                <span>
+                  <ChevronDown size={13} />
+                  <strong>{toolLabel(invocation.tool_key)}</strong>
+                </span>
+                <small><i /> {invocationStatusLabel(invocation)} · {invocation.elapsed_ms} ms</small>
+              </summary>
+              <div className="agent-run-tool-compact-result">
+                <span>{resultSummary(invocation)}</span>
+                <details>
+                  <summary>查看详情</summary>
+                  <div className="agent-run-tool-payload">
+                    <label>工具</label>
+                    <code>{invocation.tool_key}</code>
+                    <label>参数</label>
+                    <pre>{JSON.stringify(invocation.arguments, null, 2)}</pre>
+                    <label>{invocation.error ? "错误" : "结果"}</label>
+                    <pre>{invocation.error ?? JSON.stringify(invocation.result, null, 2)}</pre>
+                  </div>
+                </details>
+              </div>
+            </details>
+          ))}
+        </div>
+      ) : (
+        <p className="agent-run-empty">Agent 直接基于当前上下文完成了这次响应。</p>
+      )}
+    </section>
+  );
+}
+
 export function AgentRunInspector({
   run,
   proposals,
   busy,
+  mode = "full",
   onApplyProposal,
   onRejectProposal,
 }: AgentRunInspectorProps) {
   const invocations = run?.tool_invocations ?? [];
   const pendingProposals = proposals.filter((proposal) => proposal.status === "pending");
   if (!run && pendingProposals.length === 0) return null;
+  if (mode === "compact" && run) return <CompactRunInspector run={run} />;
 
   return (
     <section className="agent-run-inspector">
@@ -61,17 +147,19 @@ export function AgentRunInspector({
       {invocations.length > 0 && (
         <div className="agent-run-tool-list">
           {invocations.map((invocation) => (
-            <details key={invocation.id} className="agent-run-tool-item">
+            <details key={invocation.id} className={`agent-run-tool-item agent-run-tool-item-${invocationStatusClass(invocation)}`}>
               <summary>
                 <span>
                   <ChevronDown size={13} />
-                  <strong>{invocation.tool_key}</strong>
+                  <strong>{toolLabel(invocation.tool_key)}</strong>
                 </span>
                 <small>
                   {invocation.protocol} · {invocationStatusLabel(invocation)} · {invocation.elapsed_ms} ms
                 </small>
               </summary>
               <div className="agent-run-tool-payload">
+                <label>工具</label>
+                <code>{invocation.tool_key}</code>
                 <label>参数</label>
                 <pre>{JSON.stringify(invocation.arguments, null, 2)}</pre>
                 <label>{invocation.error ? "错误" : "结果"}</label>

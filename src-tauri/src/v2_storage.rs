@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-const V2_SCHEMA_VERSION: i64 = 4;
+const V2_SCHEMA_VERSION: i64 = 6;
 
 pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
@@ -41,10 +41,58 @@ pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
         }
         if current < 4 {
             apply_migration(conn, 4, migrate_v4)?;
+            current = 4;
+        }
+        if current < 5 {
+            apply_migration(conn, 5, migrate_v5)?;
+            current = 5;
+        }
+        if current < 6 {
+            apply_migration(conn, 6, migrate_v6)?;
+            current = 6;
         }
         debug_assert!(V2_SCHEMA_VERSION >= current);
         Ok(())
     })
+}
+
+fn migrate_v5(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "ALTER TABLE agent_run_events ADD COLUMN tool_key TEXT;
+         ALTER TABLE agent_run_events ADD COLUMN tool_invocation_id INTEGER;
+         ALTER TABLE agent_run_events ADD COLUMN elapsed_ms INTEGER;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v6(conn: &Connection) -> AppResult<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, enabled_tool_keys FROM agents
+         WHERE stage IN ('revision', 'artifact_revision')",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, raw) in rows {
+        let mut keys = serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+        for key in [
+            crate::agent_tools::REPLACE_TEXT,
+            crate::agent_tools::INSERT_AFTER,
+            crate::agent_tools::DELETE_RANGE,
+            crate::agent_tools::APPLY_PATCH,
+        ] {
+            if !keys.iter().any(|item| item == key) {
+                keys.push(key.to_string());
+            }
+        }
+        conn.execute(
+            "UPDATE agents SET enabled_tool_keys = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&keys)?, id],
+        )?;
+    }
+    Ok(())
 }
 
 fn apply_migration(
@@ -461,8 +509,16 @@ impl AppState {
 
     pub fn purge_expired_prepared_contexts(&self) -> AppResult<usize> {
         self.with_conn(|conn| {
+            // A context linked to a run is retained for that run's audit trail.
+            // The association deliberately uses ON DELETE RESTRICT, so only purge
+            // expired previews that were never used to start a run.
             Ok(conn.execute(
-                "DELETE FROM prepared_contexts WHERE expires_at <= ?1",
+                "DELETE FROM prepared_contexts
+                 WHERE expires_at <= ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM agent_run_contexts
+                     WHERE agent_run_contexts.prepared_context_id = prepared_contexts.id
+                   )",
                 [Utc::now().to_rfc3339()],
             )?)
         })
@@ -732,6 +788,51 @@ impl AppState {
         status: &str,
         error: Option<&str>,
     ) -> AppResult<RunEvent> {
+        self.insert_run_event_with_tool(
+            run_id, project_id, chapter_id, kind, delta, status, error, None, None, None,
+        )
+    }
+
+    pub fn insert_tool_run_event(
+        &self,
+        run_id: i64,
+        project_id: i64,
+        chapter_id: Option<i64>,
+        kind: &str,
+        tool_key: &str,
+        tool_invocation_id: Option<i64>,
+        delta: &str,
+        status: &str,
+        error: Option<&str>,
+        elapsed_ms: Option<i64>,
+    ) -> AppResult<RunEvent> {
+        self.insert_run_event_with_tool(
+            run_id,
+            project_id,
+            chapter_id,
+            kind,
+            delta,
+            status,
+            error,
+            Some(tool_key),
+            tool_invocation_id,
+            elapsed_ms,
+        )
+    }
+
+    fn insert_run_event_with_tool(
+        &self,
+        run_id: i64,
+        project_id: i64,
+        chapter_id: Option<i64>,
+        kind: &str,
+        delta: &str,
+        status: &str,
+        error: Option<&str>,
+        tool_key: Option<&str>,
+        tool_invocation_id: Option<i64>,
+        elapsed_ms: Option<i64>,
+    ) -> AppResult<RunEvent> {
         let event = self.with_conn(|conn| {
             let sequence: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_run_events WHERE run_id = ?1",
@@ -740,9 +841,10 @@ impl AppState {
             )?;
             conn.execute(
                 "INSERT INTO agent_run_events
-                    (run_id, project_id, chapter_id, stage, sequence, kind, delta, status, error, created_at)
+                    (run_id, project_id, chapter_id, stage, sequence, kind, delta, status, error,
+                     tool_key, tool_invocation_id, elapsed_ms, created_at)
                  VALUES (?1, ?2, ?3, COALESCE((SELECT stage FROM workflow_runs WHERE id = ?1), ''),
-                         ?4, ?5, ?6, ?7, ?8, ?9)",
+                         ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     run_id,
                     project_id,
@@ -752,6 +854,9 @@ impl AppState {
                     delta,
                     status,
                     error,
+                    tool_key,
+                    tool_invocation_id,
+                    elapsed_ms,
                     Utc::now().to_rfc3339(),
                 ],
             )?;
@@ -850,6 +955,15 @@ fn proposal_is_stale(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
             )
             .optional()?
         }
+        "chapter_revision" => {
+            let source_artifact_id = json_i64(&proposal.payload, "source_artifact_id")?;
+            tx.query_row(
+                "SELECT created_at FROM artifacts WHERE id = ?1 AND project_id = ?2",
+                params![source_artifact_id, proposal.project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        }
         _ => return Ok(false),
     };
     Ok(current.as_deref() != Some(expected))
@@ -860,6 +974,7 @@ fn validate_proposal_payload(proposal_type: &str, payload: &Value) -> AppResult<
         "create_chapter" => &["title"][..],
         "rename_chapter" => &["chapter_id", "title"][..],
         "artifact_candidate" => &["stage", "title", "content"][..],
+        "chapter_revision" => &["source_artifact_id"][..],
         "knowledge_card" => &["category", "title", "content"][..],
         "knowledge_card_update" => &["card_id", "category", "title", "content"][..],
         "knowledge_card_delete" => &["card_id"][..],
@@ -879,6 +994,71 @@ fn validate_proposal_payload(proposal_type: &str, payload: &Value) -> AppResult<
         }
     }
     Ok(())
+}
+
+fn apply_chapter_revision_payload(source: &str, payload: &Value) -> AppResult<String> {
+    let operations = payload
+        .get("operations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| vec![payload.clone()]);
+    let mut content = source.to_string();
+    for (index, item) in operations.iter().enumerate() {
+        let kind = item
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("type").and_then(Value::as_str))
+            .unwrap_or("");
+        match kind {
+            "replace_text" => {
+                let find = item.get("find_text").and_then(Value::as_str).unwrap_or("");
+                let replacement = item
+                    .get("replace_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                content = replace_unique(&content, find, replacement, index)?;
+            }
+            "insert_after" => {
+                let anchor = item
+                    .get("anchor_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let insert = item
+                    .get("insert_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if anchor.trim().is_empty() || content.matches(anchor).count() != 1 {
+                    return Err(AppError::Validation(format!(
+                        "第 {} 条插入操作的锚点必须唯一匹配",
+                        index + 1
+                    )));
+                }
+                let end = content.find(anchor).unwrap() + anchor.len();
+                content.insert_str(end, insert);
+            }
+            "delete_range" => {
+                let find = item.get("find_text").and_then(Value::as_str).unwrap_or("");
+                content = replace_unique(&content, find, "", index)?;
+            }
+            _ => {
+                return Err(AppError::Validation(format!(
+                    "第 {} 条章节修订操作类型不支持",
+                    index + 1
+                )))
+            }
+        }
+    }
+    Ok(content)
+}
+
+fn replace_unique(source: &str, find: &str, replacement: &str, index: usize) -> AppResult<String> {
+    if find.trim().is_empty() || source.matches(find).count() != 1 {
+        return Err(AppError::Validation(format!(
+            "第 {} 条修订操作的原文必须唯一匹配",
+            index + 1
+        )));
+    }
+    Ok(source.replacen(find, replacement, 1))
 }
 
 fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResult<(String, i64)> {
@@ -922,6 +1102,53 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
                 return Err(AppError::Validation("章节不存在".to_string()));
             }
             Ok(("chapter".to_string(), chapter_id))
+        }
+        "chapter_revision" => {
+            let source_artifact_id = json_i64(&proposal.payload, "source_artifact_id")?;
+            let source = tx
+                .query_row(
+                    "SELECT id, chapter_id, stage, content, created_at
+                     FROM artifacts WHERE id = ?1 AND project_id = ?2",
+                    params![source_artifact_id, proposal.project_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("章节修订源稿不存在".to_string()))?;
+            if let Some(expected) = proposal.expected_version.as_deref() {
+                if source.4 != expected {
+                    return Err(AppError::Validation(
+                        "源稿已变化，请重新生成章节修订提案".to_string(),
+                    ));
+                }
+            }
+            let chapter_id = source
+                .1
+                .ok_or_else(|| AppError::Validation("章节修订源稿缺少章节".to_string()))?;
+            if !matches!(source.2.as_str(), "draft" | "revision") {
+                return Err(AppError::Validation("章节修订源稿阶段不合法".to_string()));
+            }
+            let content = apply_chapter_revision_payload(&source.3, &proposal.payload)?;
+            let version: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM artifacts
+                 WHERE project_id = ?1 AND chapter_id = ?2 AND stage = 'revision'",
+                params![proposal.project_id, chapter_id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO artifacts
+                    (project_id, chapter_id, stage, title, content, version, status, parent_artifact_id, created_at)
+                 VALUES (?1, ?2, 'revision', '章节修订稿', ?3, ?4, 'pending_human_approval', ?5, ?6)",
+                params![proposal.project_id, chapter_id, content, version, source_artifact_id, now],
+            )?;
+            Ok(("artifact".to_string(), tx.last_insert_rowid()))
         }
         "artifact_candidate" => {
             let stage = json_string(&proposal.payload, "stage")?;
@@ -1244,7 +1471,7 @@ fn map_action_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionPropos
 }
 
 const RUN_EVENT_SELECT: &str = "SELECT id, run_id, project_id, chapter_id, stage, sequence, kind,
-    delta, status, error, created_at FROM agent_run_events";
+    delta, status, error, tool_key, tool_invocation_id, elapsed_ms, created_at FROM agent_run_events";
 
 fn query_run_event(conn: &Connection, id: i64) -> AppResult<RunEvent> {
     conn.query_row(
@@ -1266,7 +1493,10 @@ fn map_run_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunEvent> {
         delta: row.get(7)?,
         status: row.get(8)?,
         error: row.get(9)?,
-        created_at: row.get(10)?,
+        tool_key: row.get(10)?,
+        tool_invocation_id: row.get(11)?,
+        elapsed_ms: row.get(12)?,
+        created_at: row.get(13)?,
     })
 }
 
@@ -1510,6 +1740,122 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn tool_run_events_persist_status_and_timing() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "工具事件测试".to_string(),
+                genre: "测试".to_string(),
+                target_words: 10_000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let run = state
+            .insert_workflow_run(project.id, None, "setting", "input", "", "running", None, 0)
+            .unwrap();
+        let started = state
+            .insert_tool_run_event(
+                run.id,
+                project.id,
+                None,
+                "tool_started",
+                "reference_materials",
+                None,
+                "",
+                "running",
+                None,
+                None,
+            )
+            .unwrap();
+        let completed = state
+            .insert_tool_run_event(
+                run.id,
+                project.id,
+                None,
+                "tool_completed",
+                "reference_materials",
+                None,
+                "返回 2 条结果",
+                "success",
+                None,
+                Some(18),
+            )
+            .unwrap();
+        assert_eq!(started.tool_key.as_deref(), Some("reference_materials"));
+        assert_eq!(started.status, "running");
+        assert_eq!(completed.tool_invocation_id, None);
+        assert_eq!(completed.elapsed_ms, Some(18));
+        let events = state.list_run_events(run.id, 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, "tool_completed");
+    }
+
+    #[test]
+    fn purge_keeps_expired_context_linked_to_a_run() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "过期上下文测试".to_string(),
+                genre: "测试".to_string(),
+                target_words: 10_000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let prepared = state
+            .insert_prepared_context(
+                project.id,
+                None,
+                "setting",
+                "fingerprint",
+                "system",
+                "prompt",
+                &[],
+                &[],
+            )
+            .unwrap();
+        let unlinked = state
+            .insert_prepared_context(
+                project.id,
+                None,
+                "setting",
+                "unlinked-fingerprint",
+                "system",
+                "prompt",
+                &[],
+                &[],
+            )
+            .unwrap();
+        let run = state
+            .insert_workflow_run(project.id, None, "setting", "input", "", "success", None, 0)
+            .unwrap();
+        state
+            .link_run_prepared_context(run.id, prepared.id)
+            .unwrap();
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE prepared_contexts SET expires_at = ?1 WHERE id IN (?2, ?3)",
+                    params!["2000-01-01T00:00:00+00:00", prepared.id, unlinked.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(state.purge_expired_prepared_contexts().unwrap(), 1);
+        assert_eq!(
+            state.prepared_context_id_for_run(run.id).unwrap(),
+            Some(prepared.id)
+        );
+        assert_eq!(
+            state.get_prepared_context(prepared.id).unwrap().id,
+            prepared.id
+        );
+        assert!(state.get_prepared_context(unlinked.id).is_err());
     }
 
     #[test]

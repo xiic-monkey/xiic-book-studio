@@ -930,11 +930,14 @@ fn validate_optional_chapter(
     if let Some(chapter_id) = chapter_id {
         match state.ensure_chapter(project_id, Some(chapter_id)) {
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
+            // 章节不在本项目（缺失或归属其他项目）统一为项目归属错误；
+            // 真实的 DB 错误（Database/Io 等）仍向上传播，不被伪装成业务错误
+            Ok(None) | Err(AppError::Validation(_)) => {
                 return Err(AppError::Validation(format!(
                     "章节 #{chapter_id} 不属于当前项目"
                 )));
             }
+            Err(other) => return Err(other),
         }
     }
     Ok(())

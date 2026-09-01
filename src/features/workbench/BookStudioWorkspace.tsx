@@ -17,6 +17,8 @@ import {
   Rows3,
   MessageSquare,
   PenLine,
+  Send,
+  SlidersHorizontal,
   Play,
   Plus,
   RefreshCcw,
@@ -82,6 +84,7 @@ import type {
   PreparedContext,
   AgentRunSummary,
 } from "../../types";
+import { asStage } from "../../types";
 import { NewProjectModal } from "../../components/NewProjectModal";
 import { ProjectEditorModal } from "../../components/ProjectEditorModal";
 import { SettingsView } from "../../components/SettingsView";
@@ -157,6 +160,15 @@ type LibrarySection = "setting" | "outline" | "characters";
 type LibraryFocus = LibrarySection | "items" | "events" | "foreshadowing";
 type SettingsCategory = "ai" | "agents" | "skills" | "editor" | "data" | "appearance";
 type AgentRunMode = "smart" | "fresh";
+type AssistantChatMessage = { id: string; role: "user" | "assistant"; content: string };
+type AssistantThinkingRound = { id: string; content: string; active: boolean };
+type AssistantToolTimelineItem = {
+  id: string;
+  toolKey: string;
+  status: "running" | "success" | "failed" | "rejected";
+  elapsedMs?: number | null;
+  summary?: string;
+};
 const SIDEBAR_WIDTH_STORAGE_KEY = "book-studio.sidebar-width";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "book-studio.sidebar-collapsed";
 const SIDEBAR_DEFAULT_WIDTH = 280;
@@ -182,6 +194,82 @@ function referenceTagLabel(tag: ReferenceTag) {
 
 function clampSidebarWidth(width: number) {
   return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, width));
+}
+
+const assistantToolLabels: Record<string, string> = {
+  story_context_search: "检索故事资料",
+  prepare_agent_context: "准备创作上下文",
+  check_continuity: "检查连续性",
+  create_artifact: "生成候选版本",
+  get_current_artifact: "读取当前版本",
+  get_story_bible: "读取创作基准",
+  get_chapter_context: "读取当前章节",
+  search_story: "检索故事内容",
+};
+
+function assistantToolLabel(toolKey: string) {
+  return assistantToolLabels[toolKey] ?? toolKey.replace(/[_-]+/g, " ");
+}
+
+function assistantToolTimeline(events: RunEvent[]): AssistantToolTimelineItem[] {
+  const items: AssistantToolTimelineItem[] = [];
+  for (const event of events) {
+    if (!event.tool_key) continue;
+    if (event.kind === "tool_started") {
+      items.push({
+        id: `tool-${event.sequence}`,
+        toolKey: event.tool_key,
+        status: "running",
+      });
+      continue;
+    }
+    if (event.kind !== "tool_completed") continue;
+    const target = [...items].reverse().find((item) => item.toolKey === event.tool_key && item.status === "running");
+    if (target) {
+      target.status = event.status === "success" ? "success" : event.status === "rejected" ? "rejected" : "failed";
+      target.elapsedMs = event.elapsed_ms;
+      target.summary = event.delta || event.error || undefined;
+    } else {
+      items.push({
+        id: `tool-${event.sequence}`,
+        toolKey: event.tool_key,
+        status: event.status === "success" ? "success" : event.status === "rejected" ? "rejected" : "failed",
+        elapsedMs: event.elapsed_ms,
+        summary: event.delta || event.error || undefined,
+      });
+    }
+  }
+  return items;
+}
+
+function buildThinkingRounds(events: RunEvent[]): AssistantThinkingRound[] {
+  return events.reduce(applyThinkingEvent, [] as AssistantThinkingRound[]);
+}
+
+function applyThinkingEvent(
+  rounds: AssistantThinkingRound[],
+  event: RunEvent,
+): AssistantThinkingRound[] {
+  if (event.kind === "thinking_start") {
+    return [...rounds.map((round) => ({ ...round, active: false })), {
+      id: `thinking-${event.sequence}`,
+      content: "",
+      active: true,
+    }];
+  }
+  if (event.kind === "thinking_end") {
+    return rounds.map((round) => ({ ...round, active: false }));
+  }
+  if (event.kind !== "thinking_delta") return rounds;
+  const current = rounds.length > 0 ? rounds[rounds.length - 1] : {
+    id: `thinking-${event.sequence}`,
+    content: "",
+    active: true,
+  };
+  return [
+    ...rounds.slice(0, -1),
+    { ...current, content: `${current.content}${event.delta}` },
+  ];
 }
 
 function downloadMarkdownFile(markdown: string, projectTitle: string) {
@@ -236,6 +324,9 @@ export function BookStudioWorkspace() {
   const [writingSkills, setWritingSkills] = useState<WritingSkill[]>([]);
   const [apiKey, setApiKey] = useState("");
   const [instruction, setInstruction] = useState("");
+  const [assistantMessages, setAssistantMessages] = useState<AssistantChatMessage[]>([]);
+  const [liveToolEvents, setLiveToolEvents] = useState<RunEvent[]>([]);
+  const [thinkingRounds, setThinkingRounds] = useState<AssistantThinkingRound[]>([]);
   const [revisionFeedback, setRevisionFeedback] = useState("");
   const [patchFindText, setPatchFindText] = useState("");
   const [patchReplaceText, setPatchReplaceText] = useState("");
@@ -306,6 +397,7 @@ export function BookStudioWorkspace() {
   });
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const activeProjectRequestRef = useRef<number | null>(null);
+  const activeAgentRunIdRef = useRef<number | null>(null);
   const referenceFileInputRef = useRef<HTMLInputElement | null>(null);
 
   function currentContentSurface(): ContentSurface {
@@ -378,7 +470,27 @@ export function BookStudioWorkspace() {
     activeProjectRequestRef.current = selectedProjectId;
     void api.getActiveAgentRun(selectedProjectId)
       .then((run) => {
-        if (activeProjectRequestRef.current === selectedProjectId) setStreamingRun(run);
+        if (activeProjectRequestRef.current !== selectedProjectId) return;
+        setStreamingRun(run);
+        activeAgentRunIdRef.current = run?.id ?? null;
+        if (!run) return;
+        void api.listRunEvents(run.id)
+          .then((events) => {
+            if (activeProjectRequestRef.current !== selectedProjectId) return;
+            const historical = events.filter((event) => event.kind === "tool_started" || event.kind === "tool_completed");
+            const thinkingEvents = events.filter((event) => ["thinking_start", "thinking_delta", "thinking_end"].includes(event.kind));
+            setLiveToolEvents((current) => {
+              const merged = new Map<number, RunEvent>();
+              [...historical, ...current]
+                .filter((event) => event.run_id === run.id)
+                .forEach((event) => merged.set(event.sequence, event));
+              return [...merged.values()].sort((a, b) => a.sequence - b.sequence);
+            });
+            setThinkingRounds(buildThinkingRounds(thinkingEvents));
+          })
+          .catch(() => {
+            // The live event stream remains authoritative when historical loading is unavailable.
+          });
       })
       .catch((err) => {
         if (activeProjectRequestRef.current === selectedProjectId) setError(String(err));
@@ -404,6 +516,21 @@ export function BookStudioWorkspace() {
     let unsubscribe: (() => void) | null = null;
     void api.subscribeRunEvents(selectedProjectId, (event) => {
       if (activeProjectRequestRef.current !== event.project_id) return;
+      if (event.kind === "tool_started" || event.kind === "tool_completed") {
+        if (activeAgentRunIdRef.current == null) activeAgentRunIdRef.current = event.run_id;
+        if (activeAgentRunIdRef.current !== event.run_id) return;
+        setLiveToolEvents((current) => [...current, event]);
+        return;
+      }
+      if (["thinking_start", "thinking_delta", "thinking_end"].includes(event.kind)) {
+        if (activeAgentRunIdRef.current == null) activeAgentRunIdRef.current = event.run_id;
+        if (activeAgentRunIdRef.current !== event.run_id) return;
+        setThinkingRounds((current) => applyThinkingEvent(current, event));
+        return;
+      }
+      if (event.kind === "started" || event.kind === "output_delta" || event.kind === "output_reset" || event.kind === "cancellation_requested") {
+        activeAgentRunIdRef.current = event.run_id;
+      }
       if (["completed", "failed", "cancelled"].includes(event.kind)) {
         setStreamingRun((current) => current?.id === event.run_id ? null : current);
         void hydrateFinishedAgentRun(event);
@@ -931,6 +1058,7 @@ export function BookStudioWorkspace() {
     setExplicitArchitectSourceId(null);
     setStreamingRun(null);
     setLastAgentRun(null);
+    activeAgentRunIdRef.current = null;
     setStorySearchStatus(null);
     setQualityReport(null);
     setContinuityReport(null);
@@ -940,6 +1068,9 @@ export function BookStudioWorkspace() {
     setReviewIssues([]);
     setExportText("");
     setInstruction("");
+    setAssistantMessages([]);
+    setLiveToolEvents([]);
+    setThinkingRounds([]);
     setRevisionFeedback("");
     setPatchFindText("");
     setPatchReplaceText("");
@@ -1024,20 +1155,33 @@ export function BookStudioWorkspace() {
     if (activeProjectRequestRef.current === projectId) setStreamingRun(activeRun);
   }
 
+  function appendAssistantMessage(id: string, content: string) {
+    setAssistantMessages((current) => {
+      if (current.some((message) => message.id === id)) return current;
+      return [...current, { id, role: "assistant", content }];
+    });
+  }
+
   async function hydrateFinishedAgentRun(event: RunEvent) {
     if (activeProjectRequestRef.current !== event.project_id) return;
-    if (event.kind === "failed") {
-      setError(event.error ?? "Agent 运行失败");
-    } else if (event.kind === "cancelled") {
-      setNotice("Agent 运行已取消");
-    }
     try {
       const summary = await api.getAgentRun(event.run_id);
       if (activeProjectRequestRef.current !== event.project_id) return;
       setLastAgentRun(summary);
       mergeActionProposals(summary.proposals);
+
+      if (event.kind === "failed") {
+        const message = event.error ?? summary.run.error ?? "Agent 运行失败，请检查配置后重试。";
+        setError(message);
+        appendAssistantMessage(`run-${event.run_id}-failed`, `这次${stageLabel(summary.run.stage)}任务没有完成：${message}`);
+      } else if (event.kind === "cancelled") {
+        setNotice("Agent 运行已取消");
+        appendAssistantMessage(`run-${event.run_id}-cancelled`, `已停止${stageLabel(summary.run.stage)}任务，当前内容没有自动应用。`);
+      }
+
       if (summary.artifact) {
-        setSelectedStage(summary.artifact.stage as Stage);
+        const stage = asStage(summary.artifact.stage);
+        if (stage) setSelectedStage(stage);
         setSelectedArtifactId(summary.artifact.id);
         await refreshDetailBestEffort(event.project_id, "Agent 运行");
         if (summary.artifact.stage === "review" && summary.artifact.parent_artifact_id) {
@@ -1055,18 +1199,36 @@ export function BookStudioWorkspace() {
         }
         if (event.kind === "completed") {
           setNotice(`${stageLabel(summary.artifact.stage)}已生成 v${summary.artifact.version}`);
+          const proposalHint = summary.proposals.length > 0
+            ? `另有 ${summary.proposals.length} 条待确认提案。`
+            : "结果已放入主编辑区，等待你确认或继续修订。";
+          appendAssistantMessage(
+            `run-${event.run_id}-completed`,
+            `已生成${stageLabel(summary.artifact.stage)} v${summary.artifact.version}。${proposalHint}`,
+          );
         }
       } else if (event.kind === "completed" && ["setting", "outline", "characters"].includes(summary.run.stage)) {
-        setError("故事架构生成完成，但没有返回设定卡。请检查 Agent 配置或重试。");
+        const message = "故事架构生成完成，但没有返回候选资料。请检查 Agent 配置或重试。";
+        setError(message);
+        appendAssistantMessage(`run-${event.run_id}-completed`, message);
+      } else if (event.kind === "completed") {
+        appendAssistantMessage(
+          `run-${event.run_id}-completed`,
+          `已完成${stageLabel(summary.run.stage)}任务。结果已放入主编辑区，等待你确认或继续修订。`,
+        );
       }
     } catch (error) {
       if (activeProjectRequestRef.current === event.project_id) {
         setError(`运行已结束，但详情读取失败：${String(error)}`);
+        appendAssistantMessage(`run-${event.run_id}-error`, `运行结果已返回，但详情读取失败：${String(error)}`);
       }
     }
   }
 
   function showStartedAgentRun(result: AgentRunSummary) {
+    activeAgentRunIdRef.current = result.run.id;
+    setLiveToolEvents([]);
+    setThinkingRounds([]);
     setLastAgentRun(result);
     setStreamingRun({
       id: result.run.id,
@@ -1747,6 +1909,48 @@ export function BookStudioWorkspace() {
     return true;
   }
 
+  function selectAssistantStage(value: string) {
+    const stage = asStage(value);
+    if (!stage) return;
+    setSelectedStage(stage);
+    setSelectedArtifactId(null);
+    setNotice(`${stageLabel(stage)} Agent 已切换`);
+  }
+
+  function isCasualGreeting(prompt: string) {
+    const normalized = prompt
+      .trim()
+      .toLowerCase()
+      .replace(/[，。！？!?、,.~～\s]+/g, "");
+    return ["你好", "您好", "嗨", "哈喽", "hello", "hi", "hey"].includes(normalized);
+  }
+
+  function submitAssistantPrompt() {
+    const prompt = instruction.trim();
+    if (!prompt) return;
+    if (!detail) {
+      setNotice("请先打开一本书");
+      return;
+    }
+    setAssistantMessages((current) => [
+      ...current,
+      { id: `user-${Date.now()}`, role: "user", content: prompt },
+    ]);
+    if (isCasualGreeting(prompt)) {
+      appendAssistantMessage(
+        `greeting-${Date.now()}`,
+        "你好！我会在你明确提出创作、修改或检查需求时再启动 Agent。",
+      );
+      setInstruction("");
+      return;
+    }
+    void runAgent(selectedStage);
+  }
+
+  function useAssistantPrompt(prompt: string) {
+    setInstruction(prompt);
+  }
+
   async function runAgent(
     stage: Stage = selectedStage,
     mode: AgentRunMode = "smart",
@@ -2118,7 +2322,8 @@ export function BookStudioWorkspace() {
         replace_text: patchReplaceText,
         note: revisionFeedback.trim() || null,
       });
-      setSelectedStage(result.artifact.stage as Stage);
+      const patchStage = asStage(result.artifact.stage);
+      if (patchStage) setSelectedStage(patchStage);
       setSelectedArtifactId(result.artifact.id);
       setPatchFindText("");
       setPatchReplaceText("");
@@ -2140,7 +2345,8 @@ export function BookStudioWorkspace() {
         find_text: patchFindText,
         instruction: aiPatchInstruction,
       });
-      setSelectedStage(result.artifact.stage as Stage);
+      const aiPatchStage = asStage(result.artifact.stage);
+      if (aiPatchStage) setSelectedStage(aiPatchStage);
       setSelectedArtifactId(result.artifact.id);
       setPatchFindText("");
       setPatchReplaceText("");
@@ -2741,7 +2947,7 @@ export function BookStudioWorkspace() {
         <header className="topbar">
           <div className="topbar-project">
             <div className="project-title-row">
-      <h1>{detail?.project.title ?? "未选择项目"}</h1>
+              <h1>{detail?.project.title ?? "未选择项目"}</h1>
               {detail && (
                 <div className="project-tags" aria-label="书籍信息">
                   <span>{detail.project.genre || "未设置题材"}</span>
@@ -2750,25 +2956,23 @@ export function BookStudioWorkspace() {
                 </div>
               )}
             </div>
-            {detail && (
-              <div className="surface-switch" role="tablist" aria-label="内容区域">
-                <button
-                  className={currentContentSurface() === "official" ? "active" : ""}
-                  onClick={() => switchContentSurface("official")}
-                >
-                  <BookOpen size={14} /> 正式内容
-                </button>
-                <button
-                  className={currentContentSurface() === "workbench" ? "active" : ""}
-                  onClick={() => {
-                    enterWorkbench();
-                  }}
-                >
-                  <Sparkles size={14} /> 创作工作台
-                </button>
-              </div>
-            )}
           </div>
+          {detail && (
+            <div className="surface-switch topbar-surface-switch" role="tablist" aria-label="内容区域">
+              <button
+                className={currentContentSurface() === "official" ? "active" : ""}
+                onClick={() => switchContentSurface("official")}
+              >
+                <BookOpen size={14} /> 正式内容
+              </button>
+              <button
+                className={currentContentSurface() === "workbench" ? "active" : ""}
+                onClick={enterWorkbench}
+              >
+                <Sparkles size={14} /> 创作工作台
+              </button>
+            </div>
+          )}
           <div className="topbar-actions">
             <button onClick={() => void runTask("刷新项目", () => refreshDetail())} disabled={!detail || Boolean(busy)}>
               <RefreshCcw size={14} /> 刷新
@@ -3147,94 +3351,6 @@ export function BookStudioWorkspace() {
                 </section>
 
                 {libraryMode === "workbench" && libraryFocus !== "setting" && <aside className="library-side">
-                  <details className="library-side-panel reference-panel reference-drawer">
-                    <summary className="reference-drawer-summary">
-                      <span className="reference-drawer-label"><BookOpen size={14} /> 仿写参考</span>
-                      <span className="reference-drawer-meta">
-                        <small>{referenceMaterials.length > 0 ? `${referenceMaterials.length} 个文件` : "未导入"}</small>
-                        <button
-                          type="button"
-                          className="reference-import-trigger"
-                          onClick={(event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            referenceFileInputRef.current?.click();
-                          }}
-                          disabled={!detail || Boolean(busy)}
-                        >
-                          <Plus size={13} /> 导入文件
-                        </button>
-                      </span>
-                    </summary>
-                    <div className="reference-drawer-body">
-                      <span className="reference-session-note">本次运行有效</span>
-                    <input
-                      ref={referenceFileInputRef}
-                      className="visually-hidden"
-                      type="file"
-                      accept=".txt,text/plain"
-                      onChange={importReferenceFile}
-                    />
-                    <div className="reference-material-list">
-                      {referenceMaterials.map((material) => (
-                        <article className="reference-material" key={material.id}>
-                          <header>
-                            <div>
-                              <strong title={material.file_name}>{material.file_name}</strong>
-                              <small>{material.char_count.toLocaleString()} 字 · {material.chunk_count} 个片段</small>
-                            </div>
-                            <div className="managed-card-actions">
-                              <label className="reference-enabled-toggle" title="启用参考">
-                                <input
-                                  type="checkbox"
-                                  checked={material.enabled}
-                                  onChange={(event) => void updateReferenceMaterial(material, { enabled: event.target.checked })}
-                                  disabled={Boolean(busy)}
-                                />
-                                <span>启用</span>
-                              </label>
-                              <button
-                                className="icon-btn"
-                                onClick={() => void removeReferenceMaterial(material)}
-                                title="移除临时参考"
-                                aria-label={`移除临时参考 ${material.file_name}`}
-                                disabled={Boolean(busy)}
-                              >
-                                <Trash2 size={14} />
-                              </button>
-                            </div>
-                          </header>
-                          <div className="reference-tag-list">
-                            {(["style", "structure"] as ReferenceTag[]).map((tag) => (
-                              <label key={tag}>
-                                <input
-                                  type="checkbox"
-                                  checked={material.tags.includes(tag)}
-                                  onChange={(event) => {
-                                    const tags = event.target.checked
-                                      ? [...material.tags, tag]
-                                      : material.tags.filter((item) => item !== tag);
-                                    if (tags.length > 0) void updateReferenceMaterial(material, { tags });
-                                  }}
-                                  disabled={Boolean(busy) || (material.tags.length === 1 && material.tags.includes(tag))}
-                                />
-                                {referenceTagLabel(tag)}
-                              </label>
-                            ))}
-                          </div>
-                        </article>
-                      ))}
-                      {referenceMaterials.length === 0 && (
-                        <div className="empty-inline">尚未导入临时参考</div>
-                      )}
-                    </div>
-                    <div className="reference-context-line">
-                      <FileText size={13} />
-                      <span>当前章节：{selectedChapter?.title ?? "未选择"}</span>
-                      <small>{selectedChapter ? "自动关联已确认资料" : "未选择章节"}</small>
-                    </div>
-                    </div>
-                  </details>
                   <details className="library-side-panel foreshadowing-panel library-side-disclosure">
                     <summary className="library-side-summary">
                       <span><Sparkles size={14} /> 伏笔账本</span>
@@ -3505,15 +3621,208 @@ export function BookStudioWorkspace() {
             )}
           </section>)}
 
-          {/* Right: Assistant Panel */}
-          {mainSurface === "workbench" && (
-          <aside className="assistant-panel">
+          {/* Right: Agent chat is only needed while working on drafts and story materials. */}
+          {mainSurface !== "official" && (
+          <aside className="assistant-panel assistant-panel-v2">
+            <header className="assistant-workspace-header">
+              <div className="assistant-workspace-identity">
+                <div className="assistant-workspace-avatar"><Sparkles size={15} /></div>
+                <div>
+                  <strong>Agent 工作区</strong>
+                  <select
+                    className="assistant-agent-select"
+                    value={selectedStage}
+                    onChange={(event) => selectAssistantStage(event.target.value)}
+                    aria-label="切换当前 Agent"
+                  >
+                    {stages.map((stage) => {
+                      const agent = agentCatalog.find((item) => item.stage === stage.id);
+                      return (
+                        <option key={stage.id} value={stage.id}>
+                          {agent?.name ?? `${stage.label} Agent`} · {stage.label}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="assistant-new-chat"
+                onClick={() => {
+                  setAssistantMessages([]);
+                  setInstruction("");
+                  setLiveToolEvents([]);
+                  setLastAgentRun(null);
+                }}
+                title="新建会话"
+                aria-label="新建会话"
+              >
+                <Plus size={14} />
+              </button>
+            </header>
+
+            <div className="assistant-context-strip">
+              <span className={busy ? "assistant-status busy" : "assistant-status"}>
+                <span className="assistant-status-dot" />
+                {busy ? "Agent 执行中" : "已就绪"}
+              </span>
+              {selectedChapter && <span className="assistant-context-chip">章节 · {selectedChapter.title}</span>}
+              <span className="assistant-context-chip">上下文自动选择</span>
+            </div>
+
+            <div className="assistant-chat-feed">
+              <article className="assistant-message assistant-message-agent">
+                <div className="assistant-message-avatar"><Sparkles size={13} /></div>
+                <div className="assistant-message-body">
+                  <div className="assistant-message-meta"><strong>Book Agent</strong><span>刚刚</span></div>
+                  <p>我会围绕当前阶段协助你推进创作。你可以直接描述想改什么，也可以让我继续生成、检查连续性或整理资料。</p>
+                  <div className="assistant-suggestion-list">
+                    <button type="button" onClick={() => useAssistantPrompt("基于当前设定，给出下一步最值得推进的创作建议")}>下一步建议 <ChevronRight size={12} /></button>
+                    <button type="button" onClick={() => useAssistantPrompt("检查当前内容是否存在角色或时间线矛盾")}>检查连续性 <ChevronRight size={12} /></button>
+                  </div>
+                </div>
+              </article>
+
+              {assistantMessages.map((message) => (
+                <article
+                  className={message.role === "user" ? "assistant-message assistant-message-user" : "assistant-message assistant-message-agent"}
+                  key={message.id}
+                >
+                  {message.role === "assistant" && <div className="assistant-message-avatar"><Sparkles size={13} /></div>}
+                  <div className="assistant-message-body">
+                    {message.role === "assistant" && (
+                      <div className="assistant-message-meta"><strong>Book Agent</strong><span>刚刚</span></div>
+                    )}
+                    <p>{message.content}</p>
+                  </div>
+                </article>
+              ))}
+
+              {streamingRun && (
+                <article className="assistant-run-card assistant-run-card-live">
+                  <div className="assistant-run-card-head">
+                    <span><Loader2 size={13} className="spin" /> {stageLabel(streamingRun.stage)}正在生成</span>
+                    <small>实时输出</small>
+                  </div>
+                  <div className="assistant-run-steps" aria-label="Agent 执行步骤">
+                    {assistantToolTimeline(liveToolEvents).length > 0
+                      ? assistantToolTimeline(liveToolEvents).map((tool) => (
+                        <div className={`assistant-run-step assistant-run-step-${tool.status}`} key={tool.id}>
+                          <span className="assistant-run-step-mark">{tool.status === "success" ? "✓" : tool.status === "running" ? "•" : "!"}</span>
+                          <span>{assistantToolLabel(tool.toolKey)}{tool.summary ? ` · ${tool.summary}` : ""}</span>
+                          <small>{tool.status === "success" ? `${tool.elapsedMs ?? 0} ms` : tool.status === "running" ? "执行中" : tool.status === "rejected" ? "已拒绝" : "失败"}</small>
+                        </div>
+                      ))
+                      : [
+                        { label: "准备创作上下文", status: streamingRun.output ? "done" : "active" },
+                        { label: "检索相关故事资料", status: streamingRun.output ? "active" : "pending" },
+                        { label: "生成候选版本", status: "pending" },
+                      ].map((step) => (
+                        <div className={`assistant-run-step assistant-run-step-${step.status}`} key={step.label}>
+                          <span className="assistant-run-step-mark">{step.status === "done" ? "✓" : step.status === "active" ? "•" : ""}</span>
+                          <span>{step.label}</span>
+                          <small>{step.status === "done" ? "已完成" : step.status === "active" ? "执行中" : "等待"}</small>
+                        </div>
+                      ))}
+                  </div>
+                  <p>{streamingRun.output || "Agent 正在整理上下文并生成候选内容…"}</p>
+                </article>
+              )}
+
+              {thinkingRounds.map((round) => (
+                <details
+                  key={round.id}
+                  className={`assistant-thinking-panel${round.active ? " assistant-thinking-panel-current" : ""}`}
+                  open={round.active || undefined}
+                >
+                  <summary>
+                    <span><Sparkles size={12} /> {round.active ? "思考中" : "思考过程"}</span>
+                    <small>{round.active ? "实时更新" : "已完成"}</small>
+                  </summary>
+                  <p>{round.content || "正在分析当前任务……"}</p>
+                </details>
+              ))}
+
+              {!streamingRun && lastAgentRun && (
+                <>
+                  {assistantToolTimeline(liveToolEvents).length > 0 && (
+                    <div className="assistant-run-steps assistant-run-steps-history">
+                      {assistantToolTimeline(liveToolEvents).map((tool) => (
+                        <div className={`assistant-run-step assistant-run-step-${tool.status}`} key={tool.id}>
+                          <span className="assistant-run-step-mark">{tool.status === "success" ? "✓" : tool.status === "running" ? "•" : "!"}</span>
+                          <span>{assistantToolLabel(tool.toolKey)}{tool.summary ? ` · ${tool.summary}` : ""}</span>
+                          <small>{tool.status === "success" ? `${tool.elapsedMs ?? 0} ms` : tool.status === "running" ? "执行中" : tool.status === "rejected" ? "已拒绝" : "失败"}</small>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <AgentRunInspector
+                    run={lastAgentRun}
+                    proposals={[]}
+                    busy={Boolean(busy)}
+                    mode="compact"
+                    onApplyProposal={() => undefined}
+                    onRejectProposal={() => undefined}
+                  />
+                  {actionProposals.length > 0 && (
+                    <button type="button" className="assistant-proposal-link" onClick={() => {
+                      const target = document.querySelector<HTMLElement>(".agent-run-inspector");
+                      target?.scrollIntoView({ behavior: "smooth", block: "start" });
+                    }}>
+                      查看 {actionProposals.length} 条待确认提案 <ChevronRight size={12} />
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="assistant-composer">
+              <div className="assistant-composer-hint">
+                <span>⌘ Enter 发送</span>
+                {referenceMaterials.length > 0 && <span>{selectedReferenceIds.size} 份参考已启用</span>}
+              </div>
+              <textarea
+                className="assistant-chat-input"
+                rows={3}
+                value={instruction}
+                placeholder={selectedBookArtifactCanIterate ? "告诉 Agent 只改哪里，其他内容保持不变…" : "描述你想继续创作、修改或检查的内容…"}
+                onChange={(event) => setInstruction(event.target.value)}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    submitAssistantPrompt();
+                  }
+                }}
+              />
+              <div className="assistant-composer-actions">
+                <div className="assistant-composer-tools">
+                  <button type="button" onClick={() => setInstruction("继续推进当前阶段，给出一个可直接采用的版本")}>继续生成</button>
+                  <button type="button" onClick={previewAgentContext} disabled={!detail || Boolean(busy)}><Eye size={12} /> 上下文</button>
+                </div>
+                <button type="button" className="assistant-send-button" onClick={submitAssistantPrompt} disabled={!detail || !instruction.trim() || Boolean(busy)}>
+                  {busy ? <Loader2 size={14} className="spin" /> : <Send size={14} />}
+                  {busy ? "执行中" : "发送"}
+                </button>
+              </div>
+            </div>
+
+            <details className="assistant-advanced-controls">
+              <summary><SlidersHorizontal size={14} /> 高级控制 <span>参考资料、提案与局部修订</span></summary>
+              <div className="assistant-advanced-content">
             <section className="panel next-action-panel">
               <div className="panel-title">
                 <PenLine size={14} />
                 创作指令
               </div>
               <div className="stage-hint">当前阶段：{stageLabel(selectedStage)}</div>
+              <input
+                ref={referenceFileInputRef}
+                className="visually-hidden"
+                type="file"
+                accept=".txt,text/plain"
+                onChange={importReferenceFile}
+              />
               <textarea
                 rows={4}
                 value={instruction}
@@ -3524,53 +3833,88 @@ export function BookStudioWorkspace() {
                 }
                 onChange={(event) => setInstruction(event.target.value)}
               />
-              {referenceMaterials.length > 0 && (
-                <section className="reference-selection-panel">
-                  <div className="reference-selection-head">
+              <section className={`reference-selection-panel${referenceMaterials.length === 0 ? " empty" : ""}`}>
+                <div className="reference-selection-head">
+                  <div className="reference-selection-title">
+                    <BookOpen size={14} />
                     <div>
                       <strong>仿写参考</strong>
-                      <span>{activeReferenceSelection.enabled ? `${selectedReferenceIds.size} 份资料参与本次生成` : "未启用"}</span>
+                      <span>{referenceMaterials.length > 0 ? `${selectedReferenceIds.size} / ${referenceMaterials.length} 份启用` : "未导入"}</span>
                     </div>
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={activeReferenceSelection.enabled}
-                        onChange={(event) => updateActiveReferenceSelection({ enabled: event.target.checked })}
-                      />
-                      启用
-                    </label>
                   </div>
-                  {activeReferenceSelection.enabled && (
-                    <>
-                      <div className="reference-selection-tags">
-                        {(["style", "structure"] as ReferenceTag[]).map((tag) => (
-                          <label key={tag}>
-                            <input
-                              type="checkbox"
-                              checked={(activeReferenceSelection.tags ?? ["style", "structure"]).includes(tag)}
-                              onChange={() => toggleReferenceTag(tag)}
-                            />
-                            {referenceTagLabel(tag)}
-                          </label>
-                        ))}
-                      </div>
-                      <div className="reference-selection-list">
-                        {referenceMaterials.map((material) => (
-                          <label key={material.id} title={material.enabled ? material.file_name : "资料已停用"}>
-                            <input
-                              type="checkbox"
-                              checked={material.enabled && selectedReferenceIds.has(material.id)}
-                              onChange={() => toggleReferenceSource(material.id)}
-                              disabled={!material.enabled}
-                            />
-                            <span>{material.file_name}</span>
-                          </label>
-                        ))}
-                      </div>
-                    </>
-                  )}
-                </section>
-              )}
+                  <div className="reference-selection-actions">
+                    {referenceMaterials.length > 0 && (
+                      <label title="本次生成是否使用仿写参考">
+                        <input
+                          type="checkbox"
+                          checked={activeReferenceSelection.enabled}
+                          onChange={(event) => updateActiveReferenceSelection({ enabled: event.target.checked })}
+                        />
+                        启用
+                      </label>
+                    )}
+                    <button
+                      type="button"
+                      className="icon-btn tooltip-button"
+                      onClick={() => referenceFileInputRef.current?.click()}
+                      disabled={!detail || Boolean(busy)}
+                      title="导入 TXT"
+                      aria-label="导入 TXT"
+                    >
+                      <Plus size={14} />
+                    </button>
+                  </div>
+                </div>
+                {referenceMaterials.length > 0 && (
+                  <div className="reference-selection-list">
+                    {referenceMaterials.map((material) => (
+                      <article className="reference-selection-material" key={material.id}>
+                        <label title={material.enabled ? material.file_name : "资料已停用"}>
+                          <input
+                            type="checkbox"
+                            checked={material.enabled && selectedReferenceIds.has(material.id)}
+                            onChange={() => toggleReferenceSource(material.id)}
+                            disabled={!material.enabled || !activeReferenceSelection.enabled}
+                          />
+                          <span>{material.file_name}</span>
+                        </label>
+                        <small>{material.char_count.toLocaleString()} 字</small>
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => void removeReferenceMaterial(material)}
+                          title="移除参考"
+                          aria-label={`移除参考 ${material.file_name}`}
+                          disabled={Boolean(busy)}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                        <details className="reference-material-options">
+                          <summary>设置</summary>
+                          <div className="reference-tag-list">
+                            {(["style", "structure"] as ReferenceTag[]).map((tag) => (
+                              <label key={tag}>
+                                <input
+                                  type="checkbox"
+                                  checked={material.tags.includes(tag)}
+                                  onChange={(event) => {
+                                    const tags = event.target.checked
+                                      ? [...material.tags, tag]
+                                      : material.tags.filter((item) => item !== tag);
+                                    if (tags.length > 0) void updateReferenceMaterial(material, { tags });
+                                  }}
+                                  disabled={Boolean(busy) || (material.tags.length === 1 && material.tags.includes(tag))}
+                                />
+                                {referenceTagLabel(tag)}
+                              </label>
+                            ))}
+                          </div>
+                        </details>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </section>
               <button
                 className="btn-primary"
                 onClick={() => runAgent(selectedStage)}
@@ -4050,6 +4394,8 @@ export function BookStudioWorkspace() {
                 </button>
               </section>
             )}
+              </div>
+            </details>
               </div>
             </details>
           </aside>

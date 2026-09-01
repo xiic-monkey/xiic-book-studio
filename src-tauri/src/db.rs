@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, Notify};
 
 use crate::{
     agent_tools,
+    crypto::{is_encrypted, ApiKeyCipher},
     error::{AppError, AppResult},
     genre_agent, genre_skill,
     models::{
@@ -57,13 +58,14 @@ const AGENT_SELECT_SQL: &str = r#"SELECT a.id, a.stage, a.name, a.role, a.system
         WHEN NULLIF(a.provider_base_url, '') IS NULL AND NULLIF(a.model, '') IS NULL THEN 1
         ELSE 0
     END AS uses_global_runtime_settings,
-    COALESCE(NULLIF(a.enabled_tool_keys, ''), '["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]') AS enabled_tool_keys,
+    COALESCE(NULLIF(a.enabled_tool_keys, ''), '["search_story","search_story_facts","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]') AS enabled_tool_keys,
     COALESCE(NULLIF(a.allowed_skill_keys, ''), '["continuity_and_agency"]') AS allowed_skill_keys
     FROM agents a"#;
 
 #[derive(Clone)]
 pub struct AppState {
     pool: Arc<Pool<SqliteConnectionManager>>,
+    api_key_cipher: ApiKeyCipher,
     resource_roots: Arc<Vec<PathBuf>>,
     reference_store: Arc<Mutex<ReferenceStore>>,
     index_worker_started: Arc<AtomicBool>,
@@ -95,6 +97,7 @@ impl AppState {
         mut resource_roots: Vec<PathBuf>,
     ) -> AppResult<Self> {
         resource_roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"));
+        let api_key_cipher = ApiKeyCipher::new(&path)?;
         let manager = SqliteConnectionManager::file(path).with_init(|conn| {
             conn.busy_timeout(Duration::from_secs(5))?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -112,6 +115,7 @@ impl AppState {
         let (run_event_tx, _) = broadcast::channel(512);
         let state = Self {
             pool: Arc::new(pool),
+            api_key_cipher,
             resource_roots: Arc::new(resource_roots),
             reference_store: Arc::new(Mutex::new(ReferenceStore::default())),
             index_worker_started: Arc::new(AtomicBool::new(false)),
@@ -232,7 +236,7 @@ impl AppState {
                     model TEXT NOT NULL DEFAULT '',
                     thinking_enabled INTEGER NOT NULL DEFAULT 0,
                     thinking_level TEXT NOT NULL DEFAULT 'off',
-                    enabled_tool_keys TEXT NOT NULL DEFAULT '["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]',
+                    enabled_tool_keys TEXT NOT NULL DEFAULT '["search_story","search_story_facts","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]',
                     allowed_skill_keys TEXT NOT NULL DEFAULT '["continuity_and_agency"]'
                 );
 
@@ -711,7 +715,7 @@ impl AppState {
                 [],
             )?;
 
-            for (stage, name, role, prompt, temperature) in default_agents() {
+            for (stage, name, role, prompt, temperature) in default_agents()? {
                 conn.execute(
                     "INSERT INTO agents (stage, name, role, system_prompt, temperature)
                      VALUES (?1, ?2, ?3, ?4, ?5)
@@ -719,7 +723,7 @@ impl AppState {
                     params![stage, name, role, prompt, temperature],
                 )?;
             }
-            for (stage, name, role, prompt, temperature) in default_background_agents() {
+            for (stage, name, role, prompt, temperature) in default_background_agents()? {
                 conn.execute(
                     "INSERT INTO agents (stage, name, role, system_prompt, temperature)
                      VALUES (?1, ?2, ?3, ?4, ?5)
@@ -807,7 +811,7 @@ impl AppState {
                     ],
                 )?;
                 let project_id = conn.last_insert_rowid();
-                let genre_agent = genre_agent::detect_genre_agent(input.genre.trim());
+                let genre_agent = genre_agent::detect_genre_agent(input.genre.trim())?;
                 conn.execute(
                     "INSERT INTO project_genre_agents (project_id, agent_key, assigned_at)
                      VALUES (?1, ?2, ?3)",
@@ -2232,14 +2236,21 @@ impl AppState {
         unreachable!("artifact insert retry loop always returns")
     }
 
-    pub fn update_artifact_content(&self, project_id: i64, artifact_id: i64, content: &str) -> AppResult<Artifact> {
+    pub fn update_artifact_content(
+        &self,
+        project_id: i64,
+        artifact_id: i64,
+        content: &str,
+    ) -> AppResult<Artifact> {
         self.with_conn(|conn| {
             let changed = conn.execute(
                 "UPDATE artifacts SET content = ?1 WHERE id = ?2 AND project_id = ?3",
                 params![content, artifact_id, project_id],
             )?;
             if changed == 0 {
-                return Err(AppError::Validation("产物不存在或不属于当前项目".to_string()));
+                return Err(AppError::Validation(
+                    "产物不存在或不属于当前项目".to_string(),
+                ));
             }
             query_artifact_by_id(conn, artifact_id)
         })
@@ -2251,7 +2262,10 @@ impl AppState {
             return Err(AppError::Validation("产物不属于当前项目".to_string()));
         }
         let deletes_approved_foundation = artifact.chapter_id.is_none()
-            && matches!(artifact.stage.as_str(), "setting" | "outline" | "characters")
+            && matches!(
+                artifact.stage.as_str(),
+                "setting" | "outline" | "characters"
+            )
             && self
                 .approved_artifact(project_id, &artifact.stage, None)?
                 .is_some_and(|approved| approved.id == artifact.id);
@@ -2269,6 +2283,10 @@ impl AppState {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| {
                 delete_artifact_search_data_tx(conn, project_id, artifact_id)?;
+                // Some existing databases were created before all artifact references had
+                // the intended ON DELETE action. Clean up the dependent rows explicitly so
+                // deleting a historical artifact cannot fail with a generic FK error.
+                detach_artifact_references_tx(conn, artifact_id)?;
                 let deleted = conn.execute(
                     "DELETE FROM artifacts WHERE id = ?1 AND project_id = ?2",
                     params![artifact_id, project_id],
@@ -3150,6 +3168,10 @@ impl AppState {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+        let api_key_param = match &api_key {
+            Some(key) => self.api_key_cipher.encrypt(key)?,
+            None => String::new(),
+        };
         let updated_at = now();
 
         self.with_conn(|conn| {
@@ -3189,7 +3211,7 @@ impl AppState {
                         input.temperature,
                         input.thinking_enabled as i64,
                         thinking_level,
-                        api_key.as_deref().unwrap_or(""),
+                        api_key_param,
                         updated_at
                     ],
                 )?;
@@ -3258,7 +3280,165 @@ impl AppState {
             .map_err(AppError::from)
         })?;
 
-        Ok(stored)
+        match stored {
+            None => Ok(None),
+            // 已是本方案密文：解密；解密失败（设备密钥缺失/损坏）按缺失处理，避免把乱码当 key 用
+            Some(value) if is_encrypted(&value) => match self.api_key_cipher.decrypt(&value) {
+                Ok(plain) => Ok(Some(plain)),
+                Err(error) => {
+                    eprintln!("API Key 解密失败，按缺失处理: {error}");
+                    Ok(None)
+                }
+            },
+            // 遗留明文：直接返回，等待下次保存时被加密
+            Some(value) => Ok(Some(value)),
+        }
+    }
+
+    /// 启动迁移：将 `ai_providers` 中仍为明文（非 `ENC1::` 前缀）的 api_key 加密回写，
+    /// 使静态存储中不再残留明文。已加密的行跳过。
+    pub(crate) fn encrypt_plaintext_api_keys(&self) -> AppResult<()> {
+        let rows = self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT base_url, api_key FROM ai_providers WHERE api_key <> ''")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<(String, String)>, _>>()?;
+            Ok(rows)
+        })?;
+        for (base_url, stored) in rows {
+            if is_encrypted(&stored) {
+                continue;
+            }
+            let encrypted = self.api_key_cipher.encrypt(&stored)?;
+            self.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE ai_providers SET api_key = ?1 WHERE base_url = ?2",
+                    params![encrypted, base_url],
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn confirm_story_bible_atomic(&self, project_id: i64, note: &str) -> AppResult<StoryBible> {
+        let timestamp = now();
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let premise: String = conn
+                    .query_row(
+                        "SELECT premise FROM projects WHERE id = ?1",
+                        params![project_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| AppError::Validation("项目不存在".to_string()))?;
+
+                let approved_foundation = |stage: &str| -> AppResult<Artifact> {
+                    conn.query_row(
+                        "SELECT a.id, a.project_id, a.chapter_id, a.stage, a.title, a.content,
+                                a.version, a.status, a.parent_artifact_id, a.created_at
+                         FROM artifacts a
+                         INNER JOIN approvals ap ON ap.artifact_id = a.id
+                         WHERE a.project_id = ?1 AND a.stage = ?2 AND a.chapter_id IS NULL
+                         ORDER BY ap.created_at DESC, ap.id DESC LIMIT 1",
+                        params![project_id, stage],
+                        map_artifact,
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "确认创作基准前，请先人工通过{}资料",
+                            stage_label(stage)
+                        ))
+                    })
+                };
+
+                let setting = approved_foundation("setting")?;
+                let outline = approved_foundation("outline")?;
+                approved_foundation("characters")?;
+
+                conn.execute(
+                    "INSERT INTO story_bibles
+                        (project_id, reader_promise, protagonist_engine, core_conflict,
+                         endgame_direction, immutable_rules, canon_version, status,
+                         source_artifact_id, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, '', '', '', 1, 'confirmed', ?4, ?5, ?5)
+                     ON CONFLICT(project_id) DO UPDATE SET
+                        reader_promise = excluded.reader_promise,
+                        protagonist_engine = excluded.protagonist_engine,
+                        canon_version = story_bibles.canon_version + 1,
+                        status = 'confirmed',
+                        source_artifact_id = excluded.source_artifact_id,
+                        updated_at = excluded.updated_at",
+                    params![project_id, setting.content, premise, setting.id, &timestamp],
+                )?;
+
+                let has_active_arc: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM story_arcs
+                                   WHERE project_id = ?1 AND status = 'active')",
+                    params![project_id],
+                    |row| row.get(0),
+                )?;
+                if !has_active_arc {
+                    let arc_no: i64 = conn.query_row(
+                        "SELECT COALESCE(MAX(arc_no), 0) + 1
+                         FROM story_arcs WHERE project_id = ?1",
+                        params![project_id],
+                        |row| row.get(0),
+                    )?;
+                    conn.execute(
+                        "INSERT INTO story_arcs
+                            (project_id, arc_no, title, objective, entry_state, exit_change,
+                             core_conflict, involved_characters, status, source_artifact_id,
+                             created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, '', '', '', '', 'active', ?5, ?6, ?6)",
+                        params![
+                            project_id,
+                            arc_no,
+                            format!("第 {} 故事阶段", arc_no),
+                            outline.content,
+                            outline.id,
+                            &timestamp
+                        ],
+                    )?;
+                }
+
+                conn.execute(
+                    "INSERT INTO messages (project_id, chapter_id, role, content, created_at)
+                     VALUES (?1, NULL, 'approval_note', ?2, ?3)",
+                    params![
+                        project_id,
+                        format!("人工确认创作基准。{}", note.trim()),
+                        &timestamp
+                    ],
+                )?;
+
+                conn.query_row(
+                    "SELECT id, project_id, reader_promise, protagonist_engine, core_conflict,
+                            endgame_direction, immutable_rules, canon_version, status,
+                            source_artifact_id, created_at, updated_at
+                     FROM story_bibles WHERE project_id = ?1",
+                    params![project_id],
+                    map_story_bible,
+                )
+                .map_err(AppError::from)
+            })();
+            match result {
+                Ok(bible) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(bible)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
     }
 
     pub fn get_story_bible(&self, project_id: i64) -> AppResult<Option<StoryBible>> {
@@ -3471,7 +3651,9 @@ fn backfill_project_genre_agents(conn: &Connection) -> AppResult<()> {
     let assigned_at = now();
 
     for (project_id, genre) in projects {
-        let profile = genre_agent::detect_genre_agent(&genre);
+        let Ok(profile) = genre_agent::detect_genre_agent(&genre) else {
+            continue;
+        };
         let assigned_key = conn
             .query_row(
                 "SELECT agent_key FROM project_genre_agents WHERE project_id = ?1",
@@ -3514,7 +3696,7 @@ fn resolve_project_genre_agent(conn: &Connection, project_id: i64) -> AppResult<
         return Ok(profile);
     }
 
-    let profile = genre_agent::detect_genre_agent(&project.genre);
+    let profile = genre_agent::detect_genre_agent(&project.genre)?;
     conn.execute(
         "INSERT INTO project_genre_agents (project_id, agent_key, assigned_at)
          VALUES (?1, ?2, ?3)
@@ -3575,113 +3757,119 @@ fn default_ai_providers() -> [(
     ]
 }
 
-fn default_background_agents() -> Vec<(&'static str, &'static str, &'static str, &'static str, f64)>
-{
-    vec![
+fn require_default_prompt(key: &str) -> AppResult<&'static str> {
+    crate::prompt_templates::default_prompt(key)
+        .ok_or_else(|| AppError::Validation(format!("缺少默认 prompt 模板: {key}")))
+}
+
+fn default_background_agents(
+) -> AppResult<Vec<(&'static str, &'static str, &'static str, &'static str, f64)>> {
+    Ok(vec![
         (
             "adoption",
             "资料整理 Agent",
             "从已批准产物提取知识卡与伏笔候选",
-            crate::prompt_templates::default_prompt("adoption").unwrap(),
+            require_default_prompt("adoption")?,
             0.1,
         ),
         (
             "story_index",
             "故事索引 Agent",
             "从已批准正文提取实体、事件和原子事实",
-            crate::prompt_templates::default_prompt("story_index").unwrap(),
+            require_default_prompt("story_index")?,
             0.0,
         ),
         (
             "chapter_memory",
             "章节记忆 Agent",
             "生成下一章使用的事实交接记忆",
-            crate::prompt_templates::default_prompt("chapter_memory").unwrap(),
+            require_default_prompt("chapter_memory")?,
             0.1,
         ),
         (
             "continuity_ledger",
             "状态账本 Agent",
             "从已批准正文提取物件、资源和状态变化",
-            crate::prompt_templates::default_prompt("continuity_ledger").unwrap(),
+            require_default_prompt("continuity_ledger")?,
             0.0,
         ),
         (
             "continuity_check",
             "状态核对 Agent",
             "核对候选稿是否越过已批准状态边界",
-            crate::prompt_templates::default_prompt("continuity_check").unwrap(),
+            require_default_prompt("continuity_check")?,
             0.0,
         ),
         (
             "context_search_plan",
             "上下文规划 Agent",
             "规划需要检索的历史事实",
-            crate::prompt_templates::default_prompt("context_search_plan").unwrap(),
+            require_default_prompt("context_search_plan")?,
             0.0,
         ),
         (
             "context_search_rerank",
             "上下文筛选 Agent",
             "从检索候选中筛选直接相关的原文证据",
-            crate::prompt_templates::default_prompt("context_search_rerank").unwrap(),
+            require_default_prompt("context_search_rerank")?,
             0.0,
         ),
         (
             "continuity_review",
             "连续性审校 Agent",
             "审校多章衔接和事实连续性",
-            crate::prompt_templates::default_prompt("continuity_review").unwrap(),
+            require_default_prompt("continuity_review")?,
             0.0,
         ),
         (
             "chapter_split_plan",
             "拆章规划 Agent",
             "将超载章节拆成可执行的章节任务",
-            crate::prompt_templates::default_prompt("chapter_split_plan").unwrap(),
+            require_default_prompt("chapter_split_plan")?,
             0.0,
         ),
         (
             "artifact_revision",
             "局部修订 Agent",
             "只重写用户指定的局部片段",
-            crate::prompt_templates::default_prompt("artifact_revision").unwrap(),
+            require_default_prompt("artifact_revision")?,
             0.35,
         ),
-    ]
+    ])
 }
 
-fn default_agents() -> Vec<(&'static str, &'static str, &'static str, &'static str, f64)> {
-    vec![
+fn default_agents() -> AppResult<Vec<(&'static str, &'static str, &'static str, &'static str, f64)>>
+{
+    Ok(vec![
         (
             "story_architect",
             "故事架构 Agent",
             "负责统一维护创作基准、阶段大纲、角色与事实一致性",
-            crate::prompt_templates::default_prompt("story_architect").unwrap(),
+            require_default_prompt("story_architect")?,
             0.62,
         ),
         (
             "draft",
-            "写作 Agent",
-            "负责章节正文草稿",
-            crate::prompt_templates::default_prompt("draft").unwrap(),
+            "章节创建 Agent",
+            "负责创建整章正文候选稿",
+            require_default_prompt("draft")?,
             0.78,
         ),
         (
             "review",
             "试读 Agent",
             "负责挑出问题",
-            crate::prompt_templates::default_prompt("review").unwrap(),
+            require_default_prompt("review")?,
             0.35,
         ),
         (
             "revision",
-            "修订 Agent",
-            "负责根据反馈改稿",
-            crate::prompt_templates::default_prompt("revision").unwrap(),
+            "章节修订 Agent",
+            "负责根据反馈修订章节正文",
+            require_default_prompt("revision")?,
             0.64,
         ),
-    ]
+    ])
 }
 
 fn set_default_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
@@ -3993,6 +4181,39 @@ fn delete_chapter_search_data_tx(
            AND (chapter_id = ?2 OR (chapter_no_sort IS NOT NULL AND chapter_no_sort >= ?3))",
         params![project_id, chapter_id, chapter_no],
     )?;
+    Ok(())
+}
+
+fn detach_artifact_references_tx(conn: &Connection, artifact_id: i64) -> AppResult<()> {
+    // Keep nullable pointers valid when the database was created with an older
+    // schema, and remove derived rows whose lifetime is the artifact's lifetime.
+    for sql in [
+        "UPDATE chapters SET current_artifact_id = NULL WHERE current_artifact_id = ?1",
+        "UPDATE artifacts SET parent_artifact_id = NULL WHERE parent_artifact_id = ?1",
+        "UPDATE story_threads SET last_artifact_id = NULL WHERE last_artifact_id = ?1",
+        "UPDATE knowledge_cards SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
+        "UPDATE foreshadowings SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
+        "UPDATE story_entities SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
+        "UPDATE story_bibles SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
+        "UPDATE story_arcs SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
+    ] {
+        conn.execute(sql, params![artifact_id])?;
+    }
+
+    for sql in [
+        "DELETE FROM approvals WHERE artifact_id = ?1",
+        "DELETE FROM chapter_memories WHERE source_artifact_id = ?1",
+        "DELETE FROM continuity_ledger_entries WHERE source_artifact_id = ?1",
+        "DELETE FROM continuity_ledger_sources WHERE source_artifact_id = ?1",
+        "DELETE FROM story_events WHERE source_artifact_id = ?1",
+        "DELETE FROM story_facts WHERE source_artifact_id = ?1",
+        "DELETE FROM story_index_sources WHERE source_artifact_id = ?1",
+        "DELETE FROM derived_index_jobs WHERE source_artifact_id = ?1",
+        "DELETE FROM adoption_proposals WHERE source_artifact_id = ?1",
+        "DELETE FROM agent_run_artifacts WHERE artifact_id = ?1",
+    ] {
+        conn.execute(sql, params![artifact_id])?;
+    }
     Ok(())
 }
 
@@ -4716,7 +4937,12 @@ mod tests {
                 .map_err(AppError::from)
             })
             .unwrap();
-        assert_eq!(stored_key, "database-key");
+        // 静态存储中必须是密文，而非明文
+        assert!(
+            stored_key.starts_with("ENC1::"),
+            "api_key 应以密文形式存储，实际: {stored_key}"
+        );
+        assert_ne!(stored_key, "database-key");
     }
 
     #[test]
@@ -5385,14 +5611,7 @@ mod tests {
             })
             .unwrap();
         let artifact = state
-            .insert_artifact(
-                project.id,
-                None,
-                "setting",
-                "世界设定",
-                "旧设定",
-                None,
-            )
+            .insert_artifact(project.id, None, "setting", "世界设定", "旧设定", None)
             .unwrap();
         state
             .approve_stage(project.id, "setting", artifact.id, "通过")

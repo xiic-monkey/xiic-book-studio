@@ -37,7 +37,6 @@ import type {
   PreparedContext,
   Project,
   ProjectUpdate,
-  ProjectDetail,
   ProjectWorkspace,
   ProposalApplyResult,
   ProviderCapabilities,
@@ -54,6 +53,7 @@ import type {
   SaveKnowledgeCardInput,
   Stage,
   StoryContextSnippet,
+  StoryFactSearchResult,
   StoryContextRerankResult,
   StorySearchStatus,
   StoryIndexSummary,
@@ -72,10 +72,16 @@ declare global {
 
 const DEV_API_BASE = import.meta.env.VITE_DEV_API_BASE ?? "http://127.0.0.1:4141";
 
-export type RuntimeMode = "tauri" | "web-dev-api";
-
 function isTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
+}
+
+/** 把 dev SSE 的原始 JSON 安全收窄为 RunEvent，缺关键字段时返回 null（避免 `as RunEvent` 静默接受脏数据）。 */
+function parseRunEvent(raw: unknown): RunEvent | null {
+  if (!raw || typeof raw !== "object") return null;
+  const event = raw as Record<string, unknown>;
+  if (typeof event.kind !== "string" || typeof event.project_id !== "number") return null;
+  return raw as RunEvent;
 }
 
 async function invokeCommand<T>(command: string, args?: Record<string, unknown>) {
@@ -99,7 +105,6 @@ async function invokeCommand<T>(command: string, args?: Record<string, unknown>)
 }
 
 export const api = {
-  getRuntimeMode: (): RuntimeMode => (isTauriRuntime() ? "tauri" : "web-dev-api"),
   listProjects: () => invokeCommand<Project[]>("list_projects"),
   createProject: (input: NewProject) => invokeCommand<Project>("create_project", { input }),
   updateProject: (input: ProjectUpdate) => invokeCommand<Project>("update_project", { input }),
@@ -241,7 +246,8 @@ export const api = {
     );
     const listener = (message: MessageEvent<string>) => {
       try {
-        onEvent(JSON.parse(message.data) as RunEvent);
+        const event = parseRunEvent(JSON.parse(message.data));
+        if (event) onEvent(event);
       } catch {
         // Ignore malformed development events; command responses still carry errors.
       }
@@ -324,6 +330,20 @@ export const api = {
     include_immediate_previous?: boolean;
   }) =>
     invokeCommand<StoryContextSnippet[]>("search_story_context", { input }),
+  searchStory: (input: {
+    project_id: number;
+    chapter_id?: number | null;
+    query: string;
+    limit?: number | null;
+    include_immediate_previous?: boolean;
+  }) => invokeCommand<StoryContextSnippet[]>("search_story", { input }),
+  searchStoryFacts: (input: {
+    project_id: number;
+    chapter_id?: number | null;
+    query: string;
+    limit?: number | null;
+    include_immediate_previous?: boolean;
+  }) => invokeCommand<StoryFactSearchResult[]>("search_story_facts", { input }),
   rerankStoryContext: (input: {
     project_id: number;
     chapter_id?: number | null;

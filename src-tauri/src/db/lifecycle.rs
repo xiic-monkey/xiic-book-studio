@@ -8,6 +8,7 @@ pub(super) fn initialize(state: &AppState) -> AppResult<()> {
     state.migrate()?;
     crate::v2_storage::migrate(state)?;
     migrate_derived_schema(state)?;
+    state.encrypt_plaintext_api_keys()?;
     crate::index_jobs::recover_running_jobs(state)?;
     crate::index_jobs::enqueue_missing_search_jobs(state)?;
     recover_stale_workflow_runs(state)?;
@@ -119,7 +120,7 @@ fn ensure_agent_runtime_columns(conn: &Connection) -> AppResult<()> {
         ("thinking_level", "TEXT NOT NULL DEFAULT 'off'"),
         (
             "enabled_tool_keys",
-            r#"TEXT NOT NULL DEFAULT '["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]'"#,
+            r#"TEXT NOT NULL DEFAULT '["search_story","search_story_facts","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]'"#,
         ),
         (
             "allowed_skill_keys",
@@ -154,7 +155,7 @@ fn ensure_agent_runtime_columns(conn: &Connection) -> AppResult<()> {
     if added_tool_keys {
         conn.execute(
             r#"UPDATE agents
-             SET enabled_tool_keys = '["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]'
+             SET enabled_tool_keys = '["search_story","search_story_facts","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]'
              WHERE trim(enabled_tool_keys) = '' OR enabled_tool_keys = '[]'"#,
             [],
         )?;
@@ -175,12 +176,7 @@ fn ensure_web_search_tool_enabled(conn: &Connection) -> AppResult<()> {
     // Add the newly introduced web-search capability only to rows that still
     // hold the exact old default. A custom allowlist, especially an empty one,
     // is an explicit user decision and must survive every startup unchanged.
-    let old_default = serde_json::to_string(
-        &crate::agent_tools::default_keys()
-            .into_iter()
-            .filter(|key| key != crate::agent_tools::WEB_SEARCH)
-            .collect::<Vec<_>>(),
-    )?;
+    let old_default = r#"["history_context","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]"#;
     let new_default = serde_json::to_string(&crate::agent_tools::default_keys())?;
     conn.execute(
         "UPDATE agents SET enabled_tool_keys = ?1 WHERE enabled_tool_keys = ?2",

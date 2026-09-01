@@ -75,7 +75,7 @@ pub async fn start_agent_run(
                         .await
                         .err();
                 if let Some(error) = proposals_error {
-                    let _ = worker_state.insert_run_event(
+                    if let Err(event_error) = worker_state.insert_run_event(
                         result.run.id,
                         worker_request.project_id,
                         worker_request.chapter_id,
@@ -83,9 +83,11 @@ pub async fn start_agent_run(
                         "",
                         "success",
                         Some(&error.to_string()),
-                    );
+                    ) {
+                        eprintln!("记录 proposal_warning 运行事件失败: {event_error}");
+                    }
                 }
-                let _ = worker_state.insert_run_event(
+                if let Err(event_error) = worker_state.insert_run_event(
                     result.run.id,
                     worker_request.project_id,
                     worker_request.chapter_id,
@@ -93,10 +95,43 @@ pub async fn start_agent_run(
                     "",
                     "success",
                     None,
-                );
+                ) {
+                    eprintln!("记录 completed 运行事件失败: {event_error}");
+                }
             }
             Err(error) => {
-                // The workflow persists and broadcasts the terminal failure/cancel event.
+                // The workflow normally persists and broadcasts terminal events itself.  Some
+                // failures happen before it has entered its streaming section (for example a
+                // missing approved prerequisite), so finalize the run here as well; otherwise
+                // the UI would leave a run stuck in `running` forever.
+                let message = error.to_string();
+                let cancelled = worker_state
+                    .run_cancellation_requested(worker_run.id)
+                    .unwrap_or(false);
+                let final_status = if cancelled { "cancelled" } else { "failed" };
+                if let Ok(current) = worker_state.get_workflow_run_v2(worker_run.id) {
+                    if matches!(
+                        current.status.as_str(),
+                        "running" | "streaming" | "cancellation_requested"
+                    ) {
+                        let _ = worker_state.update_workflow_run(
+                            worker_run.id,
+                            &current.output,
+                            final_status,
+                            Some(&message),
+                            current.elapsed_ms,
+                        );
+                        let _ = worker_state.insert_run_event(
+                            worker_run.id,
+                            worker_request.project_id,
+                            worker_request.chapter_id,
+                            final_status,
+                            "",
+                            final_status,
+                            Some(&message),
+                        );
+                    }
+                }
                 eprintln!("Agent run {} ended with an error: {error}", worker_run.id);
             }
         }

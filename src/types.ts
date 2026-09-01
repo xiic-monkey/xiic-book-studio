@@ -21,6 +21,22 @@ export type {
 
 export type Stage = "setting" | "outline" | "characters" | "draft" | "review" | "revision";
 
+export const STAGE_VALUES: Stage[] = [
+  "setting",
+  "outline",
+  "characters",
+  "draft",
+  "review",
+  "revision",
+];
+
+/** 运行期把未知字符串安全收窄为 Stage，越界值返回 undefined（避免 `as Stage` 静默接受脏数据）。 */
+export function asStage(value: unknown): Stage | undefined {
+  return (STAGE_VALUES as readonly string[]).includes(value as string)
+    ? (value as Stage)
+    : undefined;
+}
+
 export type ReferenceTag = "style" | "structure";
 
 export interface ReferenceSelection {
@@ -697,6 +713,18 @@ export interface StoryContextSnippet {
   source_label: string;
   matched_term: string;
   content: string;
+  score: number;
+}
+
+export interface StoryFactSearchResult {
+  fact_type: string;
+  source_label: string;
+  chapter_id?: number | null;
+  entity_label?: string | null;
+  dimension: string;
+  value: string;
+  status: string;
+  evidence_quote: string;
   score: number;
 }
 

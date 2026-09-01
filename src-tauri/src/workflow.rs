@@ -11,7 +11,7 @@ mod text;
 use history_search::{build_history_query, extract_history_terms, retrieve_history_snippets};
 use text::{excerpt_around, is_han, is_noise_term, split_query_tokens};
 
-pub use history_search::search_story_context;
+pub use history_search::{search_story, search_story_context, search_story_facts};
 pub use markdown_export::export_markdown;
 
 use crate::{
@@ -298,7 +298,8 @@ async fn run_agent_step_impl(
     }
 
     let agent = state.get_agent_for_project_stage(input.project_id, input.stage.as_str())?;
-    let has_history_context = agent.has_tool(agent_tools::HISTORY_CONTEXT);
+    let has_history_context =
+        agent.has_tool(agent_tools::SEARCH_STORY) || agent.has_tool(agent_tools::HISTORY_CONTEXT);
     let has_reference_materials = agent.has_tool(agent_tools::REFERENCE_MATERIALS);
     let has_chapter_memory = agent.has_tool(agent_tools::CHAPTER_MEMORY);
     let has_continuity_check = agent.has_tool(agent_tools::CONTINUITY_CHECK);
@@ -323,6 +324,7 @@ async fn run_agent_step_impl(
                     .is_some()
                 {
                     let memory_settings = state.get_ai_settings_for_agent("chapter_memory")?;
+                    let memory_agent = state.get_agent("chapter_memory")?;
                     let memory_api_key = state
                         .get_api_key_for_base_url(&memory_settings.base_url)?
                         .ok_or_else(|| {
@@ -340,6 +342,7 @@ async fn run_agent_step_impl(
                         &memory_settings,
                         &memory_api_key,
                         previous_plan.as_deref(),
+                        &memory_agent.system_prompt,
                     )
                     .await
                     {
@@ -540,14 +543,24 @@ async fn run_agent_step_impl(
     let mut latest_output = String::new();
     let mut last_persisted_chars = 0usize;
     let mut last_event_chars = 0usize;
+    let mut last_thinking_event_chars = 0usize;
     let mut last_persisted_at = Instant::now();
+    state.insert_run_event(
+        run.id,
+        input.project_id,
+        input.chapter_id,
+        "generation_started",
+        "正文生成请求已发送，等待模型首段响应……",
+        "streaming",
+        None,
+    )?;
     match ai::complete_chat_streaming(
         &settings,
         &api_key,
         &agent.system_prompt,
         &prompt,
         agent.temperature,
-        |partial| {
+        |partial, thinking| {
             if state.run_cancellation_requested(run.id)? {
                 return Err(AppError::Validation("Agent 运行已取消".to_string()));
             }
@@ -584,6 +597,28 @@ async fn run_agent_step_impl(
                     "streaming",
                     None,
                 )?;
+            }
+            let thinking_chars = thinking.chars().count();
+            let thinking_delta = if thinking_chars >= last_thinking_event_chars {
+                thinking
+                    .chars()
+                    .skip(last_thinking_event_chars)
+                    .collect::<String>()
+            } else {
+                last_thinking_event_chars = 0;
+                thinking.to_string()
+            };
+            if !thinking_delta.is_empty() {
+                state.insert_run_event(
+                    run.id,
+                    input.project_id,
+                    input.chapter_id,
+                    "thinking_delta",
+                    &thinking_delta,
+                    "thinking",
+                    None,
+                )?;
+                last_thinking_event_chars = thinking_chars;
             }
             if !delta.is_empty() {
                 state.insert_run_event(
@@ -738,7 +773,8 @@ pub async fn request_revision(
     )?;
 
     let agent = state.get_agent_for_project_stage(input.project_id, "revision")?;
-    let has_history_context = agent.has_tool(agent_tools::HISTORY_CONTEXT);
+    let has_history_context =
+        agent.has_tool(agent_tools::SEARCH_STORY) || agent.has_tool(agent_tools::HISTORY_CONTEXT);
     let has_reference_materials = agent.has_tool(agent_tools::REFERENCE_MATERIALS);
     let has_continuity_check = agent.has_tool(agent_tools::CONTINUITY_CHECK);
     let settings = agent.ai_settings();
@@ -886,6 +922,7 @@ pub async fn request_revision(
     let mut latest_output = String::new();
     let mut last_persisted_chars = 0usize;
     let mut last_event_chars = 0usize;
+    let mut last_thinking_event_chars = 0usize;
     let mut last_persisted_at = Instant::now();
     match ai::complete_chat_streaming(
         &settings,
@@ -893,7 +930,7 @@ pub async fn request_revision(
         &agent.system_prompt,
         &prompt,
         agent.temperature,
-        |partial| {
+        |partial, thinking| {
             if state.run_cancellation_requested(run.id)? {
                 return Err(AppError::Validation("Agent 运行已取消".to_string()));
             }
@@ -930,6 +967,28 @@ pub async fn request_revision(
                     None,
                 )?;
                 last_event_chars = chars;
+            }
+            let thinking_chars = thinking.chars().count();
+            let thinking_delta = if thinking_chars >= last_thinking_event_chars {
+                thinking
+                    .chars()
+                    .skip(last_thinking_event_chars)
+                    .collect::<String>()
+            } else {
+                last_thinking_event_chars = 0;
+                thinking.to_string()
+            };
+            if !thinking_delta.is_empty() {
+                state.insert_run_event(
+                    run.id,
+                    input.project_id,
+                    source.chapter_id,
+                    "thinking_delta",
+                    &thinking_delta,
+                    "thinking",
+                    None,
+                )?;
+                last_thinking_event_chars = thinking_chars;
             }
             Ok(())
         },
@@ -1029,9 +1088,15 @@ pub fn replace_artifact_span(
         .content
         .replacen(&input.find_text, &input.replace_text, 1);
     let note = input.note.as_deref().unwrap_or("").trim();
-    if note.starts_with("删除候选卡片") && matches!(source.stage.as_str(), "setting" | "outline" | "characters") {
-        let artifact = state.update_artifact_content(input.project_id, source.id, &patched_content)?;
-        let run_input = format!("# in-place-candidate-card-delete\n\nsource_artifact_id: {}\nnote: {}", source.id, note);
+    if note.starts_with("删除候选卡片")
+        && matches!(source.stage.as_str(), "setting" | "outline" | "characters")
+    {
+        let artifact =
+            state.update_artifact_content(input.project_id, source.id, &patched_content)?;
+        let run_input = format!(
+            "# in-place-candidate-card-delete\n\nsource_artifact_id: {}\nnote: {}",
+            source.id, note
+        );
         let run = state.insert_workflow_run(
             input.project_id,
             source.chapter_id,
@@ -1172,7 +1237,8 @@ pub async fn revise_artifact_span_with_ai(
     }
 
     let revision_agent = state.get_agent("artifact_revision")?;
-    let has_history_context = revision_agent.has_tool(agent_tools::HISTORY_CONTEXT);
+    let has_history_context = revision_agent.has_tool(agent_tools::SEARCH_STORY)
+        || revision_agent.has_tool(agent_tools::HISTORY_CONTEXT);
     let has_continuity_check = revision_agent.has_tool(agent_tools::CONTINUITY_CHECK);
     let settings = revision_agent.ai_settings();
     let api_key = state
@@ -1491,7 +1557,8 @@ pub async fn generate_chapter_split_plan(
             "当前拆章 Agent 未启用“拆章规划”工具，请先在 Agent 设置中启用".to_string(),
         ));
     }
-    let has_history_context = split_agent.has_tool(agent_tools::HISTORY_CONTEXT);
+    let has_history_context = split_agent.has_tool(agent_tools::SEARCH_STORY)
+        || split_agent.has_tool(agent_tools::HISTORY_CONTEXT);
     let has_continuity_check = split_agent.has_tool(agent_tools::CONTINUITY_CHECK);
     let has_quality_analysis = split_agent.has_tool(agent_tools::QUALITY_ANALYSIS);
     let quality_report = has_quality_analysis.then(|| quality::analyze_artifact(&artifact));
@@ -1811,7 +1878,9 @@ fn build_prompt_internal(
 ) -> AppResult<String> {
     let project = state.get_project(project_id)?;
     let has_history_context = agent
-        .map(|item| item.has_tool(agent_tools::HISTORY_CONTEXT))
+        .map(|item| {
+            item.has_tool(agent_tools::SEARCH_STORY) || item.has_tool(agent_tools::HISTORY_CONTEXT)
+        })
         .unwrap_or(true);
     let has_chapter_memory = agent
         .map(|item| item.has_tool(agent_tools::CHAPTER_MEMORY))

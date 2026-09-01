@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::{
     db::AppState,
     error::AppResult,
-    models::{StoryContextSearchInput, StoryContextSnippet},
+    models::{StoryContextSearchInput, StoryContextSnippet, StoryFactSearchResult},
 };
 
 use super::{
@@ -41,6 +41,13 @@ pub(super) fn build_history_query(
     }
 }
 
+pub fn search_story(
+    state: &AppState,
+    input: StoryContextSearchInput,
+) -> AppResult<Vec<StoryContextSnippet>> {
+    search_story_context(state, input)
+}
+
 pub fn search_story_context(
     state: &AppState,
     input: StoryContextSearchInput,
@@ -61,6 +68,161 @@ pub fn search_story_context(
     )?;
     let limit = input.limit.unwrap_or(6).clamp(1, 12);
     Ok(snippets.into_iter().take(limit).collect())
+}
+
+/// Search only structured, evidence-backed story state. This intentionally does
+/// not fall back to prose or message search, so callers can distinguish facts
+/// from narrative context.
+pub fn search_story_facts(
+    state: &AppState,
+    input: StoryContextSearchInput,
+) -> AppResult<Vec<StoryFactSearchResult>> {
+    state.get_project(input.project_id)?;
+    let query = input.query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let terms = split_query_tokens(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = input.limit.unwrap_or(8).clamp(1, 12);
+    let entities = state
+        .list_story_entities(input.project_id)?
+        .into_iter()
+        .map(|entity| (entity.id, entity.name))
+        .collect::<std::collections::HashMap<_, _>>();
+    let chapters = state
+        .list_chapters(input.project_id)?
+        .into_iter()
+        .map(|chapter| (chapter.id, (chapter.chapter_no, chapter.title)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut results = Vec::new();
+
+    for fact in state.list_story_facts(input.project_id)? {
+        if fact.status != "active" {
+            continue;
+        }
+        let entity_label = entities.get(&fact.entity_id).cloned();
+        let haystack = format!(
+            "{} {} {} {}",
+            entity_label.as_deref().unwrap_or(""),
+            fact.dimension,
+            fact.value,
+            fact.source_quote
+        );
+        if let Some(score) = fact_match_score(&haystack, &terms) {
+            let source_label = fact
+                .narrative_chapter_id
+                .and_then(|id| {
+                    chapters
+                        .get(&id)
+                        .map(|(_, title)| format!("第{}章 {}", chapters[&id].0, title))
+                })
+                .unwrap_or_else(|| "结构化故事事实".to_string());
+            results.push(StoryFactSearchResult {
+                fact_type: "story_fact".to_string(),
+                source_label,
+                chapter_id: fact.narrative_chapter_id,
+                entity_label,
+                dimension: fact.dimension,
+                value: fact.value,
+                status: fact.status,
+                evidence_quote: fact.source_quote,
+                score,
+            });
+        }
+    }
+
+    for entry in state.list_continuity_ledger_entries(input.project_id)? {
+        let Some((_, title)) = chapters.get(&entry.chapter_id) else {
+            continue;
+        };
+        let Some(source) =
+            state.latest_approved_chapter_body(input.project_id, entry.chapter_id)?
+        else {
+            continue;
+        };
+        if crate::chapter_memory::source_text_hash(&source.content) != entry.source_text_hash {
+            continue;
+        }
+        let haystack = format!(
+            "{} {} {} {}",
+            entry.entity_label, entry.state_kind, entry.state_value, entry.evidence_quote
+        );
+        if let Some(score) = fact_match_score(&haystack, &terms) {
+            results.push(StoryFactSearchResult {
+                fact_type: "continuity_ledger".to_string(),
+                source_label: format!("第{}章 {}", chapters[&entry.chapter_id].0, title),
+                chapter_id: Some(entry.chapter_id),
+                entity_label: Some(entry.entity_label),
+                dimension: entry.state_kind,
+                value: entry.state_value,
+                status: "active".to_string(),
+                evidence_quote: entry.evidence_quote,
+                score,
+            });
+        }
+    }
+
+    for chapter_id in chapters.keys().copied() {
+        let Some(memory) =
+            crate::chapter_memory::current_memory_for_chapter(state, input.project_id, chapter_id)?
+        else {
+            continue;
+        };
+        let Ok(payload) =
+            serde_json::from_str::<crate::chapter_memory::ChapterMemoryPayload>(&memory.content)
+        else {
+            continue;
+        };
+        let Some((chapter_no, title)) = chapters.get(&chapter_id) else {
+            continue;
+        };
+        let source_label = format!("第{}章 {}（章节记忆）", chapter_no, title);
+        let groups = [
+            ("state_change", payload.state_changes),
+            ("knowledge_change", payload.knowledge_changes),
+            ("commitment", payload.commitments),
+            ("open_loop", payload.open_loops),
+        ];
+        for (fact_type, entries) in groups {
+            for item in entries {
+                let haystack = format!("{} {}", item.text, item.evidence_quote);
+                if let Some(score) = fact_match_score(&haystack, &terms) {
+                    results.push(StoryFactSearchResult {
+                        fact_type: fact_type.to_string(),
+                        source_label: source_label.clone(),
+                        chapter_id: Some(chapter_id),
+                        entity_label: None,
+                        dimension: fact_type.to_string(),
+                        value: item.text,
+                        status: "active".to_string(),
+                        evidence_quote: item.evidence_quote,
+                        score,
+                    });
+                }
+            }
+        }
+    }
+
+    results.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.source_label.cmp(&right.source_label))
+    });
+    results.truncate(limit);
+    Ok(results)
+}
+
+fn fact_match_score(text: &str, terms: &[String]) -> Option<usize> {
+    let normalized = text.to_lowercase();
+    let matched = terms
+        .iter()
+        .filter(|term| normalized.contains(&term.to_lowercase()))
+        .count();
+    (matched > 0).then_some(matched * 100 + text.chars().count().min(80))
 }
 
 pub(super) fn retrieve_history_snippets(

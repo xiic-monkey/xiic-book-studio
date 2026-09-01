@@ -218,7 +218,7 @@ pub async fn rerank_story_context(
     input: StoryContextRerankRequest,
 ) -> AppResult<StoryContextRerankResult> {
     state.get_project(input.project_id)?;
-    let candidates = workflow::search_story_context(
+    let candidates = workflow::search_story(
         state,
         StoryContextSearchInput {
             project_id: input.project_id,
@@ -287,13 +287,13 @@ fn build_planner_prompt(stage: &Stage, source_material: &str, ledger_catalog: &[
         r#"# 任务
 {stage_task}
 
-你正在决定是否调用 App 的 `search_story_context` 工具。只为确实依赖前文状态的对象发起查询；当前章首次出现且不依赖历史的内容不要搜索。最多 {MAX_AGENT_SEARCHES} 次。试读正文超过 1500 字且多次使用前文人物、物件或事件时，通常需要 3-6 个不同查询，不能因为状态账本目录存在就省略正文搜索。
+你正在决定是否调用 App 的 `search_story` 工具。只为确实依赖前文状态的对象发起查询；当前章首次出现且不依赖历史的内容不要搜索。最多 {MAX_AGENT_SEARCHES} 次。试读正文超过 1500 字且多次使用前文人物、物件或事件时，通常需要 3-6 个不同查询，不能因为状态账本目录存在就省略正文搜索。
 
 # 搜索规则
 1. `query` 使用 2-24 个字的具体名称或短语，例如人物名、物件名、事件名、地点名、承诺对象；不要写“相关历史”“前文伏笔”之类泛词。
 2. `evidence_quote` 必须是下方输入中连续出现的 6-100 个字原文，且能证明为什么需要回查。不得改写、拼接或使用省略号。
 3. `reason` 说明要核对什么状态，例如角色知情边界、入场路径、物件归属/消耗/封印、伤势、承诺是否兑现、旧事件的实际结果。
-4. 试读阶段宁可多查真正的旧引用，也不要只复述章纲。修订阶段必须以被修订正文为主要搜索来源。
+4. 试读阶段宁可多查真正的旧引用，也不要只复述章纲。修订阶段必须以被修订正文为主要搜索来源。需要核对原子状态时另行使用 `search_story_facts`，不要用事实检索替代正文检索。
 5. 不得搜索未来剧情，也不得把候选稿自身当成历史事实。
 
 # 已有状态账本实体目录
@@ -482,7 +482,7 @@ fn execute_history_searches(
     let mut results = Vec::new();
     let mut seen = HashSet::new();
     for search in searches {
-        let snippets = workflow::search_story_context(
+        let snippets = workflow::search_story(
             state,
             StoryContextSearchInput {
                 project_id,

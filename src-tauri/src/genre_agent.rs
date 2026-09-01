@@ -1,4 +1,5 @@
 use crate::{
+    error::{AppError, AppResult},
     genre_skill::{self, GenreSkillKind},
     models::{Agent, GenreAgentProfile},
 };
@@ -68,9 +69,9 @@ fn profile(
     }
 }
 
-pub fn detect_genre_agent(genre: &str) -> GenreAgentProfile {
+pub fn detect_genre_agent(genre: &str) -> AppResult<GenreAgentProfile> {
     profile_for_key(genre_skill::detect_genre_skill(genre).skill_id())
-        .expect("every built-in genre skill must have an agent profile")
+        .ok_or_else(|| AppError::Validation(format!("未找到题材 '{genre}' 对应的 Agent 配置")))
 }
 
 pub fn profile_for_key(agent_key: &str) -> Option<GenreAgentProfile> {
@@ -114,20 +115,23 @@ mod tests {
     #[test]
     fn routes_supported_genres_to_specialists() {
         assert_eq!(
-            detect_genre_agent("都市异能").agent_key,
+            detect_genre_agent("都市异能").unwrap().agent_key,
             "urban_supernatural"
         );
-        assert_eq!(detect_genre_agent("悬疑").agent_key, "mystery");
+        assert_eq!(detect_genre_agent("悬疑").unwrap().agent_key, "mystery");
         assert_eq!(
-            detect_genre_agent("男频修仙").agent_key,
+            detect_genre_agent("男频修仙").unwrap().agent_key,
             "xianxia_power_fantasy"
         );
-        assert_eq!(detect_genre_agent("历史").agent_key, "general_serialized");
+        assert_eq!(
+            detect_genre_agent("历史").unwrap().agent_key,
+            "general_serialized"
+        );
     }
 
     #[test]
     fn specialist_exposes_only_its_genre_skill_and_shared_allowlist() {
-        let profile = detect_genre_agent("悬疑");
+        let profile = detect_genre_agent("悬疑").unwrap();
         assert!(profile.allowed_skill_keys.contains(&"mystery".to_string()));
         assert!(!profile
             .allowed_skill_keys
@@ -139,7 +143,7 @@ mod tests {
 
     #[test]
     fn composed_agent_separates_fact_protocol_from_genre_and_stage_roles() {
-        let profile = detect_genre_agent("男频修仙");
+        let profile = detect_genre_agent("男频修仙").unwrap();
         let agent = compose_stage_agent(
             Agent {
                 id: 1,
