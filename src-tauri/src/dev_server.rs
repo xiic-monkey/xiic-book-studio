@@ -418,6 +418,14 @@ async fn dispatch_command(
             let input: StoryContextSearchInput = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.search_story_context(input)?)?)
         }
+        "search_story" => {
+            let input: StoryContextSearchInput = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(gateway.search_story(input)?)?)
+        }
+        "search_story_facts" => {
+            let input: StoryContextSearchInput = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(gateway.search_story_facts(input)?)?)
+        }
         "rerank_story_context" => {
             let input: StoryContextRerankRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
