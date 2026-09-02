@@ -107,6 +107,49 @@ function normalizeAiSettings(settings: AiSettings): AiSettings {
   };
 }
 
+const MODEL_CATALOG_CACHE_KEY = "xiic-book-studio:model-catalog:v1";
+
+type ModelCatalogCache = Record<string, ModelInfo[]>;
+
+function modelCatalogCacheKey(baseUrl: string) {
+  return normalizeBaseUrl(baseUrl);
+}
+
+function readModelCatalogCache(): ModelCatalogCache {
+  if (typeof window === "undefined") return {};
+  try {
+    const stored = window.sessionStorage.getItem(MODEL_CATALOG_CACHE_KEY);
+    if (!stored) return {};
+    const parsed: unknown = JSON.parse(stored);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).flatMap(([baseUrl, entries]) => {
+        if (!Array.isArray(entries)) return [];
+        const models = entries.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return [];
+          const id = (entry as Record<string, unknown>).id;
+          const ownedBy = (entry as Record<string, unknown>).owned_by;
+          return typeof id === "string"
+            ? [{ id, owned_by: typeof ownedBy === "string" ? ownedBy : null }]
+            : [];
+        });
+        return [[baseUrl, models] as const];
+      })
+    );
+  } catch {
+    return {};
+  }
+}
+
+function persistModelCatalogCache(cache: ModelCatalogCache) {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(MODEL_CATALOG_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // Model lists are a convenience cache. A full/quota-limited storage area should not block settings.
+  }
+}
+
 function isCustomModel(model: string, availableModels: ModelInfo[]) {
   const value = model.trim();
   return value.length === 0 || !availableModels.some((item) => item.id === value);
@@ -228,7 +271,10 @@ export function SettingsView({
   const [providers, setProviders] = useState<ProviderConfig[]>(initialProviderState.providers);
   const [selectedProviderId, setSelectedProviderId] = useState(initialProviderState.selectedProviderId);
   const providerCatalogInitialized = useRef(savedProviders.length > 0);
-  const [models, setModels] = useState<ModelInfo[]>([]);
+  const modelCatalogCache = useRef<ModelCatalogCache>(readModelCatalogCache());
+  const [models, setModels] = useState<ModelInfo[]>(() =>
+    modelCatalogCache.current[modelCatalogCacheKey(settings.base_url)] ?? []
+  );
   const [loadingModels, setLoadingModels] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
   const [providerCapabilities, setProviderCapabilities] = useState<ProviderCapabilities | null>(null);
@@ -277,7 +323,6 @@ export function SettingsView({
     setLocalApiKey(apiKey);
     setProviders(nextProviderState.providers);
     setSelectedProviderId(nextProviderState.selectedProviderId);
-    setModels([]);
     setModelError(null);
   }, [settings, apiKey]);
 
@@ -342,6 +387,12 @@ export function SettingsView({
   const currentProvider =
     providers.find((provider) => provider.id === selectedProviderId) ?? providers[0] ?? null;
   const customGlobalModel = isCustomModel(aiSettings.model, models);
+
+  useEffect(() => {
+    const cacheKey = modelCatalogCacheKey(currentProvider?.base_url ?? "");
+    setModels(modelCatalogCache.current[cacheKey] ?? []);
+    setModelError(null);
+  }, [currentProvider?.base_url]);
 
   useEffect(() => {
     const providerBaseUrl = currentProvider?.base_url.trim();
@@ -410,6 +461,15 @@ export function SettingsView({
     await onTestConnection(aiSettings, localApiKey);
   };
 
+  const invalidateCurrentModelCatalog = () => {
+    const cacheKey = modelCatalogCacheKey(aiSettings.base_url);
+    if (!(cacheKey in modelCatalogCache.current)) return;
+    const { [cacheKey]: _discarded, ...remaining } = modelCatalogCache.current;
+    modelCatalogCache.current = remaining;
+    persistModelCatalogCache(remaining);
+    setModels([]);
+  };
+
   const handleRefreshModels = async () => {
     setLoadingModels(true);
     setModelError(null);
@@ -418,6 +478,9 @@ export function SettingsView({
         base_url: aiSettings.base_url,
         api_key: localApiKey,
       });
+      const cacheKey = modelCatalogCacheKey(aiSettings.base_url);
+      modelCatalogCache.current = { ...modelCatalogCache.current, [cacheKey]: result };
+      persistModelCatalogCache(modelCatalogCache.current);
       setModels(result);
     } catch (err) {
       setModelError(String(err));
@@ -799,7 +862,12 @@ export function SettingsView({
                   type="password"
                   value={localApiKey}
                   placeholder="新 Key（留空保留）"
-                  onChange={(e) => setLocalApiKey(e.target.value)}
+                  onChange={(e) => {
+                    // Model availability may be account-specific, so don't reuse an
+                    // endpoint cache after the user supplies a different key.
+                    invalidateCurrentModelCatalog();
+                    setLocalApiKey(e.target.value);
+                  }}
                 />
               </div>
               <div className="button-row">
