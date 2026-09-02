@@ -107,6 +107,11 @@ function normalizeAiSettings(settings: AiSettings): AiSettings {
   };
 }
 
+function isCustomModel(model: string, availableModels: ModelInfo[]) {
+  const value = model.trim();
+  return value.length === 0 || !availableModels.some((item) => item.id === value);
+}
+
 function buildProviderState(settings: AiSettings, storedProviders: AiProvider[]) {
   const normalizedSettings = normalizeAiSettings(settings);
   const baseProviders = storedProviders.map((provider, index) => normalizeProvider(provider, index));
@@ -336,6 +341,7 @@ export function SettingsView({
 
   const currentProvider =
     providers.find((provider) => provider.id === selectedProviderId) ?? providers[0] ?? null;
+  const customGlobalModel = isCustomModel(aiSettings.model, models);
 
   useEffect(() => {
     const providerBaseUrl = currentProvider?.base_url.trim();
@@ -485,9 +491,11 @@ export function SettingsView({
 
   const updateCurrentProvider = (patch: Partial<ProviderConfig>) => {
     setProviders((current) =>
-      current.map((provider, index) =>
+      current.map((provider) =>
         provider.id === selectedProviderId
-          ? normalizeProvider({ ...provider, ...patch }, index)
+          // Keep transient empty values while the user is editing. Validation and
+          // fallback labels belong at save/load boundaries, not on every keystroke.
+          ? { ...provider, ...patch }
           : provider
       )
     );
@@ -654,17 +662,14 @@ export function SettingsView({
                   <div className="model-picker-row">
                     <Select
                       id="model"
-                      value={aiSettings.model}
+                      value={customGlobalModel ? "" : aiSettings.model}
                       onChange={(value) => {
                         setAiSettings({ ...aiSettings, model: value });
                         updateCurrentProvider({ model: value });
                       }}
                       options={[
                         { value: "", label: "自定义模型" },
-                        ...(aiSettings.model && !models.some((model) => model.id === aiSettings.model)
-                          ? [{ id: aiSettings.model, owned_by: null }, ...models]
-                          : models
-                        ).map((model) => ({
+                        ...models.map((model) => ({
                           value: model.id,
                           label: `${model.id}${model.owned_by ? ` · ${model.owned_by}` : ""}`,
                         })),
@@ -675,16 +680,18 @@ export function SettingsView({
                       刷新
                     </button>
                   </div>
-                  <input
-                    type="text"
-                    value={aiSettings.model}
-                    onChange={(e) => {
-                      const value = e.target.value;
-                      setAiSettings({ ...aiSettings, model: value });
-                      updateCurrentProvider({ model: value });
-                    }}
-                    placeholder="模型名称"
-                  />
+                  {customGlobalModel && (
+                    <input
+                      type="text"
+                      value={aiSettings.model}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setAiSettings({ ...aiSettings, model: value });
+                        updateCurrentProvider({ model: value });
+                      }}
+                      placeholder="模型名称"
+                    />
+                  )}
                   <div className="settings-hint-row">
                     {loadingModels && <span>正在拉取模型列表…</span>}
                     {!loadingModels && models.length > 0 && <span>已获取 {models.length} 个模型</span>}
@@ -852,6 +859,7 @@ export function SettingsView({
                 const draft = selectedAgentDraft;
                 const agentProviderOptions = selectedAgentProviderOptions;
                 const availableModels = agentModels[agent.id] ?? [];
+                const customAgentModel = isCustomModel(draft.model, availableModels);
                 return (
                   <section className="agent-prompt-card" key={agent.id}>
                     <header>
@@ -923,12 +931,18 @@ export function SettingsView({
                       <div className="form-field">
                         <label htmlFor={`agent-model-${agent.id}`}>模型</label>
                         <div className="model-picker-row">
-                          <input
-                            id={`agent-model-${agent.id}`}
-                            value={draft.model}
+                          <Select
+                            className="agent-model-select"
+                            value={customAgentModel ? "" : draft.model}
                             disabled={draft.uses_global_runtime_settings}
-                            onChange={(event) => updateAgentDraft(agent, { model: event.target.value })}
-                            placeholder="模型名称"
+                            onChange={(model) => updateAgentDraft(agent, { model })}
+                            options={[
+                              { value: "", label: "自定义模型" },
+                              ...availableModels.map((model) => ({
+                                value: model.id,
+                                label: `${model.id}${model.owned_by ? ` · ${model.owned_by}` : ""}`,
+                              })),
+                            ]}
                           />
                           <button
                             type="button"
@@ -943,17 +957,13 @@ export function SettingsView({
                             <RefreshCcw size={14} className={loadingAgentModels === agent.id ? "spin" : undefined} />
                           </button>
                         </div>
-                        {availableModels.length > 0 && (
-                          <Select
-                            className="agent-model-select"
+                        {customAgentModel && (
+                          <input
+                            id={`agent-model-${agent.id}`}
                             value={draft.model}
                             disabled={draft.uses_global_runtime_settings}
-                            placeholder="选择模型"
-                            onChange={(model) => updateAgentDraft(agent, { model })}
-                            options={availableModels.map((model) => ({
-                              value: model.id,
-                              label: `${model.id}${model.owned_by ? ` · ${model.owned_by}` : ""}`,
-                            }))}
+                            onChange={(event) => updateAgentDraft(agent, { model: event.target.value })}
+                            placeholder="模型名称"
                           />
                         )}
                       </div>

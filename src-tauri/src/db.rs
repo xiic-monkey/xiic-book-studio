@@ -4882,6 +4882,20 @@ mod tests {
             .unwrap();
         assert_eq!(saved.label, "测试供应商");
 
+        let provider_with_space = state
+            .save_ai_provider(SaveAiProvider {
+                id: Some(saved.id),
+                label: "Xiaomi MiMO".to_string(),
+                base_url: saved.base_url.clone(),
+                model: saved.model.clone(),
+                temperature: saved.temperature,
+                thinking_enabled: saved.thinking_enabled,
+                thinking_level: saved.thinking_level.clone(),
+                tool_protocol: saved.tool_protocol,
+            })
+            .unwrap();
+        assert_eq!(provider_with_space.label, "Xiaomi MiMO");
+
         let updated = state
             .save_ai_provider(SaveAiProvider {
                 id: Some(saved.id),
