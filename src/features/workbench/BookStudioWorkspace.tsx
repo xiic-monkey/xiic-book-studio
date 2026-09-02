@@ -3621,8 +3621,8 @@ export function BookStudioWorkspace() {
             )}
           </section>)}
 
-          {/* Right: Agent chat is only needed while working on drafts and story materials. */}
-          {mainSurface !== "official" && (
+          {/* Right: Agent chat belongs only to the workbench, never to read-only official content. */}
+          {currentContentSurface() === "workbench" && (
           <aside className="assistant-panel assistant-panel-v2">
             <header className="assistant-workspace-header">
               <div className="assistant-workspace-identity">
