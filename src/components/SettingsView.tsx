@@ -720,6 +720,21 @@ export function SettingsView({
                 />
               </div>
               <div className="form-field">
+                <label htmlFor="api_key">API Key</label>
+                <input
+                  id="api_key"
+                  type="password"
+                  value={localApiKey}
+                  placeholder="新 Key（留空保留）"
+                  onChange={(e) => {
+                    // Model availability may be account-specific, so don't reuse an
+                    // endpoint cache after the user supplies a different key.
+                    invalidateCurrentModelCatalog();
+                    setLocalApiKey(e.target.value);
+                  }}
+                />
+              </div>
+              <div className="form-field">
                 <label htmlFor="model">模型名称</label>
                 <div className="model-picker">
                   <div className="model-picker-row">
@@ -854,21 +869,6 @@ export function SettingsView({
                     <span className="settings-error">能力状态读取失败：{providerCapabilitiesError}</span>
                   )}
                 </div>
-              </div>
-              <div className="form-field">
-                <label htmlFor="api_key">API Key</label>
-                <input
-                  id="api_key"
-                  type="password"
-                  value={localApiKey}
-                  placeholder="新 Key（留空保留）"
-                  onChange={(e) => {
-                    // Model availability may be account-specific, so don't reuse an
-                    // endpoint cache after the user supplies a different key.
-                    invalidateCurrentModelCatalog();
-                    setLocalApiKey(e.target.value);
-                  }}
-                />
               </div>
               <div className="button-row">
                 <button onClick={handleSaveAi} disabled={Boolean(busy)} className="btn-primary">

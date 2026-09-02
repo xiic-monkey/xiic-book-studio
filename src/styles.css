@@ -93,6 +93,14 @@ input, textarea, select {
   font-size: 13px;
 }
 
+input[type="text"],
+input[type="password"],
+input[type="number"],
+input[type="search"],
+select {
+  height: 38px;
+}
+
 textarea {
   resize: vertical;
   line-height: 1.5;
