@@ -218,8 +218,8 @@ pub fn canonical_snapshot(state: &AppState, project_id: i64) -> AppResult<String
 
 fn mode_contract(mode: &crate::models::StoryArchitectMode) -> &'static str {
     match mode {
-        crate::models::StoryArchitectMode::Initialize => "建立故事内核、可执行世界规则、远期方向、第一故事阶段和初始角色。远期方向只保留路标，禁止伪造完整章节细节。",
-        crate::models::StoryArchitectMode::RefineCanon => "只补充当前 Canon 真正需要的新规则、势力、地点、物件或边界。每项必须说明叙事用途、引入路径和代价。",
+        crate::models::StoryArchitectMode::Initialize => "建立故事内核、可执行世界规则、远期方向、第一故事阶段和初始角色。远期方向只保留路标，禁止伪造完整章节细节。对需要沉淀的世界观、规则、地点、势力和物件，必须逐条调用提议知识卡工具；不要把 Markdown 作为主要交付物。",
+        crate::models::StoryArchitectMode::RefineCanon => "只补充当前 Canon 真正需要的新规则、势力、地点、物件或边界。每项必须说明叙事用途、引入路径和代价，并逐条调用提议知识卡工具创建或更新卡片；不要把 Markdown 作为主要交付物。",
         crate::models::StoryArchitectMode::PlanCurrentArc => "细化当前故事阶段：目标、进入局面、核心冲突、退出变化、相关角色和近期章节任务。已通过正式章节只能作为已发生事实被总结，必须从第一章尚无正式正文的章节继续规划；不得回写、改名或用规划版本替代已写内容。为当前阶段补充读者主要期待、推进证据、局部回报、尚未兑现项和对下一阶段形成的新条件；回报可以是理解、情绪、关系、能力、资源或目标变化，不规定固定章数和爽点频率。不要把更远阶段写死。",
         crate::models::StoryArchitectMode::ExtendNextArc => "基于当前阶段结局、正式章节、活跃伏笔与角色状态，提出下一故事阶段的候选方向；已通过正式章节和已经形成的阶段结果不可重写。每个候选阶段说明读者主要期待、可验证的推进证据、局部回报、继续保留的未兑现项和阶段结束后的新条件；不按目标字数平均切块，也不规定固定回报频率。新要素必须说明从何而来。",
         crate::models::StoryArchitectMode::DesignCharacters => "补充或修订角色卡。角色必须有自身目标、限制、知道什么、入场路径，以及如何改变当前阶段的因果。",

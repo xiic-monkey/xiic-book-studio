@@ -3278,7 +3278,7 @@ export function BookStudioWorkspace() {
                   )}
 
                   <div className="knowledge-grid">
-                    {libraryFocus !== "foreshadowing" && librarySourceSections.length > 0 && (
+                    {libraryFocus !== "foreshadowing" && libraryFocus !== "setting" && librarySourceSections.length > 0 && (
                       <details className={libraryMode === "official" ? "source-artifact-reference official-source-reference" : "source-artifact-reference"} open>
                         {libraryMode === "workbench" ? (
                           <summary>

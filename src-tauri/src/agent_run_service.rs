@@ -154,20 +154,45 @@ async fn prepare_proposals_after_run(
 ) -> AppResult<()> {
     let agent = state.get_agent_for_project_stage(request.project_id, request.stage.as_str())?;
     let mut proposal_agent = agent.clone();
+    let foundation_mode = matches!(
+        request.stage,
+        Stage::Setting | Stage::Outline | Stage::Characters
+    );
     proposal_agent.enabled_tool_keys.retain(|key| {
-        crate::agent_tools::get(key)
-            .is_some_and(|definition| definition.kind == crate::models::ToolKind::Proposal)
+        crate::agent_tools::get(key).is_some_and(|definition| {
+            definition.kind == crate::models::ToolKind::Proposal
+                || (foundation_mode
+                    && matches!(
+                        key.as_str(),
+                        crate::agent_tools::PROPOSE_KNOWLEDGE_CARD
+                            | crate::agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD
+                    ))
+        })
     });
     if proposal_agent.enabled_tool_keys.is_empty() {
         return Ok(());
     }
-    let proposal_prompt = format!(
-        "# 已完成的 Agent 产物\n阶段：{}\n标题：{}\n\n{}\n\n# 人工原始指令\n{}\n\n只在产物明确需要创建章节、重命名章节、生成资料候选、更新或删除知识卡、生成伏笔候选时创建写入提案。不得提议删除章节或正文、批准或直接应用正文。",
-        request.stage.as_str(),
-        result.artifact.title,
-        result.artifact.content,
-        request.user_instruction.as_deref().unwrap_or("未提供")
+    let foundation_mode = matches!(
+        request.stage,
+        Stage::Setting | Stage::Outline | Stage::Characters
     );
+    let proposal_prompt = if foundation_mode {
+        format!(
+            "# 已完成的 Agent 产物\n阶段：{}\n标题：{}\n\n{}\n\n# 人工原始指令\n{}\n\n你现在是结构化资料沉淀子流程。不要输出 Markdown，也不要创建资料候选版本。请逐条调用提议知识卡工具，把产物中的世界观、规则、地点、势力、物件、角色或大纲任务创建/更新为独立知识卡。每张卡只表达一个稳定知识单元；已有卡片应优先更新而不是重复创建。所有卡片保持待人工确认状态。完成后停止工具调用。",
+            request.stage.as_str(),
+            result.artifact.title,
+            result.artifact.content,
+            request.user_instruction.as_deref().unwrap_or("未提供")
+        )
+    } else {
+        format!(
+            "# 已完成的 Agent 产物\n阶段：{}\n标题：{}\n\n{}\n\n# 人工原始指令\n{}\n\n只在产物明确需要创建章节、重命名章节、生成资料候选、更新或删除知识卡、生成伏笔候选时创建写入提案。不得提议删除章节或正文、批准或直接应用正文。",
+            request.stage.as_str(),
+            result.artifact.title,
+            result.artifact.content,
+            request.user_instruction.as_deref().unwrap_or("未提供")
+        )
+    };
     tool_runtime::prepare_tools(
         ToolExecutionContext {
             state,

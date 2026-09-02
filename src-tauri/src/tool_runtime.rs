@@ -8,7 +8,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         ActionProposal, Agent, AgentToolDefinition, ChapterSplitPlanRequest, ReferenceSelection,
-        Stage, StoryContextSearchInput, ToolCall, ToolKind, ToolProtocol, ToolResult,
+        SaveKnowledgeCard, Stage, StoryContextSearchInput, ToolCall, ToolKind, ToolProtocol,
+        ToolResult,
     },
     quality, workflow,
 };
@@ -46,7 +47,19 @@ pub fn definitions_for_agent(
 ) -> Vec<AgentToolDefinition> {
     agent_tools::definitions()
         .into_iter()
-        .filter(|definition| agent.has_tool(&definition.key))
+        // The story architect now writes world/outline/character knowledge through
+        // one-card-at-a-time card operations. Keep this capability implicit for the
+        // specialist so old agent configurations do not silently fall back to Markdown.
+        .filter(|definition| {
+            agent.has_tool(&definition.key)
+                || (agent.stage == "story_architect"
+                    && matches!(stage, Stage::Setting | Stage::Outline | Stage::Characters)
+                    && matches!(
+                        definition.key.as_str(),
+                        agent_tools::PROPOSE_KNOWLEDGE_CARD
+                            | agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD
+                    ))
+        })
         .filter(|definition| {
             definition
                 .supported_stages
@@ -831,25 +844,71 @@ async fn execute_call(
             &call.arguments,
             None,
         ),
-        agent_tools::PROPOSE_KNOWLEDGE_CARD => create_proposal(
-            context,
-            "knowledge_card",
-            "创建知识卡候选",
-            &call.arguments,
-            None,
-        ),
+        agent_tools::PROPOSE_KNOWLEDGE_CARD => {
+            if context.agent.stage == "story_architect" && context.run_id.is_some() {
+                let category = required_string(&call.arguments, "category")?;
+                let title = required_string(&call.arguments, "title")?;
+                let content = required_string(&call.arguments, "content")?;
+                let card = context.state.save_knowledge_card(SaveKnowledgeCard {
+                    id: None,
+                    project_id: context.project_id,
+                    category: category.to_string(),
+                    title: title.to_string(),
+                    content: content.to_string(),
+                    status: "pending_human_approval".to_string(),
+                    source_artifact_id: context.source_artifact_id,
+                    source_chapter_id: context.chapter_id,
+                })?;
+                Ok((
+                    json!({"card_id": card.id, "status": card.status, "title": card.title}),
+                    Vec::new(),
+                    false,
+                    None,
+                ))
+            } else {
+                create_proposal(
+                    context,
+                    "knowledge_card",
+                    "创建知识卡候选",
+                    &call.arguments,
+                    None,
+                )
+            }
+        }
         agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD => {
             let card_id = required_i64(&call.arguments, "card_id")?;
             let card = context
                 .state
                 .get_knowledge_card(context.project_id, card_id)?;
-            create_proposal(
-                context,
-                "knowledge_card_update",
-                &format!("更新知识卡 #{}", card_id),
-                &call.arguments,
-                Some(&card.updated_at),
-            )
+            if context.agent.stage == "story_architect" && context.run_id.is_some() {
+                let category = required_string(&call.arguments, "category")?;
+                let title = required_string(&call.arguments, "title")?;
+                let content = required_string(&call.arguments, "content")?;
+                let updated = context.state.save_knowledge_card(SaveKnowledgeCard {
+                    id: Some(card_id),
+                    project_id: context.project_id,
+                    category: category.to_string(),
+                    title: title.to_string(),
+                    content: content.to_string(),
+                    status: "pending_human_approval".to_string(),
+                    source_artifact_id: context.source_artifact_id,
+                    source_chapter_id: context.chapter_id,
+                })?;
+                Ok((
+                    json!({"card_id": updated.id, "status": updated.status, "title": updated.title}),
+                    Vec::new(),
+                    false,
+                    None,
+                ))
+            } else {
+                create_proposal(
+                    context,
+                    "knowledge_card_update",
+                    &format!("更新知识卡 #{}", card_id),
+                    &call.arguments,
+                    Some(&card.updated_at),
+                )
+            }
         }
         agent_tools::PROPOSE_DELETE_KNOWLEDGE_CARD => {
             let card_id = required_i64(&call.arguments, "card_id")?;
