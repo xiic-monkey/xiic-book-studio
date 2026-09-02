@@ -3629,21 +3629,19 @@ export function BookStudioWorkspace() {
                 <div className="assistant-workspace-avatar"><Sparkles size={15} /></div>
                 <div>
                   <strong>Agent 工作区</strong>
-                  <select
+                  <Select
                     className="assistant-agent-select"
                     value={selectedStage}
-                    onChange={(event) => selectAssistantStage(event.target.value)}
+                    onChange={selectAssistantStage}
                     aria-label="切换当前 Agent"
-                  >
-                    {stages.map((stage) => {
+                    options={stages.map((stage) => {
                       const agent = agentCatalog.find((item) => item.stage === stage.id);
-                      return (
-                        <option key={stage.id} value={stage.id}>
-                          {agent?.name ?? `${stage.label} Agent`} · {stage.label}
-                        </option>
-                      );
+                      return {
+                        value: stage.id,
+                        label: `${agent?.name ?? `${stage.label} Agent`} · ${stage.label}`,
+                      };
                     })}
-                  </select>
+                  />
                 </div>
               </div>
               <button

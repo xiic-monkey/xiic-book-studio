@@ -4954,21 +4954,43 @@ input:focus, textarea:focus, select:focus {
 /* Agent workspace: readable execution trace, without exposing internal reasoning. */
 .assistant-agent-select {
   width: min(210px, 100%);
-  min-height: 20px;
   margin: 0;
-  padding: 0 18px 0 0;
-  border: 0;
-  border-radius: 0;
-  color: var(--text-secondary);
-  background-color: transparent;
-  font-size: 11px;
-  line-height: 1.2;
-  cursor: pointer;
 }
 
-.assistant-agent-select:focus {
+.assistant-agent-select .select-trigger {
+  min-height: 22px;
+  height: 22px;
+  padding: 0 18px 0 0;
+  border: 0;
+  border-radius: 3px;
+  color: var(--text-secondary);
+  background: transparent;
+  font-size: 11px;
+  line-height: 1.2;
+  box-shadow: none;
+}
+
+.assistant-agent-select .select-trigger:hover:not(:disabled) {
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.assistant-agent-select .select-trigger:focus-visible {
   outline: 2px solid rgba(63, 114, 146, 0.22);
   outline-offset: 2px;
+}
+
+.assistant-agent-select .select-trigger span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-agent-select .select-chevron {
+  width: 14px;
+  height: 14px;
 }
 
 .assistant-chat-feed .agent-run-inspector-compact {
