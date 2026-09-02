@@ -3919,8 +3919,9 @@ input:focus, textarea:focus, select:focus {
 
 .agent-runtime-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(260px, 1.2fr);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
   gap: 12px;
+  min-width: 0;
 }
 
 .agent-edit-grid,
@@ -3928,6 +3929,16 @@ input:focus, textarea:focus, select:focus {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  min-width: 0;
+}
+
+.agent-edit-grid > *,
+.agent-runtime-grid > *,
+.agent-allowlist-grid > *,
+.agent-prompt-card .form-field,
+.agent-prompt-card input,
+.agent-prompt-card .select-control {
+  min-width: 0;
 }
 
 .agent-edit-grid .form-field {
@@ -3947,6 +3958,10 @@ input:focus, textarea:focus, select:focus {
 }
 
 .agent-inherited-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   padding: 7px 9px;
   border-left: 2px solid var(--border-focus);
   background: var(--bg-tertiary);
