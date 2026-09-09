@@ -281,7 +281,12 @@ impl AppState {
                     error TEXT,
                     elapsed_ms INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
+                    parent_run_id INTEGER,
+                    agent_key TEXT,
+                    run_kind TEXT NOT NULL DEFAULT 'legacy',
+                    task_title TEXT,
                     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(parent_run_id) REFERENCES workflow_runs(id) ON DELETE SET NULL,
                     FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
                 );
 
@@ -2438,34 +2443,42 @@ impl AppState {
         error: Option<&str>,
         elapsed_ms: i64,
     ) -> AppResult<WorkflowRun> {
+        self.insert_workflow_run_with_meta(
+            project_id, chapter_id, stage, input, output, status, error, elapsed_ms, None, None,
+            "legacy", None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_workflow_run_with_meta(
+        &self,
+        project_id: i64,
+        chapter_id: Option<i64>,
+        stage: &str,
+        input: &str,
+        output: &str,
+        status: &str,
+        error: Option<&str>,
+        elapsed_ms: i64,
+        parent_run_id: Option<i64>,
+        agent_key: Option<&str>,
+        run_kind: &str,
+        task_title: Option<&str>,
+    ) -> AppResult<WorkflowRun> {
         let now = now();
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO workflow_runs (project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![project_id, chapter_id, stage, input, output, status, error, elapsed_ms, now],
+                "INSERT INTO workflow_runs (project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at, parent_run_id, agent_key, run_kind, task_title)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![project_id, chapter_id, stage, input, output, status, error, elapsed_ms, now, parent_run_id, agent_key, run_kind, task_title],
             )?;
             let id = conn.last_insert_rowid();
             conn.query_row(
-                "SELECT id, project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at
+                "SELECT id, project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at, parent_run_id, agent_key, run_kind, task_title
                  FROM workflow_runs WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok(WorkflowRun {
-                        id: row.get(0)?,
-                        project_id: row.get(1)?,
-                        chapter_id: row.get(2)?,
-                        stage: row.get(3)?,
-                        input: row.get(4)?,
-                        output: row.get(5)?,
-                        status: row.get(6)?,
-                        error: row.get(7)?,
-                        elapsed_ms: row.get(8)?,
-                        created_at: row.get(9)?,
-                    })
-                },
-            )
-            .map_err(AppError::from)
+                map_workflow_run,
+            ).map_err(AppError::from)
         })
     }
 
@@ -2488,7 +2501,7 @@ impl AppState {
                 return Err(AppError::Validation("运行记录不存在".to_string()));
             }
             conn.query_row(
-                "SELECT id, project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at
+                "SELECT id, project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at, parent_run_id, agent_key, run_kind, task_title
                  FROM workflow_runs WHERE id = ?1",
                 params![run_id],
                 map_workflow_run,
@@ -2500,7 +2513,7 @@ impl AppState {
     pub fn list_workflow_runs(&self, project_id: i64) -> AppResult<Vec<WorkflowRun>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at
+                "SELECT id, project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at, parent_run_id, agent_key, run_kind, task_title
                  FROM workflow_runs WHERE project_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 100",
             )?;
             let rows = stmt.query_map(params![project_id], map_workflow_run)?;
@@ -3338,7 +3351,7 @@ impl AppState {
                     .optional()?
                     .ok_or_else(|| AppError::Validation("项目不存在".to_string()))?;
 
-                let approved_foundation = |stage: &str| -> AppResult<Artifact> {
+                let approved_foundation = |stage: &str| -> AppResult<Option<Artifact>> {
                     conn.query_row(
                         "SELECT a.id, a.project_id, a.chapter_id, a.stage, a.title, a.content,
                                 a.version, a.status, a.parent_artifact_id, a.created_at
@@ -3349,18 +3362,36 @@ impl AppState {
                         params![project_id, stage],
                         map_artifact,
                     )
-                    .optional()?
-                    .ok_or_else(|| {
-                        AppError::Validation(format!(
-                            "确认创作基准前，请先人工通过{}资料",
-                            stage_label(stage)
-                        ))
-                    })
+                    .optional()
+                    .map_err(AppError::from)
                 };
-
-                let setting = approved_foundation("setting")?;
-                let outline = approved_foundation("outline")?;
-                approved_foundation("characters")?;
+                let card_content = |stage: &str| -> AppResult<String> {
+                    let category_filter = match stage {
+                        "setting" => "('world','cultivation','map','faction','taboo','item','rule')",
+                        "outline" => "('outline','chapter_plan')",
+                        "characters" => "('character')",
+                        _ => "('')",
+                    };
+                    let sql = format!(
+                        "SELECT COALESCE(group_concat(title || ': ' || content, char(10) || char(10)), '')
+                         FROM knowledge_cards WHERE project_id = ?1 AND status = 'approved' AND category IN {category_filter}"
+                    );
+                    conn.query_row(&sql, params![project_id], |row| row.get(0)).map_err(AppError::from)
+                };
+                let setting_artifact = approved_foundation("setting")?;
+                let outline_artifact = approved_foundation("outline")?;
+                let characters_artifact = approved_foundation("characters")?;
+                let setting_content = setting_artifact.as_ref().map(|item| item.content.clone()).unwrap_or(card_content("setting")?);
+                let outline_content = outline_artifact.as_ref().map(|item| item.content.clone()).unwrap_or(card_content("outline")?);
+                if setting_content.trim().is_empty() {
+                    return Err(AppError::Validation(format!("确认创作基准前，请先人工通过{}资料", stage_label("setting"))));
+                }
+                if outline_content.trim().is_empty() {
+                    return Err(AppError::Validation(format!("确认创作基准前，请先人工通过{}资料", stage_label("outline"))));
+                }
+                if characters_artifact.is_none() && card_content("characters")?.trim().is_empty() {
+                    return Err(AppError::Validation(format!("确认创作基准前，请先人工通过{}资料", stage_label("characters"))));
+                }
 
                 conn.execute(
                     "INSERT INTO story_bibles
@@ -3375,7 +3406,7 @@ impl AppState {
                         status = 'confirmed',
                         source_artifact_id = excluded.source_artifact_id,
                         updated_at = excluded.updated_at",
-                    params![project_id, setting.content, premise, setting.id, &timestamp],
+                    params![project_id, setting_content, premise, setting_artifact.as_ref().map(|item| item.id), &timestamp],
                 )?;
 
                 let has_active_arc: bool = conn.query_row(
@@ -3401,8 +3432,8 @@ impl AppState {
                             project_id,
                             arc_no,
                             format!("第 {} 故事阶段", arc_no),
-                            outline.content,
-                            outline.id,
+                            outline_content,
+                            outline_artifact.as_ref().map(|item| item.id),
                             &timestamp
                         ],
                     )?;
@@ -3841,6 +3872,13 @@ fn default_background_agents(
 fn default_agents() -> AppResult<Vec<(&'static str, &'static str, &'static str, &'static str, f64)>>
 {
     Ok(vec![
+        (
+            "orchestrator",
+            "主 Agent",
+            "负责对话理解、只读检索和子任务编排；不直接修改项目数据",
+            require_default_prompt("orchestrator")?,
+            0.2,
+        ),
         (
             "story_architect",
             "故事架构 Agent",
@@ -4447,6 +4485,10 @@ fn map_workflow_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRun> {
         error: row.get(7)?,
         elapsed_ms: row.get(8)?,
         created_at: row.get(9)?,
+        parent_run_id: row.get(10)?,
+        agent_key: row.get(11)?,
+        run_kind: row.get(12)?,
+        task_title: row.get(13)?,
     })
 }
 

@@ -6,8 +6,9 @@ use crate::{
     models::{
         ActionProposal, ActiveAgentRun, Agent, AgentRunRequest, AgentRunSummary, Artifact,
         ArtifactFilters, ArtifactSummary, DecideActionProposalRequest, DerivedIndexJob,
-        ListActionProposalsRequest, PreparedContext, ProjectWorkspace, ProposalApplyResult,
-        ProviderCapabilities, RevisionRequest, RunEvent, RunStoryArchitectRequest,
+        ListActionProposalsRequest, OrchestratorTurnRequest, OrchestratorTurnResponse,
+        PreparedContext, ProjectWorkspace, ProposalApplyResult, ProviderCapabilities,
+        RevisionRequest, RunEvent, RunStoryArchitectRequest,
     },
 };
 
@@ -37,6 +38,13 @@ impl ApplicationGateway {
 
     pub async fn start_agent_run(&self, input: AgentRunRequest) -> AppResult<AgentRunSummary> {
         agent_run_service::start_agent_run(&self.state, input).await
+    }
+
+    pub async fn start_orchestrator_turn(
+        &self,
+        input: OrchestratorTurnRequest,
+    ) -> AppResult<OrchestratorTurnResponse> {
+        agent_run_service::start_orchestrator_turn(&self.state, input).await
     }
 
     pub async fn start_story_architect_run(

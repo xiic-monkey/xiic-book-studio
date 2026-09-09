@@ -15,9 +15,9 @@ export type Chapter = { id: number, project_id: number, chapter_no: number, titl
 
 export type Artifact = { id: number, project_id: number, chapter_id: number | null, stage: Stage, title: string, content: string, version: number, status: string, parent_artifact_id: number | null, created_at: string, };
 
-export type WorkflowRun = { id: number, project_id: number, chapter_id: number | null, stage: string, input: string, output: string, status: string, error: string | null, elapsed_ms: number, created_at: string, };
+export type WorkflowRun = { id: number, project_id: number, chapter_id: number | null, stage: string, input: string, output: string, status: string, error: string | null, elapsed_ms: number, created_at: string, parent_run_id: number | null, agent_key: string | null, run_kind: string, task_title: string | null, };
 
-export type WorkflowRunSummary = { id: number, project_id: number, chapter_id: number | null, stage: string, status: string, error: string | null, elapsed_ms: number, output_chars: number, created_at: string, };
+export type WorkflowRunSummary = { id: number, project_id: number, chapter_id: number | null, stage: string, status: string, error: string | null, elapsed_ms: number, output_chars: number, created_at: string, parent_run_id: number | null, agent_key: string | null, run_kind: string, task_title: string | null, };
 
 export type Approval = { id: number, project_id: number, chapter_id: number | null, stage: string, artifact_id: number, note: string, created_at: string, };
 
@@ -83,9 +83,15 @@ export type ProposalApplyResult = { proposal: ActionProposal, entity_kind: strin
 
 export type ProviderCapabilities = { provider_base_url: string, configured_protocol: ToolProtocol, detected_protocol: ToolProtocol | null, last_error: string | null, updated_at: string | null, };
 
+export type OrchestratorTask = { task_type: string, title: string, instruction: string, depends_on: Array<number>, chapter_id: number | null, };
+
+export type OrchestratorTurnRequest = { project_id: number, chapter_id: number | null, message: string, stage: string | null, };
+
+export type OrchestratorTurnResponse = { kind: string, answer: string | null, parent_run: WorkflowRun | null, tasks: Array<WorkflowRun>, };
+
 export type AgentRunSummary = { run: WorkflowRun, artifact: Artifact | null, prepared_context_id: number | null, tool_invocations: Array<ToolInvocation>, proposals: Array<ActionProposal>, };
 
-export type RunEvent = { run_id: number, project_id: number, chapter_id: number | null, stage: string, sequence: number, kind: "completed" | "failed" | "cancelled" | "started" | "output_delta" | "output_reset" | "thinking_start" | "thinking_delta" | "thinking_end" | "cancellation_requested" | "proposal_warning" | "tool_started" | "tool_completed", delta: string, status: string, error: string | null, tool_key: string | null, tool_invocation_id: number | null, elapsed_ms: number | null, created_at: string, };
+export type RunEvent = { run_id: number, project_id: number, chapter_id: number | null, stage: string, sequence: number, kind: "completed" | "failed" | "cancelled" | "started" | "output_delta" | "output_reset" | "thinking_start" | "thinking_delta" | "thinking_end" | "cancellation_requested" | "proposal_warning" | "tool_started" | "tool_completed", delta: string, status: string, error: string | null, tool_key: string | null, tool_invocation_id: number | null, elapsed_ms: number | null, created_at: string, parent_run_id: number | null, agent_key: string | null, agent_role: string | null, task_title: string | null, };
 
 export type ActiveAgentRun = { id: number, project_id: number, chapter_id: number | null, stage: string, output: string, status: string, error: string | null, elapsed_ms: number, created_at: string, };
 
@@ -96,6 +102,7 @@ export type ProjectWorkspace = { project: Project, genre_agent: GenreAgentProfil
 export const V2_COMMANDS = {
   previewAgentRun: "preview_agent_run",
   startAgentRun: "start_agent_run",
+  startOrchestratorTurn: "start_orchestrator_turn",
   startStoryArchitectRun: "start_story_architect_run",
   startRevisionRun: "start_revision_run",
   cancelAgentRun: "cancel_agent_run",

@@ -60,10 +60,25 @@ pub fn confirm_story_bible(
     input: ConfirmStoryBibleRequest,
 ) -> AppResult<StoryBible> {
     for stage in ["setting", "outline", "characters"] {
-        if state
+        let has_approved_artifact = state
             .approved_artifact(input.project_id, stage, None)?
-            .is_none()
-        {
+            .is_some();
+        let has_approved_card = state
+            .list_knowledge_cards(input.project_id)?
+            .into_iter()
+            .any(|card| {
+                card.status == "approved"
+                    && match stage {
+                        "setting" => matches!(
+                            card.category.as_str(),
+                            "world" | "cultivation" | "map" | "faction" | "taboo" | "item" | "rule"
+                        ),
+                        "outline" => matches!(card.category.as_str(), "outline" | "chapter_plan"),
+                        "characters" => card.category == "character",
+                        _ => false,
+                    }
+            });
+        if !has_approved_artifact && !has_approved_card {
             return Err(AppError::Validation(format!(
                 "确认创作基准前，请先人工通过{}资料",
                 stage_label(stage)
@@ -202,27 +217,112 @@ pub fn canonical_fingerprint(state: &AppState, project_id: i64) -> AppResult<Str
 }
 
 pub fn canonical_snapshot(state: &AppState, project_id: i64) -> AppResult<String> {
+    // A Canon fingerprint must represent story content, not workflow metadata.
+    // In particular, confirming a review changes the story bible status and
+    // updated_at, but does not change the material that was reviewed.
     let artifacts = ["setting", "outline", "characters"]
         .into_iter()
         .filter_map(|stage| state.approved_artifact(project_id, stage, None).transpose())
-        .collect::<AppResult<Vec<_>>>()?;
+        .collect::<AppResult<Vec<_>>>()?
+        .into_iter()
+        .map(|artifact| {
+            serde_json::json!({
+                "id": artifact.id,
+                "chapter_id": artifact.chapter_id,
+                "stage": artifact.stage,
+                "title": artifact.title,
+                "content": artifact.content,
+                "version": artifact.version,
+                "parent_artifact_id": artifact.parent_artifact_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let story_bible = state.get_story_bible(project_id)?.map(|bible| {
+        serde_json::json!({
+            "id": bible.id,
+            "reader_promise": bible.reader_promise,
+            "protagonist_engine": bible.protagonist_engine,
+            "core_conflict": bible.core_conflict,
+            "endgame_direction": bible.endgame_direction,
+            "immutable_rules": bible.immutable_rules,
+            "canon_version": bible.canon_version,
+            "source_artifact_id": bible.source_artifact_id,
+        })
+    });
+    let story_arcs = state
+        .list_story_arcs(project_id)?
+        .into_iter()
+        .map(|arc| {
+            serde_json::json!({
+                "id": arc.id,
+                "arc_no": arc.arc_no,
+                "title": arc.title,
+                "objective": arc.objective,
+                "entry_state": arc.entry_state,
+                "exit_change": arc.exit_change,
+                "core_conflict": arc.core_conflict,
+                "involved_characters": arc.involved_characters,
+                "chapter_start": arc.chapter_start,
+                "chapter_end": arc.chapter_end,
+                "status": arc.status,
+                "source_artifact_id": arc.source_artifact_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let canon_cards = state
+        .list_knowledge_cards(project_id)?
+        .into_iter()
+        .filter(|card| card.status == "approved")
+        .map(|card| {
+            serde_json::json!({
+                "id": card.id,
+                "category": card.category,
+                "title": card.title,
+                "content": card.content,
+                "source_artifact_id": card.source_artifact_id,
+                "source_chapter_id": card.source_chapter_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let foreshadowings = state
+        .list_foreshadowings(project_id)?
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item.status.as_str(),
+                "active" | "ready_for_payoff" | "resolved"
+            )
+        })
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "title": item.title,
+                "content": item.content,
+                "status": item.status,
+                "planted_chapter_id": item.planted_chapter_id,
+                "planned_payoff_chapter_id": item.planned_payoff_chapter_id,
+                "planned_payoff_note": item.planned_payoff_note,
+                "source_artifact_id": item.source_artifact_id,
+            })
+        })
+        .collect::<Vec<_>>();
     let value = serde_json::json!({
-        "story_bible": state.get_story_bible(project_id)?,
+        "story_bible": story_bible,
         "foundation_artifacts": artifacts,
-        "story_arcs": state.list_story_arcs(project_id)?,
-        "canon_cards": state.list_knowledge_cards(project_id)?.into_iter().filter(|card| card.status == "approved").collect::<Vec<_>>(),
-        "foreshadowings": state.list_foreshadowings(project_id)?.into_iter().filter(|item| matches!(item.status.as_str(), "active" | "ready_for_payoff" | "resolved")).collect::<Vec<_>>(),
+        "story_arcs": story_arcs,
+        "canon_cards": canon_cards,
+        "foreshadowings": foreshadowings,
     });
     serde_json::to_string_pretty(&value).map_err(AppError::from)
 }
 
 fn mode_contract(mode: &crate::models::StoryArchitectMode) -> &'static str {
     match mode {
-        crate::models::StoryArchitectMode::Initialize => "建立故事内核、可执行世界规则、远期方向、第一故事阶段和初始角色。远期方向只保留路标，禁止伪造完整章节细节。对需要沉淀的世界观、规则、地点、势力和物件，必须逐条调用提议知识卡工具；不要把 Markdown 作为主要交付物。",
-        crate::models::StoryArchitectMode::RefineCanon => "只补充当前 Canon 真正需要的新规则、势力、地点、物件或边界。每项必须说明叙事用途、引入路径和代价，并逐条调用提议知识卡工具创建或更新卡片；不要把 Markdown 作为主要交付物。",
+        crate::models::StoryArchitectMode::Initialize => "建立基础世界模型、少量核心角色基础和故事方向，但按资料类别分流写入：世界观只描述世界长期如何运行，角色只写角色卡，故事方向只保留高层路标。禁止在世界观卡中写第一章、主角下一步、压迫链、资源循环、首次收益、升级路线或章节任务。远期方向只保留路标，禁止伪造完整章节细节。对需要沉淀的资料必须逐条调用创建/更新知识卡工具；不要把 Markdown 作为主要交付物。",
+        crate::models::StoryArchitectMode::RefineCanon => "只补充当前 Canon 真正需要的长期世界规则、势力、地点、物件或边界。压迫链、资源循环、阶段目标和章节任务属于大纲，不属于世界观卡；角色变化属于角色卡。每项必须说明其稳定定义，并逐条调用创建/更新知识卡工具；不要把 Markdown 作为主要交付物。",
         crate::models::StoryArchitectMode::PlanCurrentArc => "细化当前故事阶段：目标、进入局面、核心冲突、退出变化、相关角色和近期章节任务。已通过正式章节只能作为已发生事实被总结，必须从第一章尚无正式正文的章节继续规划；不得回写、改名或用规划版本替代已写内容。为当前阶段补充读者主要期待、推进证据、局部回报、尚未兑现项和对下一阶段形成的新条件；回报可以是理解、情绪、关系、能力、资源或目标变化，不规定固定章数和爽点频率。不要把更远阶段写死。",
         crate::models::StoryArchitectMode::ExtendNextArc => "基于当前阶段结局、正式章节、活跃伏笔与角色状态，提出下一故事阶段的候选方向；已通过正式章节和已经形成的阶段结果不可重写。每个候选阶段说明读者主要期待、可验证的推进证据、局部回报、继续保留的未兑现项和阶段结束后的新条件；不按目标字数平均切块，也不规定固定回报频率。新要素必须说明从何而来。",
-        crate::models::StoryArchitectMode::DesignCharacters => "补充或修订角色卡。角色必须有自身目标、限制、知道什么、入场路径，以及如何改变当前阶段的因果。",
+        crate::models::StoryArchitectMode::DesignCharacters => "只补充或修订角色卡。角色必须有自身身份、目标、限制、已知信息、关系和长期变化条件；不要把世界规则、压迫链或章节任务写进角色卡。",
     }
 }
 
@@ -324,6 +424,52 @@ mod tests {
     }
 
     #[test]
+    fn approved_cards_can_confirm_story_bible_without_foundation_artifacts() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "卡片项目".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "用卡片维护故事".to_string(),
+            })
+            .unwrap();
+        for (category, title, content) in [
+            ("world", "世界规则", "火脉残缺者不能直接炼化赤焰。"),
+            ("outline", "第一阶段", "主角先在焚炉谷活下来。"),
+            ("character", "陆烬", "陆烬想摆脱杂役身份。"),
+        ] {
+            state
+                .save_knowledge_card(SaveKnowledgeCard {
+                    id: None,
+                    project_id: project.id,
+                    category: category.to_string(),
+                    title: title.to_string(),
+                    content: content.to_string(),
+                    status: "approved".to_string(),
+                    source_artifact_id: None,
+                    source_chapter_id: None,
+                })
+                .unwrap();
+        }
+        let bible = confirm_story_bible(
+            &state,
+            ConfirmStoryBibleRequest {
+                project_id: project.id,
+                note: "确认卡片 Canon".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(bible.status, "confirmed");
+        assert!(state
+            .approved_artifact(project.id, "setting", None)
+            .unwrap()
+            .is_none());
+        assert!(state.active_story_arc(project.id).unwrap().is_some());
+    }
+
+    #[test]
     fn foundation_stages_resolve_to_one_story_architect() {
         let (_file, state, _project_id) = state_with_foundation();
         let architect_id = state.get_agent("story_architect").unwrap().id;
@@ -341,6 +487,17 @@ mod tests {
         assert!(contract.contains("不得回写、改名"));
         assert!(contract.contains("读者主要期待、推进证据、局部回报、尚未兑现项"));
         assert!(contract.contains("不规定固定章数和爽点频率"));
+    }
+
+    #[test]
+    fn foundation_contracts_keep_world_model_separate_from_plot_planning() {
+        let setting = mode_contract(&crate::models::StoryArchitectMode::Initialize);
+        let refine = mode_contract(&crate::models::StoryArchitectMode::RefineCanon);
+        let outline = mode_contract(&crate::models::StoryArchitectMode::PlanCurrentArc);
+        assert!(setting.contains("世界长期如何运行"));
+        assert!(setting.contains("压迫链"));
+        assert!(refine.contains("压迫链、资源循环、阶段目标和章节任务属于大纲"));
+        assert!(outline.contains("核心冲突"));
     }
 
     #[test]
@@ -377,6 +534,36 @@ mod tests {
             .approve_stage(project_id, "setting", extra.id, "通过")
             .unwrap();
         assert!(ensure_ready_for_draft(&state, project_id).is_err());
+    }
+
+    #[test]
+    fn confirming_a_review_does_not_change_the_canonical_fingerprint() {
+        let (_file, state, project_id) = state_with_foundation();
+        confirm_story_bible(
+            &state,
+            ConfirmStoryBibleRequest {
+                project_id,
+                note: "确认".to_string(),
+            },
+        )
+        .unwrap();
+        let before = canonical_fingerprint(&state, project_id).unwrap();
+        let review = state
+            .insert_story_bible_review(project_id, &before, "strong", "一致", "[]")
+            .unwrap();
+
+        confirm_story_bible_review(
+            &state,
+            ConfirmStoryBibleReviewRequest {
+                project_id,
+                review_id: review.id,
+                note: "确认审校".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(before, canonical_fingerprint(&state, project_id).unwrap());
+        assert!(ensure_ready_for_draft(&state, project_id).is_ok());
     }
 
     #[test]

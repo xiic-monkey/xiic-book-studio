@@ -1,13 +1,14 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
     db::AppState,
     error::{AppError, AppResult},
     models::{
-        AgentRunRequest, AgentRunSummary, Artifact, ContextSegment, PreparedContext,
-        RevisionRequest, RunAgentRequest, RunStoryArchitectRequest, Stage, WorkflowRun,
+        AgentRunRequest, AgentRunSummary, Artifact, ContextSegment, OrchestratorTask,
+        OrchestratorTurnRequest, OrchestratorTurnResponse, PreparedContext, RevisionRequest,
+        RunAgentRequest, RunStoryArchitectRequest, Stage, StoryArchitectMode, WorkflowRun,
     },
     tool_runtime::{self, ToolExecutionContext},
     workflow,
@@ -22,7 +23,17 @@ pub async fn preview_agent_run(
 
 pub async fn start_agent_run(
     state: &AppState,
+    request: AgentRunRequest,
+) -> AppResult<AgentRunSummary> {
+    start_agent_run_internal(state, request, None, None, false).await
+}
+
+async fn start_agent_run_internal(
+    state: &AppState,
     mut request: AgentRunRequest,
+    parent_run_id: Option<i64>,
+    task_title: Option<&str>,
+    allow_concurrent: bool,
 ) -> AppResult<AgentRunSummary> {
     let prepared = if let Some(id) = request.prepared_context_id {
         let prepared = state.get_prepared_context(id)?;
@@ -32,12 +43,12 @@ pub async fn start_agent_run(
         prepare_context(state, &request, true).await?
     };
     request.prepared_context_id = Some(prepared.id);
-    if state.get_active_agent_run(request.project_id)?.is_some() {
+    if !allow_concurrent && state.get_active_agent_run(request.project_id)?.is_some() {
         return Err(AppError::Validation(
             "当前项目已有 Agent 任务正在运行".to_string(),
         ));
     }
-    let run = state.insert_workflow_run(
+    let run = state.insert_workflow_run_with_meta(
         request.project_id,
         request.chapter_id,
         request.stage.as_str(),
@@ -46,6 +57,14 @@ pub async fn start_agent_run(
         "running",
         None,
         0,
+        parent_run_id,
+        Some(request.stage.as_str()),
+        if parent_run_id.is_some() {
+            "subagent"
+        } else {
+            "legacy"
+        },
+        task_title,
     )?;
     state.link_run_prepared_context(run.id, prepared.id)?;
     state.insert_run_event(
@@ -216,8 +235,675 @@ pub async fn start_story_architect_run(
     state: &AppState,
     request: RunStoryArchitectRequest,
 ) -> AppResult<AgentRunSummary> {
+    start_story_architect_run_internal(state, request, None, None, false).await
+}
+
+async fn start_story_architect_run_internal(
+    state: &AppState,
+    request: RunStoryArchitectRequest,
+    parent_run_id: Option<i64>,
+    task_title: Option<&str>,
+    allow_concurrent: bool,
+) -> AppResult<AgentRunSummary> {
+    // Foundation data is persisted as individual knowledge_cards. Do not route
+    // this specialist through the generic text-artifact workflow: that would
+    // recreate the old "generate Markdown, then extract cards" pipeline.
     let request = crate::story_architecture::build_agent_run_request(state, request)?;
-    start_agent_run(state, request).await
+    state.get_project(request.project_id)?;
+    if !allow_concurrent && state.get_active_agent_run(request.project_id)?.is_some() {
+        return Err(AppError::Validation(
+            "当前项目已有 Agent 任务正在运行".to_string(),
+        ));
+    }
+    let agent = state.get_agent_for_project_stage(request.project_id, "story_architect")?;
+    let prompt = direct_story_architect_prompt(state, &request, &agent)?;
+    let run = state.insert_workflow_run_with_meta(
+        request.project_id,
+        None,
+        request.stage.as_str(),
+        &prompt,
+        "",
+        "running",
+        None,
+        0,
+        parent_run_id,
+        Some("story_architect"),
+        if parent_run_id.is_some() {
+            "subagent"
+        } else {
+            "legacy"
+        },
+        task_title,
+    )?;
+    state.insert_run_event(
+        run.id,
+        request.project_id,
+        None,
+        "started",
+        "",
+        "running",
+        None,
+    )?;
+
+    let worker_state = state.clone();
+    let worker_request = request.clone();
+    let worker_run = run.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let result = tool_runtime::prepare_tools(
+            ToolExecutionContext {
+                state: &worker_state,
+                agent: &agent,
+                project_id: worker_request.project_id,
+                chapter_id: None,
+                stage: &worker_request.stage,
+                source_artifact_id: None,
+                user_instruction: worker_request.user_instruction.as_deref(),
+                reference_selection: worker_request.reference_selection.as_ref(),
+                run_id: Some(worker_run.id),
+                preview: false,
+            },
+            &prompt,
+        )
+        .await;
+        match result {
+            Ok(preparation) => {
+                let card_count = worker_state
+                    .list_knowledge_cards(worker_request.project_id)
+                    .map(|cards| {
+                        cards
+                            .into_iter()
+                            .filter(|card| card.updated_at >= worker_run.created_at)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let output = format!("已直接写入 {} 张结构化资料卡。", card_count);
+                if let Err(error) = worker_state.update_workflow_run(
+                    worker_run.id,
+                    &output,
+                    "success",
+                    None,
+                    started.elapsed().as_millis() as i64,
+                ) {
+                    eprintln!("更新故事架构运行状态失败: {error}");
+                }
+                let _ = worker_state.insert_run_event(
+                    worker_run.id,
+                    worker_request.project_id,
+                    None,
+                    "completed",
+                    "",
+                    "success",
+                    None,
+                );
+                let _ = worker_state.insert_message(
+                    worker_request.project_id,
+                    None,
+                    "agent_result",
+                    &format!("故事架构 Agent 已直接沉淀 {} 张资料卡。", card_count),
+                );
+                let _ = preparation;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let cancelled = worker_state
+                    .run_cancellation_requested(worker_run.id)
+                    .unwrap_or(false);
+                let status = if cancelled { "cancelled" } else { "failed" };
+                let _ = worker_state.update_workflow_run(
+                    worker_run.id,
+                    "",
+                    status,
+                    Some(&message),
+                    started.elapsed().as_millis() as i64,
+                );
+                let _ = worker_state.insert_run_event(
+                    worker_run.id,
+                    worker_request.project_id,
+                    None,
+                    status,
+                    "",
+                    status,
+                    Some(&message),
+                );
+            }
+        }
+    });
+
+    Ok(AgentRunSummary {
+        run,
+        artifact: None,
+        prepared_context_id: None,
+        tool_invocations: Vec::new(),
+        proposals: Vec::new(),
+    })
+}
+
+fn direct_story_architect_prompt(
+    state: &AppState,
+    request: &crate::models::AgentRunRequest,
+    agent: &crate::models::Agent,
+) -> AppResult<String> {
+    let mut prompt = workflow::build_prompt_for_agent(
+        state,
+        request.project_id,
+        &request.stage,
+        None,
+        request.user_instruction.as_deref(),
+        None,
+        None,
+        agent,
+    )?;
+    prompt.push_str("\n\n# 结构化资料卡工作方式\n你必须直接操作当前项目的知识卡数据库，不生成设定/大纲/角色 Markdown，不把整篇资料作为最终答复。请把每个稳定知识单元逐条调用“创建知识卡”或“更新知识卡”工具；已有卡片优先更新，只有不存在对应卡片时才创建。卡片会自动保存为待人工确认。当前 setting 阶段只允许 world、cultivation、map、faction、taboo、item、rule：只写世界长期如何运行，不写主角第一章、压迫链、资源循环、首次收益或章节任务。当前 outline 阶段只允许 outline、chapter_plan：压迫链、资源循环、阶段目标和章节任务应写在这里。当前 characters 阶段只允许 character。单张卡只表达一个稳定概念，避免把一个概念拆成大量碎片。完成所有必要卡片后停止工具调用。\n\n# 当前已有知识卡\n");
+    let cards = state.list_knowledge_cards(request.project_id)?;
+    if cards.is_empty() {
+        prompt.push_str("（暂无已有卡片）");
+    } else {
+        for card in cards {
+            prompt.push_str(&format!(
+                "\n[id={}] [{}][{}] {}\n{}",
+                card.id, card.category, card.status, card.title, card.content
+            ));
+        }
+    }
+    Ok(prompt)
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorDecision {
+    kind: String,
+    #[serde(default)]
+    answer: String,
+    #[serde(default)]
+    tasks: Vec<OrchestratorTask>,
+}
+
+const ORCHESTRATOR_TASK_TYPES: &[&str] = &[
+    "story_architect",
+    "draft",
+    "review",
+    "revision",
+    "chapter_memory",
+    "continuity_check",
+    "adoption",
+];
+
+/// Starts the project-level, read-only conversation agent. Its only side effect is creating
+/// explicitly delegated child runs; specialist workers own all business writes.
+pub async fn start_orchestrator_turn(
+    state: &AppState,
+    input: OrchestratorTurnRequest,
+) -> AppResult<OrchestratorTurnResponse> {
+    state.get_project(input.project_id)?;
+    if let Some(chapter_id) = input.chapter_id {
+        state
+            .ensure_chapter(input.project_id, Some(chapter_id))?
+            .ok_or_else(|| AppError::Validation("章节不属于当前项目".to_string()))?;
+    }
+    let message = input.message.trim();
+    if message.is_empty() {
+        return Err(AppError::Validation("消息不能为空".to_string()));
+    }
+    state.insert_message(input.project_id, input.chapter_id, "user", message)?;
+    let agent = state.get_agent_for_project_stage(input.project_id, "orchestrator")?;
+    let run = state.insert_workflow_run_with_meta(
+        input.project_id,
+        input.chapter_id,
+        "orchestrator",
+        message,
+        "",
+        "running",
+        None,
+        0,
+        None,
+        Some("orchestrator"),
+        "orchestrator",
+        Some("主 Agent"),
+    )?;
+    state.insert_run_event(
+        run.id,
+        input.project_id,
+        input.chapter_id,
+        "started",
+        "",
+        "running",
+        None,
+    )?;
+    state.insert_run_event(
+        run.id,
+        input.project_id,
+        input.chapter_id,
+        "thinking_start",
+        "正在理解你的请求…",
+        "running",
+        None,
+    )?;
+
+    let worker_state = state.clone();
+    let worker_input = input.clone();
+    let worker_run = run.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let outcome =
+            run_orchestrator_turn(&worker_state, &agent, &worker_input, &worker_run).await;
+        if let Err(error) = outcome {
+            let message = error.to_string();
+            let _ = worker_state.update_workflow_run(
+                worker_run.id,
+                "",
+                "failed",
+                Some(&message),
+                started.elapsed().as_millis() as i64,
+            );
+            let _ = worker_state.insert_run_event(
+                worker_run.id,
+                worker_input.project_id,
+                worker_input.chapter_id,
+                "failed",
+                "",
+                "failed",
+                Some(&message),
+            );
+        }
+    });
+    Ok(OrchestratorTurnResponse {
+        kind: "running".to_string(),
+        answer: None,
+        parent_run: Some(run),
+        tasks: Vec::new(),
+    })
+}
+
+async fn run_orchestrator_turn(
+    state: &AppState,
+    agent: &crate::models::Agent,
+    input: &OrchestratorTurnRequest,
+    parent: &WorkflowRun,
+) -> AppResult<()> {
+    let project = state.get_project(input.project_id)?;
+    let chapter_hint = input
+        .chapter_id
+        .and_then(|id| {
+            state
+                .ensure_chapter(input.project_id, Some(id))
+                .ok()
+                .flatten()
+        })
+        .map(|chapter| {
+            format!(
+                "当前章节：第 {} 章《{}》",
+                chapter.chapter_no, chapter.title
+            )
+        })
+        .unwrap_or_else(|| "当前没有指定章节".to_string());
+    let stage_hint = input
+        .stage
+        .as_deref()
+        .filter(|stage| !stage.trim().is_empty())
+        .map(|stage| {
+            format!(
+                "当前工作区阶段：{}（仅作为上下文，不代表主 Agent 身份，也不限制委托类型）",
+                stage
+            )
+        })
+        .unwrap_or_else(|| {
+            "当前工作区未指定阶段；根据用户意图决定是否委托以及委托类型".to_string()
+        });
+    let prompt = format!(
+        "# 项目\n标题：{}\n类型：{}\n简介：{}\n{}\n{}\n\n# 用户消息\n{}\n\n请按协议决定回答或委托。主 Agent 只负责对话和只读理解；具体业务阶段由委托的子 Agent 决定。",
+        project.title,
+        project.genre,
+        project.premise,
+        chapter_hint,
+        stage_hint,
+        input.message.trim()
+    );
+    let settings = agent.ai_settings();
+    let api_key = state
+        .get_api_key_for_base_url(&settings.base_url)?
+        .ok_or_else(|| {
+            AppError::Validation("请先为主 Agent 当前供应商保存 AI API Key".to_string())
+        })?;
+    let raw = crate::ai::complete_json_chat(
+        &settings,
+        &api_key,
+        &agent.system_prompt,
+        &prompt,
+        agent.temperature,
+    )
+    .await?;
+    let decision = parse_orchestrator_decision(&raw, input.chapter_id)?;
+    state.insert_run_event(
+        parent.id,
+        input.project_id,
+        input.chapter_id,
+        "thinking_end",
+        "",
+        "running",
+        None,
+    )?;
+
+    if decision.kind == "answer" {
+        let answer = decision.answer.trim();
+        let answer = if answer.is_empty() {
+            "我已理解你的问题；目前不需要启动执行任务。"
+        } else {
+            answer
+        };
+        state.update_workflow_run(parent.id, answer, "success", None, 0)?;
+        state.insert_run_event(
+            parent.id,
+            input.project_id,
+            input.chapter_id,
+            "output_delta",
+            answer,
+            "success",
+            None,
+        )?;
+        state.insert_run_event(
+            parent.id,
+            input.project_id,
+            input.chapter_id,
+            "completed",
+            "",
+            "success",
+            None,
+        )?;
+        state.insert_message(input.project_id, input.chapter_id, "assistant", answer)?;
+        return Ok(());
+    }
+
+    let intro = if decision.answer.trim().is_empty() {
+        "我已识别到需要执行的任务，正在委托专业 Agent…"
+    } else {
+        decision.answer.trim()
+    };
+    state.insert_run_event(
+        parent.id,
+        input.project_id,
+        input.chapter_id,
+        "output_delta",
+        intro,
+        "running",
+        None,
+    )?;
+    state.insert_run_event(
+        parent.id,
+        input.project_id,
+        input.chapter_id,
+        "thinking_delta",
+        "已确定需要委托专业 Agent。",
+        "running",
+        None,
+    )?;
+
+    let mut children = Vec::new();
+    let mut start_errors = Vec::new();
+    // Start independent child tasks without a frontend keyword router. Internal starts bypass
+    // the legacy single-active-run guard, while every child retains its parent metadata.
+    for task in decision.tasks {
+        if !task.depends_on.is_empty() {
+            state.insert_run_event(
+                parent.id,
+                input.project_id,
+                input.chapter_id,
+                "thinking_delta",
+                &format!("任务“{}”等待前置任务。", task.title),
+                "running",
+                None,
+            )?;
+        }
+        match start_delegated_task(state, input, parent.id, &task).await {
+            Ok(child) => children.push(child.run),
+            Err(error) => {
+                start_errors.push(format!("{}：{}", task.title, error));
+                state.insert_run_event(
+                    parent.id,
+                    input.project_id,
+                    input.chapter_id,
+                    "output_delta",
+                    &format!("无法启动“{}”：{}", task.title, error),
+                    "running",
+                    None,
+                )?;
+            }
+        }
+    }
+    if children.is_empty() {
+        return Err(AppError::Validation(format!(
+            "主 Agent 未能启动任何子任务：{}",
+            start_errors.join("；")
+        )));
+    }
+    let state = state.clone();
+    let parent_id = parent.id;
+    let project_id = input.project_id;
+    let chapter_id = input.chapter_id;
+    tokio::spawn(async move {
+        let summary = wait_for_children_and_summarize(&state, parent_id, &children).await;
+        let (status, text, error) = match summary {
+            Ok(text) => ("success", text, None),
+            Err(error) => (
+                "failed",
+                format!("子任务未能全部完成：{error}"),
+                Some(error.to_string()),
+            ),
+        };
+        let _ = state.update_workflow_run(parent_id, &text, status, error.as_deref(), 0);
+        let _ = state.insert_run_event(
+            parent_id,
+            project_id,
+            chapter_id,
+            "output_delta",
+            &text,
+            status,
+            error.as_deref(),
+        );
+        let _ = state.insert_run_event(
+            parent_id,
+            project_id,
+            chapter_id,
+            if status == "success" {
+                "completed"
+            } else {
+                "failed"
+            },
+            "",
+            status,
+            error.as_deref(),
+        );
+        let _ = state.insert_message(project_id, chapter_id, "assistant", &text);
+    });
+    Ok(())
+}
+
+fn parse_orchestrator_decision(
+    raw: &str,
+    default_chapter_id: Option<i64>,
+) -> AppResult<OrchestratorDecision> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let mut decision: OrchestratorDecision = serde_json::from_str(trimmed)
+        .map_err(|_| AppError::Validation("主 Agent 返回的任务决策不是有效 JSON".to_string()))?;
+    if !matches!(decision.kind.as_str(), "answer" | "delegate") {
+        return Err(AppError::Validation(
+            "主 Agent 返回了未知的决策类型".to_string(),
+        ));
+    }
+    if decision.kind == "answer" {
+        decision.tasks.clear();
+        return Ok(decision);
+    }
+    if decision.tasks.is_empty() {
+        return Err(AppError::Validation(
+            "主 Agent 委托时必须提供至少一个子任务".to_string(),
+        ));
+    }
+    for (index, task) in decision.tasks.iter_mut().enumerate() {
+        if !ORCHESTRATOR_TASK_TYPES.contains(&task.task_type.as_str())
+            || task.title.trim().is_empty()
+            || task.instruction.trim().is_empty()
+        {
+            return Err(AppError::Validation(
+                "主 Agent 返回了无效子任务".to_string(),
+            ));
+        }
+        if task
+            .depends_on
+            .iter()
+            .any(|dependency| *dependency >= index)
+        {
+            return Err(AppError::Validation(
+                "子任务依赖必须指向前置任务".to_string(),
+            ));
+        }
+        if task.chapter_id.is_none() {
+            task.chapter_id = default_chapter_id;
+        }
+    }
+    Ok(decision)
+}
+
+fn delegated_chapter_id(
+    input_chapter_id: Option<i64>,
+    task_chapter_id: Option<i64>,
+    error_message: &str,
+) -> AppResult<i64> {
+    // The selected workspace chapter is an authoritative database id. A model may
+    // only know the human-facing chapter number, so never let it override that id.
+    input_chapter_id
+        .or(task_chapter_id)
+        .ok_or_else(|| AppError::Validation(error_message.to_string()))
+}
+
+async fn start_delegated_task(
+    state: &AppState,
+    input: &OrchestratorTurnRequest,
+    parent_run_id: i64,
+    task: &OrchestratorTask,
+) -> AppResult<AgentRunSummary> {
+    match task.task_type.as_str() {
+        "story_architect" => {
+            start_story_architect_run_internal(
+                state,
+                RunStoryArchitectRequest {
+                    project_id: input.project_id,
+                    mode: StoryArchitectMode::RefineCanon,
+                    arc_id: None,
+                    user_instruction: Some(task.instruction.clone()),
+                    source_artifact_id: None,
+                    reference_selection: None,
+                },
+                Some(parent_run_id),
+                Some(&task.title),
+                true,
+            )
+            .await
+        }
+        "draft" | "review" | "revision" => {
+            let stage = match task.task_type.as_str() {
+                "draft" => Stage::Draft,
+                "review" | "continuity_check" => Stage::Review,
+                _ => Stage::Revision,
+            };
+            let chapter_id =
+                delegated_chapter_id(input.chapter_id, task.chapter_id, "该子任务需要选择章节")?;
+            start_agent_run_internal(
+                state,
+                AgentRunRequest {
+                    project_id: input.project_id,
+                    stage,
+                    chapter_id: Some(chapter_id),
+                    user_instruction: Some(task.instruction.clone()),
+                    source_artifact_id: None,
+                    reference_selection: None,
+                    prepared_context_id: None,
+                },
+                Some(parent_run_id),
+                Some(&task.title),
+                true,
+            )
+            .await
+        }
+        "continuity_check" => {
+            let chapter_id =
+                delegated_chapter_id(input.chapter_id, task.chapter_id, "连续性检查需要选择章节")?;
+            start_agent_run_internal(
+                state,
+                AgentRunRequest {
+                    project_id: input.project_id,
+                    stage: Stage::Review,
+                    chapter_id: Some(chapter_id),
+                    user_instruction: Some(format!("连续性检查：{}", task.instruction)),
+                    source_artifact_id: None,
+                    reference_selection: None,
+                    prepared_context_id: None,
+                },
+                Some(parent_run_id),
+                Some(&task.title),
+                true,
+            )
+            .await
+        }
+        "chapter_memory" | "adoption" => Err(AppError::Validation(format!(
+            "{} 尚未接入统一委托执行器",
+            task.task_type
+        ))),
+        _ => Err(AppError::Validation("不支持的子任务类型".to_string())),
+    }
+}
+
+async fn wait_for_children_and_summarize(
+    state: &AppState,
+    _parent_run_id: i64,
+    children: &[WorkflowRun],
+) -> AppResult<String> {
+    for child in children {
+        loop {
+            let current = state.get_workflow_run_v2(child.id)?;
+            if matches!(current.status.as_str(), "success" | "failed" | "cancelled") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    }
+    let completed = children
+        .iter()
+        .map(|child| state.get_workflow_run_v2(child.id))
+        .collect::<AppResult<Vec<_>>>()?;
+    let successes = completed
+        .iter()
+        .filter(|run| run.status == "success")
+        .count();
+    let failures = completed.len() - successes;
+    let details = completed
+        .iter()
+        .map(|run| {
+            format!(
+                "{}：{}",
+                run.task_title
+                    .as_deref()
+                    .unwrap_or(run.agent_key.as_deref().unwrap_or("子任务")),
+                if run.status == "success" {
+                    run.output.as_str()
+                } else {
+                    run.error.as_deref().unwrap_or("执行失败")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    if failures > 0 {
+        return Err(AppError::Validation(format!(
+            "{} 个子任务完成，{} 个失败。{}",
+            successes, failures, details
+        )));
+    }
+    Ok(format!("已完成 {} 个子任务。{}", successes, details))
 }
 
 pub async fn start_revision_run(
@@ -744,6 +1430,37 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         panic!("Agent run {run_id} did not emit {event_type}");
+    }
+
+    #[test]
+    fn orchestrator_decision_accepts_answer_without_tasks() {
+        let decision = parse_orchestrator_decision(r#"{"kind":"answer","answer":"你好","tasks":[{"task_type":"draft","title":"x","instruction":"x"}]}"#, None).unwrap();
+        assert_eq!(decision.kind, "answer");
+        assert!(decision.tasks.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_decision_rejects_unknown_task_and_forward_dependency() {
+        let unknown = parse_orchestrator_decision(
+            r#"{"kind":"delegate","tasks":[{"task_type":"unknown","title":"x","instruction":"x"}]}"#,
+            None,
+        );
+        assert!(unknown.is_err());
+        let forward = parse_orchestrator_decision(
+            r#"{"kind":"delegate","tasks":[{"task_type":"draft","title":"x","instruction":"x","depends_on":[1]}]}"#,
+            None,
+        );
+        assert!(forward.is_err());
+    }
+
+    #[test]
+    fn workspace_chapter_id_overrides_model_chapter_id() {
+        assert_eq!(
+            delegated_chapter_id(Some(42), Some(1), "missing").unwrap(),
+            42
+        );
+        assert_eq!(delegated_chapter_id(None, Some(1), "missing").unwrap(), 1);
+        assert!(delegated_chapter_id(None, None, "missing").is_err());
     }
 
     #[test]

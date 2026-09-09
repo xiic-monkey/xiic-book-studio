@@ -1683,15 +1683,15 @@ fn validate_prerequisites(
 ) -> AppResult<()> {
     match stage {
         Stage::Setting => {}
-        Stage::Outline => require_approved(state, project_id, "setting", None)?,
+        Stage::Outline => require_approved_foundation(state, project_id, "setting")?,
         Stage::Characters => {
-            require_approved(state, project_id, "setting", None)?;
-            require_approved(state, project_id, "outline", None)?;
+            require_approved_foundation(state, project_id, "setting")?;
+            require_approved_foundation(state, project_id, "outline")?;
         }
         Stage::Draft => {
-            require_approved(state, project_id, "setting", None)?;
-            require_approved(state, project_id, "outline", None)?;
-            require_approved(state, project_id, "characters", None)?;
+            require_approved_foundation(state, project_id, "setting")?;
+            require_approved_foundation(state, project_id, "outline")?;
+            require_approved_foundation(state, project_id, "characters")?;
             story_architecture::ensure_ready_for_draft(state, project_id)?;
         }
         Stage::Review => {
@@ -1715,6 +1715,35 @@ fn validate_prerequisites(
         }
     }
     Ok(())
+}
+
+fn require_approved_foundation(state: &AppState, project_id: i64, stage: &str) -> AppResult<()> {
+    if state.approved_artifact(project_id, stage, None)?.is_some() {
+        return Ok(());
+    }
+    let has_card = state
+        .list_knowledge_cards(project_id)?
+        .into_iter()
+        .any(|card| {
+            card.status == "approved"
+                && match stage {
+                    "setting" => matches!(
+                        card.category.as_str(),
+                        "world" | "cultivation" | "map" | "faction" | "taboo" | "item" | "rule"
+                    ),
+                    "outline" => matches!(card.category.as_str(), "outline" | "chapter_plan"),
+                    "characters" => card.category == "character",
+                    _ => false,
+                }
+        });
+    if has_card {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "请先人工通过{}",
+            stage_label(stage)
+        )))
+    }
 }
 
 fn require_approved(
@@ -3670,10 +3699,26 @@ fn approved_outline_section_for_chapter(
     project_id: i64,
     chapter_no: i64,
 ) -> AppResult<Option<String>> {
-    let Some(outline) = state.approved_artifact(project_id, "outline", None)? else {
-        return Ok(None);
-    };
-    let lines = outline.content.lines().collect::<Vec<_>>();
+    let outline_content =
+        if let Some(outline) = state.approved_artifact(project_id, "outline", None)? {
+            outline.content
+        } else {
+            let content = state
+                .list_knowledge_cards(project_id)?
+                .into_iter()
+                .filter(|card| {
+                    card.status == "approved"
+                        && matches!(card.category.as_str(), "outline" | "chapter_plan")
+                })
+                .map(|card| format!("## {}\n{}", card.title, card.content))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if content.trim().is_empty() {
+                return Ok(None);
+            }
+            content
+        };
+    let lines = outline_content.lines().collect::<Vec<_>>();
     let targets = [
         format!("第{}章", chapter_no),
         format!("第 {} 章", chapter_no),

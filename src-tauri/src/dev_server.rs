@@ -25,12 +25,13 @@ use crate::{
         ContinuityReviewRequest, DecideActionProposalRequest, DecideAdoptionProposalsRequest,
         DeleteArtifactRequest, DeleteKnowledgeCardRequest, ImportReferenceTextRequest,
         LedgerContinuityCheckRequest, ListActionProposalsRequest, ListAdoptionProposalsRequest,
-        ListModelsInput, PrepareArtifactAdoptionsRequest, RebuildStoryIndexRequest,
-        RebuildStorySearchIndexRequest, RetryIndexJobsRequest, RevisionRequest,
-        RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider, SaveAiSettings,
-        SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest,
-        StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextSearchInput,
-        TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
+        ListModelsInput, OrchestratorTurnRequest, PrepareArtifactAdoptionsRequest,
+        RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, RetryIndexJobsRequest,
+        RevisionRequest, RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider,
+        SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill,
+        SpanReplacementRequest, StoryBibleReviewRequest, StoryContextRerankRequest,
+        StoryContextSearchInput, TestAiConnectionInput, UpdateAdoptionProposalRequest,
+        UpdateReferenceMaterialRequest,
     },
 };
 
@@ -441,6 +442,12 @@ async fn dispatch_command(
         "start_agent_run" => {
             let input: AgentRunRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.start_agent_run(input).await?)?)
+        }
+        "start_orchestrator_turn" => {
+            let input: OrchestratorTurnRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                gateway.start_orchestrator_turn(input).await?,
+            )?)
         }
         "start_story_architect_run" => {
             let input: RunStoryArchitectRequest = read_required(&payload, "input")?;

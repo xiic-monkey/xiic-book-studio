@@ -45,9 +45,9 @@ use commands::{
     rerank_story_context, reset_agent_prompt, retry_index_jobs, review_project_continuity,
     review_story_bible, revise_artifact_span_with_ai, save_agent_settings, save_ai_provider,
     save_ai_settings, save_foreshadowing, save_knowledge_card, save_writing_skill, search_story,
-    search_story_context, search_story_facts, start_agent_run, start_revision_run,
-    start_story_architect_run, test_ai_connection, update_adoption_proposal, update_chapter,
-    update_project, update_reference_material,
+    search_story_context, search_story_facts, start_agent_run, start_orchestrator_turn,
+    start_revision_run, start_story_architect_run, test_ai_connection, update_adoption_proposal,
+    update_chapter, update_project, update_reference_material,
 };
 use db::AppState;
 use tauri::{Emitter, Manager};
@@ -136,6 +136,7 @@ pub fn run() {
             rerank_story_context,
             preview_agent_run,
             start_agent_run,
+            start_orchestrator_turn,
             start_story_architect_run,
             start_revision_run,
             cancel_agent_run,

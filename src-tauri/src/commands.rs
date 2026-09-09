@@ -14,16 +14,17 @@ use crate::{
         DeleteKnowledgeCardRequest, DerivedIndexJob, Foreshadowing, HistoryCleanupResult,
         ImportReferenceTextRequest, KnowledgeCard, LedgerContinuityCheckRequest,
         LedgerContinuityReport, ListActionProposalsRequest, ListAdoptionProposalsRequest,
-        ListModelsInput, NewChapter, NewProject, PrepareArtifactAdoptionsRequest, PreparedContext,
-        Project, ProjectDetail, ProjectUpdate, ProjectWorkspace, ProposalApplyResult,
-        ProviderCapabilities, QualityReport, RebuildStoryIndexRequest,
-        RebuildStorySearchIndexRequest, ReferenceMaterial, RetryIndexJobsRequest, RevisionRequest,
-        RunEvent, RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider, SaveAiSettings,
-        SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest, StoryBible,
-        StoryBibleReview, StoryBibleReviewRequest, StoryContextRerankRequest,
-        StoryContextRerankResult, StoryContextSearchInput, StoryContextSnippet,
-        StoryFactSearchResult, StoryIndexSummary, TestAiConnectionInput,
-        UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest, WritingSkill,
+        ListModelsInput, NewChapter, NewProject, OrchestratorTurnRequest, OrchestratorTurnResponse,
+        PrepareArtifactAdoptionsRequest, PreparedContext, Project, ProjectDetail, ProjectUpdate,
+        ProjectWorkspace, ProposalApplyResult, ProviderCapabilities, QualityReport,
+        RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, ReferenceMaterial,
+        RetryIndexJobsRequest, RevisionRequest, RunEvent, RunStoryArchitectRequest,
+        SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
+        SaveWritingSkill, SpanReplacementRequest, StoryBible, StoryBibleReview,
+        StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextRerankResult,
+        StoryContextSearchInput, StoryContextSnippet, StoryFactSearchResult, StoryIndexSummary,
+        TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
+        WritingSkill,
     },
 };
 
@@ -475,6 +476,14 @@ pub async fn start_agent_run(
     input: AgentRunRequest,
 ) -> AppResult<AgentRunSummary> {
     gateway.start_agent_run(input).await
+}
+
+#[tauri::command]
+pub async fn start_orchestrator_turn(
+    gateway: State<'_, ApplicationGateway>,
+    input: OrchestratorTurnRequest,
+) -> AppResult<OrchestratorTurnResponse> {
+    gateway.start_orchestrator_turn(input).await
 }
 
 #[tauri::command]

@@ -56,7 +56,9 @@ pub fn definitions_for_agent(
                     && matches!(stage, Stage::Setting | Stage::Outline | Stage::Characters)
                     && matches!(
                         definition.key.as_str(),
-                        agent_tools::PROPOSE_KNOWLEDGE_CARD
+                        agent_tools::CREATE_KNOWLEDGE_CARD
+                            | agent_tools::UPDATE_KNOWLEDGE_CARD
+                            | agent_tools::PROPOSE_KNOWLEDGE_CARD
                             | agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD
                     ))
         })
@@ -844,9 +846,10 @@ async fn execute_call(
             &call.arguments,
             None,
         ),
-        agent_tools::PROPOSE_KNOWLEDGE_CARD => {
-            if context.agent.stage == "story_architect" && context.run_id.is_some() {
+        agent_tools::CREATE_KNOWLEDGE_CARD | agent_tools::PROPOSE_KNOWLEDGE_CARD => {
+            if is_direct_story_architect_run(context) {
                 let category = required_string(&call.arguments, "category")?;
+                validate_story_architect_card_category(context.stage, &category)?;
                 let title = required_string(&call.arguments, "title")?;
                 let content = required_string(&call.arguments, "content")?;
                 let card = context.state.save_knowledge_card(SaveKnowledgeCard {
@@ -859,6 +862,7 @@ async fn execute_call(
                     source_artifact_id: context.source_artifact_id,
                     source_chapter_id: context.chapter_id,
                 })?;
+                crate::index_jobs::enqueue_project_search_job(context.state, context.project_id)?;
                 Ok((
                     json!({"card_id": card.id, "status": card.status, "title": card.title}),
                     Vec::new(),
@@ -875,13 +879,14 @@ async fn execute_call(
                 )
             }
         }
-        agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD => {
+        agent_tools::UPDATE_KNOWLEDGE_CARD | agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD => {
             let card_id = required_i64(&call.arguments, "card_id")?;
             let card = context
                 .state
                 .get_knowledge_card(context.project_id, card_id)?;
-            if context.agent.stage == "story_architect" && context.run_id.is_some() {
+            if is_direct_story_architect_run(context) {
                 let category = required_string(&call.arguments, "category")?;
+                validate_story_architect_card_category(context.stage, &category)?;
                 let title = required_string(&call.arguments, "title")?;
                 let content = required_string(&call.arguments, "content")?;
                 let updated = context.state.save_knowledge_card(SaveKnowledgeCard {
@@ -894,6 +899,7 @@ async fn execute_call(
                     source_artifact_id: context.source_artifact_id,
                     source_chapter_id: context.chapter_id,
                 })?;
+                crate::index_jobs::enqueue_project_search_job(context.state, context.project_id)?;
                 Ok((
                     json!({"card_id": updated.id, "status": updated.status, "title": updated.title}),
                     Vec::new(),
@@ -934,6 +940,42 @@ async fn execute_call(
             "未注册的工具：{}",
             call.tool_key
         ))),
+    }
+}
+
+fn is_direct_story_architect_run(context: &ToolExecutionContext<'_>) -> bool {
+    context.agent.stage == "story_architect"
+        && context.run_id.is_some()
+        && matches!(
+            context.stage,
+            Stage::Setting | Stage::Outline | Stage::Characters
+        )
+        && !context.preview
+}
+
+fn validate_story_architect_card_category(stage: &Stage, category: &str) -> AppResult<()> {
+    let allowed: &[&str] = match stage {
+        Stage::Setting => &[
+            "world",
+            "cultivation",
+            "map",
+            "faction",
+            "taboo",
+            "item",
+            "rule",
+        ],
+        Stage::Outline => &["outline", "chapter_plan"],
+        Stage::Characters => &["character"],
+        _ => return Ok(()),
+    };
+    if allowed.contains(&category) {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "当前{}阶段不允许创建 {} 类型知识卡；请把内容放入对应阶段",
+            stage.title(),
+            category
+        )))
     }
 }
 
@@ -1058,5 +1100,38 @@ mod tests {
             &json!({"stage": "draft", "title": "标题", "content": "内容"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn story_architect_card_categories_follow_stage_boundaries() {
+        assert!(validate_story_architect_card_category(&Stage::Setting, "world").is_ok());
+        assert!(validate_story_architect_card_category(&Stage::Setting, "rule").is_ok());
+        assert!(validate_story_architect_card_category(&Stage::Setting, "outline").is_err());
+        assert!(validate_story_architect_card_category(&Stage::Setting, "chapter_plan").is_err());
+        assert!(validate_story_architect_card_category(&Stage::Outline, "outline").is_ok());
+        assert!(validate_story_architect_card_category(&Stage::Outline, "world").is_err());
+        assert!(validate_story_architect_card_category(&Stage::Characters, "character").is_ok());
+        assert!(validate_story_architect_card_category(&Stage::Characters, "faction").is_err());
+    }
+
+    #[test]
+    fn story_architect_implicitly_receives_card_tools_only_for_foundation_stages() {
+        let mut agent = agent(&[]);
+        agent.stage = "story_architect".to_string();
+
+        let setting = definitions_for_agent(&agent, &Stage::Setting, false);
+        for key in [
+            agent_tools::CREATE_KNOWLEDGE_CARD,
+            agent_tools::UPDATE_KNOWLEDGE_CARD,
+            agent_tools::PROPOSE_KNOWLEDGE_CARD,
+            agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD,
+        ] {
+            assert!(setting.iter().any(|definition| definition.key == key));
+        }
+
+        let preview = definitions_for_agent(&agent, &Stage::Setting, true);
+        assert!(preview.is_empty());
+        let draft = definitions_for_agent(&agent, &Stage::Draft, false);
+        assert!(draft.is_empty());
     }
 }

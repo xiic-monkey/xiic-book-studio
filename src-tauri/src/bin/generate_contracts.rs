@@ -53,6 +53,9 @@ fn render() -> String {
     output.push_str(&declaration::<ActionProposal>());
     output.push_str(&declaration::<ProposalApplyResult>());
     output.push_str(&declaration::<ProviderCapabilities>());
+    output.push_str(&declaration::<OrchestratorTask>());
+    output.push_str(&declaration::<OrchestratorTurnRequest>());
+    output.push_str(&declaration::<OrchestratorTurnResponse>());
     output.push_str(&declaration::<AgentRunSummary>());
     output.push_str(&declaration::<RunEvent>());
     output.push_str(&declaration::<ActiveAgentRun>());

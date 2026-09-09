@@ -279,6 +279,14 @@ pub struct WorkflowRun {
     pub error: Option<String>,
     pub elapsed_ms: i64,
     pub created_at: String,
+    #[serde(default)]
+    pub parent_run_id: Option<i64>,
+    #[serde(default)]
+    pub agent_key: Option<String>,
+    #[serde(default)]
+    pub run_kind: String,
+    #[serde(default)]
+    pub task_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -292,6 +300,14 @@ pub struct WorkflowRunSummary {
     pub elapsed_ms: i64,
     pub output_chars: usize,
     pub created_at: String,
+    #[serde(default)]
+    pub parent_run_id: Option<i64>,
+    #[serde(default)]
+    pub agent_key: Option<String>,
+    #[serde(default)]
+    pub run_kind: String,
+    #[serde(default)]
+    pub task_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1142,6 +1158,32 @@ pub struct ProviderCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct OrchestratorTask {
+    pub task_type: String,
+    pub title: String,
+    pub instruction: String,
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
+    pub chapter_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct OrchestratorTurnRequest {
+    pub project_id: i64,
+    pub chapter_id: Option<i64>,
+    pub message: String,
+    pub stage: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct OrchestratorTurnResponse {
+    pub kind: String,
+    pub answer: Option<String>,
+    pub parent_run: Option<WorkflowRun>,
+    pub tasks: Vec<WorkflowRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AgentRunSummary {
     pub run: WorkflowRun,
     pub artifact: Option<Artifact>,
@@ -1168,6 +1210,14 @@ pub struct RunEvent {
     pub tool_invocation_id: Option<i64>,
     pub elapsed_ms: Option<i64>,
     pub created_at: String,
+    #[serde(default)]
+    pub parent_run_id: Option<i64>,
+    #[serde(default)]
+    pub agent_key: Option<String>,
+    #[serde(default)]
+    pub agent_role: Option<String>,
+    #[serde(default)]
+    pub task_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

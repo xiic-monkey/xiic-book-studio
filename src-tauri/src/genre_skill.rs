@@ -242,6 +242,28 @@ mod tests {
             detect_genre_skill("都市生活"),
             GenreSkillKind::GeneralSerialized
         );
+        assert_eq!(
+            detect_genre_skill("科幻"),
+            GenreSkillKind::GeneralSerialized
+        );
+        assert_eq!(
+            detect_genre_skill("奇幻"),
+            GenreSkillKind::GeneralSerialized
+        );
+        assert_eq!(
+            detect_genre_skill("历史"),
+            GenreSkillKind::GeneralSerialized
+        );
+    }
+
+    #[test]
+    fn more_specific_genre_markers_win_when_genre_is_composite() {
+        assert_eq!(detect_genre_skill("都市悬疑"), GenreSkillKind::Mystery);
+        assert_eq!(detect_genre_skill("都市异能悬疑"), GenreSkillKind::Mystery);
+        assert_eq!(
+            detect_genre_skill("都市异能升级流"),
+            GenreSkillKind::XianxiaPowerFantasy
+        );
     }
 
     #[test]

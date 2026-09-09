@@ -1231,6 +1231,22 @@ mod tests {
     }
 
     #[test]
+    fn extraction_parser_accepts_empty_array_and_embedded_array() {
+        assert!(parse_extracted_candidates("[]").unwrap().is_empty());
+        let parsed = parse_extracted_candidates(
+            "整理结果如下：[{\"target_kind\":\"knowledge_card\",\"data\":{\"category\":\"world\",\"title\":\"矿场\",\"content\":\"事实\"},\"evidence_quote\":\"事实\"}]",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn extraction_parser_rejects_missing_json_array() {
+        let error = parse_extracted_candidates("没有候选").unwrap_err();
+        assert!(error.to_string().contains("JSON 数组"));
+    }
+
+    #[test]
     fn pending_candidate_does_not_enter_canonical_library() {
         let state = test_state();
         let artifact = approved_artifact(&state, "宁烬来自黑石矿场。");

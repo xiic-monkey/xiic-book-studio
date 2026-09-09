@@ -1,6 +1,7 @@
 pub const V2_COMMANDS: &[(&str, &str)] = &[
     ("previewAgentRun", "preview_agent_run"),
     ("startAgentRun", "start_agent_run"),
+    ("startOrchestratorTurn", "start_orchestrator_turn"),
     ("startStoryArchitectRun", "start_story_architect_run"),
     ("startRevisionRun", "start_revision_run"),
     ("cancelAgentRun", "cancel_agent_run"),

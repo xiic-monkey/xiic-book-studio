@@ -9,6 +9,27 @@ const URBAN_SUPERNATURAL_PROMPT: &str = "你是都市异能小说专属 Agent。
 const MYSTERY_PROMPT: &str = "你是悬疑小说专属 Agent。你长期负责谜面、证据链、知情差、嫌疑变化与解释竞争。所有阶段都要维护线索来源、角色知情边界、推理可追溯性和公平性；不得默认存在异能体系，也不能用无来源的新证据制造反转。";
 const XIANXIA_PROMPT: &str = "你是男频修仙/玄幻升级流专属 Agent。你长期负责资源循环、修炼成长、压迫链、能力合同和阶段性收益驱动的项目。所有阶段都要维护实力边界、资源来源、升级代价和爽点兑现；不能把一次性触发偷换成永久能力。";
 
+pub const COMPOSED_AGENT_KEYS: &[&str] = &[
+    "story_architect",
+    "draft",
+    "review",
+    "revision",
+    "orchestrator",
+];
+
+pub const RAW_AGENT_KEYS: &[&str] = &[
+    "chapter_memory",
+    "continuity_ledger",
+    "continuity_check",
+    "story_index",
+    "adoption",
+    "context_search_plan",
+    "context_search_rerank",
+    "artifact_revision",
+    "continuity_review",
+    "chapter_split_plan",
+];
+
 const BASE_AGENT_PROTOCOL: &str = r#"这是所有 Agent 共享、优先级最高的工作协议：
 1. 事实优先级依次为：已通过正式正文与带来源引文的状态记录；已通过创作基准、设定、大纲和角色资料；本次人工指令；题材与写作 Skill。Skill 只能提供方法，不能补充本书事实。
 2. 未经人工通过的候选稿、试读意见和模型推测都不是 Canon。你只能生成候选产物，不能替人工确认，也不能宣称已经写入正式资料。
@@ -112,6 +133,26 @@ pub fn compose_stage_agent(mut stage_agent: Agent, profile: &GenreAgentProfile) 
 mod tests {
     use super::*;
 
+    fn test_agent(stage: &str) -> Agent {
+        Agent {
+            id: 1,
+            stage: stage.to_string(),
+            name: stage.to_string(),
+            role: "测试 Agent".to_string(),
+            editable_role: "测试 Agent".to_string(),
+            system_prompt: "阶段任务".to_string(),
+            editable_system_prompt: "阶段任务".to_string(),
+            temperature: 0.7,
+            provider_base_url: "https://api.example.com".to_string(),
+            model: "example-model".to_string(),
+            thinking_enabled: false,
+            thinking_level: "off".to_string(),
+            uses_global_runtime_settings: false,
+            enabled_tool_keys: crate::agent_tools::default_keys(),
+            allowed_skill_keys: vec!["continuity_and_agency".to_string()],
+        }
+    }
+
     #[test]
     fn routes_supported_genres_to_specialists() {
         assert_eq!(
@@ -181,5 +222,50 @@ mod tests {
         assert!(agent.role.contains("写正文"));
         assert!(!agent.editable_role.contains("男频修仙/玄幻升级流"));
         assert_eq!(agent.editable_role, "写正文");
+    }
+
+    #[test]
+    fn route_registry_covers_fifteen_agents_without_overlap() {
+        let composed = COMPOSED_AGENT_KEYS
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let raw = RAW_AGENT_KEYS
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(COMPOSED_AGENT_KEYS.len(), 5);
+        assert_eq!(RAW_AGENT_KEYS.len(), 10);
+        assert_eq!(composed.len(), COMPOSED_AGENT_KEYS.len());
+        assert_eq!(raw.len(), RAW_AGENT_KEYS.len());
+        assert!(composed.is_disjoint(&raw));
+        let registered = crate::prompt_templates::BUILTIN_AGENT_KEYS
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let routed = COMPOSED_AGENT_KEYS
+            .iter()
+            .chain(RAW_AGENT_KEYS.iter())
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(registered, routed);
+    }
+
+    #[test]
+    fn every_composed_agent_receives_shared_protocol_and_stage_prompt() {
+        let profile = detect_genre_agent("悬疑").unwrap();
+        for key in COMPOSED_AGENT_KEYS {
+            let agent = compose_stage_agent(test_agent(key), &profile);
+            assert!(
+                agent.system_prompt.starts_with("# 共享 Agent 协议"),
+                "{key}"
+            );
+            assert!(
+                agent.system_prompt.contains("# 题材专属 Agent 身份"),
+                "{key}"
+            );
+            assert!(agent.system_prompt.contains("# 当前工作模式"), "{key}");
+            assert!(agent.system_prompt.contains("阶段任务"), "{key}");
+        }
     }
 }

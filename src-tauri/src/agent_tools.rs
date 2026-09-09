@@ -16,6 +16,8 @@ pub const WEB_SEARCH: &str = "web_search";
 pub const PROPOSE_CREATE_CHAPTER: &str = "propose_create_chapter";
 pub const PROPOSE_RENAME_CHAPTER: &str = "propose_rename_chapter";
 pub const PROPOSE_ARTIFACT_CANDIDATE: &str = "propose_artifact_candidate";
+pub const CREATE_KNOWLEDGE_CARD: &str = "create_knowledge_card";
+pub const UPDATE_KNOWLEDGE_CARD: &str = "update_knowledge_card";
 pub const PROPOSE_KNOWLEDGE_CARD: &str = "propose_knowledge_card";
 pub const PROPOSE_UPDATE_KNOWLEDGE_CARD: &str = "propose_update_knowledge_card";
 pub const PROPOSE_DELETE_KNOWLEDGE_CARD: &str = "propose_delete_knowledge_card";
@@ -333,6 +335,45 @@ pub fn definitions() -> Vec<AgentToolDefinition> {
                     "content": {"type": "string", "minLength": 1}
                 },
                 "required": ["stage", "title", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            CREATE_KNOWLEDGE_CARD,
+            "创建知识卡",
+            "直接创建一张结构化知识卡；仅故事架构 Agent 可用，卡片会以待确认状态写入当前项目数据库。",
+            "资料卡写入",
+            "proposal",
+            BOOK_STAGES,
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "content": {"type": "string", "minLength": 1}
+                },
+                "required": ["category", "title", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            UPDATE_KNOWLEDGE_CARD,
+            "更新知识卡",
+            "直接更新当前项目中的结构化知识卡；仅故事架构 Agent 可用。",
+            "资料卡写入",
+            "proposal",
+            BOOK_STAGES,
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "card_id": {"type": "integer", "minimum": 1},
+                    "category": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "content": {"type": "string", "minLength": 1}
+                },
+                "required": ["card_id", "category", "title", "content"],
                 "additionalProperties": false
             }),
         ),

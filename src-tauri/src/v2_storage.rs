@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-const V2_SCHEMA_VERSION: i64 = 6;
+const V2_SCHEMA_VERSION: i64 = 8;
 
 pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
@@ -51,6 +51,14 @@ pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
             apply_migration(conn, 6, migrate_v6)?;
             current = 6;
         }
+        if current < 7 {
+            apply_migration(conn, 7, migrate_v7)?;
+            current = 7;
+        }
+        if current < 8 {
+            apply_migration(conn, 8, migrate_v8)?;
+            current = 8;
+        }
         debug_assert!(V2_SCHEMA_VERSION >= current);
         Ok(())
     })
@@ -61,6 +69,48 @@ fn migrate_v5(conn: &Connection) -> AppResult<()> {
         "ALTER TABLE agent_run_events ADD COLUMN tool_key TEXT;
          ALTER TABLE agent_run_events ADD COLUMN tool_invocation_id INTEGER;
          ALTER TABLE agent_run_events ADD COLUMN elapsed_ms INTEGER;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v7(conn: &Connection) -> AppResult<()> {
+    for (column, definition) in [
+        ("parent_run_id", "INTEGER"),
+        ("agent_key", "TEXT"),
+        ("run_kind", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("task_title", "TEXT"),
+    ] {
+        if !column_exists(conn, "workflow_runs", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE workflow_runs ADD COLUMN {column} {definition};"
+            ))?;
+        }
+    }
+    for (column, definition) in [
+        ("parent_run_id", "INTEGER"),
+        ("agent_key", "TEXT"),
+        ("agent_role", "TEXT"),
+        ("task_title", "TEXT"),
+    ] {
+        if !column_exists(conn, "agent_run_events", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE agent_run_events ADD COLUMN {column} {definition};"
+            ))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent ON workflow_runs(parent_run_id, id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v8(conn: &Connection) -> AppResult<()> {
+    let prompt = crate::prompt_templates::require_default_prompt("orchestrator")?;
+    conn.execute(
+        "INSERT INTO agents (stage, name, role, system_prompt, temperature)
+         VALUES ('orchestrator', '主 Agent', '负责对话理解、只读检索和子任务编排；不直接修改项目数据', ?1, 0.2)
+         ON CONFLICT(stage) DO NOTHING",
+        params![prompt],
     )?;
     Ok(())
 }
@@ -361,7 +411,7 @@ impl AppState {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, project_id, chapter_id, stage, status, error, elapsed_ms,
-                        length(output), created_at
+                        length(output), created_at, parent_run_id, agent_key, run_kind, task_title
                  FROM workflow_runs
                  WHERE project_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -379,6 +429,10 @@ impl AppState {
                     elapsed_ms: row.get(6)?,
                     output_chars: output_chars.max(0) as usize,
                     created_at: row.get(8)?,
+                    parent_run_id: row.get(9)?,
+                    agent_key: row.get(10)?,
+                    run_kind: row.get(11)?,
+                    task_title: row.get(12)?,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -389,7 +443,7 @@ impl AppState {
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT id, project_id, chapter_id, stage, input, output, status, error,
-                        elapsed_ms, created_at
+                        elapsed_ms, created_at, parent_run_id, agent_key, run_kind, task_title
                  FROM workflow_runs WHERE id = ?1",
                 [run_id],
                 |row| {
@@ -404,6 +458,10 @@ impl AppState {
                         error: row.get(7)?,
                         elapsed_ms: row.get(8)?,
                         created_at: row.get(9)?,
+                        parent_run_id: row.get(10)?,
+                        agent_key: row.get(11)?,
+                        run_kind: row.get(12)?,
+                        task_title: row.get(13)?,
                     })
                 },
             )
@@ -842,9 +900,13 @@ impl AppState {
             conn.execute(
                 "INSERT INTO agent_run_events
                     (run_id, project_id, chapter_id, stage, sequence, kind, delta, status, error,
-                     tool_key, tool_invocation_id, elapsed_ms, created_at)
+                     tool_key, tool_invocation_id, elapsed_ms, parent_run_id, agent_key, agent_role, task_title, created_at)
                  VALUES (?1, ?2, ?3, COALESCE((SELECT stage FROM workflow_runs WHERE id = ?1), ''),
-                         ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         (SELECT parent_run_id FROM workflow_runs WHERE id = ?1),
+                         (SELECT agent_key FROM workflow_runs WHERE id = ?1),
+                         (SELECT agent_key FROM workflow_runs WHERE id = ?1),
+                         (SELECT task_title FROM workflow_runs WHERE id = ?1), ?12)",
                 params![
                     run_id,
                     project_id,
@@ -1471,7 +1533,7 @@ fn map_action_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionPropos
 }
 
 const RUN_EVENT_SELECT: &str = "SELECT id, run_id, project_id, chapter_id, stage, sequence, kind,
-    delta, status, error, tool_key, tool_invocation_id, elapsed_ms, created_at FROM agent_run_events";
+    delta, status, error, tool_key, tool_invocation_id, elapsed_ms, parent_run_id, agent_key, agent_role, task_title, created_at FROM agent_run_events";
 
 fn query_run_event(conn: &Connection, id: i64) -> AppResult<RunEvent> {
     conn.query_row(
@@ -1496,7 +1558,11 @@ fn map_run_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunEvent> {
         tool_key: row.get(10)?,
         tool_invocation_id: row.get(11)?,
         elapsed_ms: row.get(12)?,
-        created_at: row.get(13)?,
+        parent_run_id: row.get(13)?,
+        agent_key: row.get(14)?,
+        agent_role: row.get(15)?,
+        task_title: row.get(16)?,
+        created_at: row.get(17)?,
     })
 }
 

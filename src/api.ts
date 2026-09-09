@@ -34,6 +34,7 @@ import type {
   NewProject,
   NewChapter,
   ModelInfo,
+  OrchestratorTurnResponse,
   PreparedContext,
   Project,
   ProjectUpdate,
@@ -212,6 +213,12 @@ export const api = {
     reference_selection?: ReferenceSelection | null;
     prepared_context_id?: number | null;
   }) => invokeCommand<AgentRunSummary>(V2_COMMANDS.startAgentRun, { input }),
+  startOrchestratorTurn: (input: {
+    project_id: number;
+    chapter_id?: number | null;
+    message: string;
+    stage?: string | null;
+  }) => invokeCommand<OrchestratorTurnResponse>(V2_COMMANDS.startOrchestratorTurn, { input }),
   startStoryArchitectRun: (input: {
     project_id: number;
     mode: StoryArchitectMode;
