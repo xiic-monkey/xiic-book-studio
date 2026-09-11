@@ -1164,6 +1164,9 @@ pub struct OrchestratorTask {
     pub instruction: String,
     #[serde(default)]
     pub depends_on: Vec<usize>,
+    #[serde(default)]
+    pub source_artifact_id: Option<i64>,
+    #[serde(default)]
     pub chapter_id: Option<i64>,
 }
 
@@ -1422,6 +1425,7 @@ pub struct ContinuityIssue {
     pub chapters: Vec<String>,
     pub reason: String,
     pub suggestion: String,
+    pub evidence_quote: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

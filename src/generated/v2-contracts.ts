@@ -83,7 +83,7 @@ export type ProposalApplyResult = { proposal: ActionProposal, entity_kind: strin
 
 export type ProviderCapabilities = { provider_base_url: string, configured_protocol: ToolProtocol, detected_protocol: ToolProtocol | null, last_error: string | null, updated_at: string | null, };
 
-export type OrchestratorTask = { task_type: string, title: string, instruction: string, depends_on: Array<number>, chapter_id: number | null, };
+export type OrchestratorTask = { task_type: string, title: string, instruction: string, depends_on: Array<number>, source_artifact_id: number | null, chapter_id: number | null, };
 
 export type OrchestratorTurnRequest = { project_id: number, chapter_id: number | null, message: string, stage: string | null, };
 

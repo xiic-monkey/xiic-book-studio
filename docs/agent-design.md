@@ -8,18 +8,20 @@
 
 `story_architect`、`draft`、`review`、`revision`、`orchestrator`
 
-这些 Agent 通过 `get_agent_for_project_stage` 获取。数据库先读取项目题材 profile，再由 `compose_stage_agent` 按以下顺序生成最终 Agent：
+这些 Agent 通过 `get_agent_for_project_stage` 获取。数据库先读取项目题材 profile，再由 `compose_stage_agent` 按以下顺序生成最终 system prompt：
 
-1. 共享事实与 Canon 边界协议；
+1. 原始阶段 Agent 的身份和任务；
 2. 题材专属 Agent 身份；
 3. 题材 profile 允许的 Skill 白名单；
-4. 原始阶段 Agent 的身份和任务。
+4. 仅合成路径使用的共享事实与 Canon 边界协议。
+
+共享协议放在 system prompt 的末尾，作为合成路径的统一边界；实际题材 Skill 内容、项目资料和阶段行为由运行时 user prompt 追加。
 
 ### 裸 Agent 路径（10 个）
 
 `chapter_memory`、`continuity_ledger`、`continuity_check`、`story_index`、`adoption`、`context_search_plan`、`context_search_rerank`、`artifact_revision`、`continuity_review`、`chapter_split_plan`
 
-这些 Agent 直接通过 `get_agent` 获取，不自动继承 `BASE_AGENT_PROTOCOL`。它们的业务契约主要由运行时 user prompt、解析器和校验逻辑提供。新增副 Agent 时必须明确登记其入口、输出契约和验证位置，不应默认复制完整题材协议。
+这些 Agent 直接通过 `get_agent` 获取，不自动继承 `COMPOSED_AGENT_PROTOCOL`。它们的业务契约主要由运行时 user prompt、解析器和校验逻辑提供。新增副 Agent 时必须明确登记其入口、输出契约和验证位置，不应默认复制完整题材协议。
 
 路由清单位于 `src-tauri/src/genre_agent.rs`，内置 Agent 总表位于 `src-tauri/src/prompt_templates.rs`；测试会验证两者数量、唯一性和全集一致。
 
@@ -27,7 +29,7 @@
 
 ### 静态 Agent prompt
 
-静态 prompt 负责身份、长期职责和少量不可误解的输出边界。它不应复制已有的阶段业务格式、数据库字段约束或运行时上下文。
+静态 prompt 负责身份、长期职责，以及没有运行时 canonical source 时才需要保留的机器输出边界（例如 adoption 的 JSON 外形）。它不应复制已有的阶段业务格式、数据库字段约束或运行时上下文。
 
 ### 运行时 user prompt
 
@@ -37,7 +39,7 @@
 
 Rust 解析器和数据库边界是最终事实来源。模型遵守的格式必须在代码侧再次解析、校验、归一化和检查项目归属。Prompt 不能替代安全校验。
 
-`adoption` 是机器可读输出的例外重点：其 prompt 声明 JSON 数组和候选字段，`parse_extracted_candidates`、`normalize_data`、证据引文校验和外键校验共同决定候选是否可进入待人工确认流程。
+`adoption` 是机器可读输出的例外重点：其 prompt 声明 `{"items":[...]}` 对象、候选字段和空结果形式，`parse_extracted_candidates`、`normalize_data`、证据引文校验和外键校验共同决定候选是否可进入待人工确认流程；解析器仍兼容旧数组和代码围栏，不能把兼容路径当作 prompt 契约。
 
 ## 3. 题材合成与 Skill
 

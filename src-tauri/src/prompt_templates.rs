@@ -83,12 +83,15 @@ mod tests {
     fn adoption_prompt_declares_machine_readable_contract() {
         let prompt = require_default_prompt("adoption").unwrap();
         for fragment in [
-            "只返回一个 JSON 数组",
-            "没有可安全采纳的候选时返回 `[]`",
+            "只返回一个 JSON 对象",
+            "items",
+            "没有可安全采纳的候选时返回 `{\"items\":[]}`",
             "target_kind",
             "target_id",
             "operation",
             "data",
+            "knowledge_card` 允许 `category`、`title`、`content`、`source_chapter_id",
+            "foreshadowing` 允许 `title`、`content`、`planted_chapter_id",
             "evidence_quote",
             "knowledge_card",
             "foreshadowing",
@@ -100,5 +103,16 @@ mod tests {
                 "missing adoption prompt fragment: {fragment}"
             );
         }
+    }
+
+    #[test]
+    fn stage_output_contracts_live_in_runtime_prompts() {
+        let draft = require_default_prompt("draft").unwrap();
+        let revision = require_default_prompt("revision").unwrap();
+        let artifact_revision = require_default_prompt("artifact_revision").unwrap();
+
+        assert!(!draft.contains("只输出章节正文"));
+        assert!(!revision.contains("只输出修订后的完整正文"));
+        assert!(!artifact_revision.contains("只输出替换后的新片段正文"));
     }
 }

@@ -22,6 +22,7 @@ const FORESHADOWING: &str = "foreshadowing";
 const PENDING: &str = "pending";
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExtractedCandidate {
     #[serde(alias = "target")]
     target_kind: String,
@@ -31,6 +32,12 @@ struct ExtractedCandidate {
     operation: String,
     data: Value,
     evidence_quote: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractedCandidateEnvelope {
+    items: Vec<ExtractedCandidate>,
 }
 
 fn default_operation() -> String {
@@ -81,7 +88,7 @@ pub async fn prepare_artifact_adoptions(
         artifact.title,
         artifact.content
     );
-    let output = ai::complete_chat(
+    let output = ai::complete_json_chat(
         &settings,
         &api_key,
         &agent.system_prompt,
@@ -859,12 +866,20 @@ fn parse_extracted_candidates(raw: &str) -> AppResult<Vec<ExtractedCandidate>> {
         .strip_suffix("```")
         .unwrap_or(without_prefix)
         .trim();
-    if let Ok(items) = serde_json::from_str(candidate) {
+    if let Ok(envelope) = serde_json::from_str::<ExtractedCandidateEnvelope>(candidate) {
+        return Ok(envelope.items);
+    }
+    if let Ok(items) = serde_json::from_str::<Vec<ExtractedCandidate>>(candidate) {
         return Ok(items);
+    }
+    if candidate.starts_with('{') {
+        return Err(AppError::Validation(
+            "资料整理 Agent 返回的 JSON 对象不符合 items 契约".to_string(),
+        ));
     }
     let start = candidate
         .find('[')
-        .ok_or_else(|| AppError::Validation("资料整理 Agent 未返回 JSON 数组".to_string()))?;
+        .ok_or_else(|| AppError::Validation("资料整理 Agent 未返回 JSON 对象或数组".to_string()))?;
     let end = candidate
         .rfind(']')
         .ok_or_else(|| AppError::Validation("资料整理 Agent 返回的 JSON 不完整".to_string()))?;
@@ -1234,16 +1249,38 @@ mod tests {
     fn extraction_parser_accepts_empty_array_and_embedded_array() {
         assert!(parse_extracted_candidates("[]").unwrap().is_empty());
         let parsed = parse_extracted_candidates(
-            "整理结果如下：[{\"target_kind\":\"knowledge_card\",\"data\":{\"category\":\"world\",\"title\":\"矿场\",\"content\":\"事实\"},\"evidence_quote\":\"事实\"}]",
+            "整理结果如下：[{\"target_kind\":\"knowledge_card\",\"data\":{\"category\":\"world\",\"title\":\"矿场\",\"content\":\"事实\"},\"evidence_quote\":\"事实\"}]。以上。",
         )
         .unwrap();
         assert_eq!(parsed.len(), 1);
     }
 
     #[test]
-    fn extraction_parser_rejects_missing_json_array() {
+    fn extraction_parser_accepts_json_object_envelope() {
+        let parsed = parse_extracted_candidates(
+            r#"{"items":[{"target_kind":"knowledge_card","data":{"category":"world","title":"矿场","content":"事实"},"evidence_quote":"事实"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn extraction_parser_rejects_missing_json_container() {
         let error = parse_extracted_candidates("没有候选").unwrap_err();
-        assert!(error.to_string().contains("JSON 数组"));
+        assert!(error.to_string().contains("JSON 对象或数组"));
+    }
+
+    #[test]
+    fn extraction_parser_rejects_unknown_contract_fields() {
+        let error =
+            parse_extracted_candidates(r#"{"items":[],"extra":"不能静默忽略"}"#).unwrap_err();
+        assert!(error.to_string().contains("items 契约"));
+
+        let error = parse_extracted_candidates(
+            r#"{"items":[{"target_kind":"knowledge_card","data":{},"evidence_quote":"事实","extra":true}]}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("items 契约"));
     }
 
     #[test]

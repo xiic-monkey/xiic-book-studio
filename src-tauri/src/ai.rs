@@ -653,22 +653,39 @@ pub async fn list_models(settings: &AiSettings, api_key: &str) -> AppResult<Vec<
     }))
 }
 
-pub fn parse_review_issues(raw: &str) -> Vec<ReviewIssue> {
+pub fn parse_review_issues(raw: &str) -> AppResult<Vec<ReviewIssue>> {
     let trimmed = trim_code_fence(raw);
-    if let Ok(json) = serde_json::from_str::<Vec<ReviewIssue>>(trimmed) {
-        return json;
-    }
-
-    if let Some(start) = trimmed.find('[') {
-        if let Some(end) = trimmed.rfind(']') {
-            let slice = &trimmed[start..=end];
-            if let Ok(json) = serde_json::from_str::<Vec<ReviewIssue>>(slice) {
-                return json;
-            }
+    let issues = serde_json::from_str::<Vec<ReviewIssue>>(trimmed).map_err(|error| {
+        AppError::Validation(format!(
+            "试读 Agent 返回的 JSON 不是严格的问题数组：{error}"
+        ))
+    })?;
+    for issue in &issues {
+        if issue.issue_type.trim().is_empty()
+            || issue.location.trim().is_empty()
+            || issue.reason.trim().is_empty()
+            || issue.suggestion.trim().is_empty()
+            || !matches!(issue.severity.as_str(), "minor" | "moderate" | "major")
+        {
+            return Err(AppError::Validation(
+                "试读 Agent 返回的问题字段不完整或 severity 无效".to_string(),
+            ));
+        }
+        let evidence_chars = issue.evidence_quote.trim().chars().count();
+        if !(8..=80).contains(&evidence_chars) {
+            return Err(AppError::Validation(
+                "试读 Agent 返回的问题缺少 8-80 字 evidence_quote".to_string(),
+            ));
+        }
+        if !issue.action_evidence_quote.trim().is_empty()
+            && !(8..=80).contains(&issue.action_evidence_quote.trim().chars().count())
+        {
+            return Err(AppError::Validation(
+                "试读 Agent 返回的 action_evidence_quote 必须是 8-80 字".to_string(),
+            ));
         }
     }
-
-    Vec::new()
+    Ok(issues)
 }
 
 fn build_client() -> AppResult<reqwest::Client> {
@@ -1122,10 +1139,21 @@ mod tests {
 ]
 ```"#;
 
-        let issues = parse_review_issues(raw);
+        let issues = parse_review_issues(raw).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].issue_type, "钩子不足");
         assert_eq!(issues[0].severity, "moderate");
+    }
+
+    #[test]
+    fn rejects_review_prose_instead_of_silently_returning_no_issues() {
+        let error = parse_review_issues("审校结果如下：[]").unwrap_err();
+        assert!(error.to_string().contains("严格的问题数组"));
+    }
+
+    #[test]
+    fn accepts_empty_review_array_as_a_valid_result() {
+        assert!(parse_review_issues("[]").unwrap().is_empty());
     }
 
     #[test]

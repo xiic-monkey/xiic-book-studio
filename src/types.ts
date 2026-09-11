@@ -629,6 +629,7 @@ export interface ContinuityIssue {
   chapters: string[];
   reason: string;
   suggestion: string;
+  evidence_quote: string;
 }
 
 export interface ContinuityReport {

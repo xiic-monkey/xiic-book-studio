@@ -30,12 +30,12 @@ pub const RAW_AGENT_KEYS: &[&str] = &[
     "chapter_split_plan",
 ];
 
-const BASE_AGENT_PROTOCOL: &str = r#"这是所有 Agent 共享、优先级最高的工作协议：
+const COMPOSED_AGENT_PROTOCOL: &str = r#"这是题材合成路径中注入的共享、优先级最高工作协议：
 1. 事实优先级依次为：已通过正式正文与带来源引文的状态记录；已通过创作基准、设定、大纲和角色资料；本次人工指令；题材与写作 Skill。Skill 只能提供方法，不能补充本书事实。
 2. 未经人工通过的候选稿、试读意见和模型推测都不是 Canon。你只能生成候选产物，不能替人工确认，也不能宣称已经写入正式资料。
 3. 资料缺失时保留未知；资料冲突时明确指出冲突或采用不越界的最低事实，不能静默发明解释。
 4. 只完成当前阶段职责。故事架构 Agent 不代写正文，写作 Agent 不修改 Canon，试读 Agent 不编造修法，修订 Agent 不引入来源中不存在的新事实。
-5. 章节结构由本章模式和实际内容决定。允许修炼、恢复、交易、关系、探索和过渡章节；不强制固定场景数、固定中段反转或危险式章末钩子。章节仍需产生可感知的状态变化，并形成自然的结束或延续。"#;
+"#;
 
 pub fn default_genre_agents() -> Vec<GenreAgentProfile> {
     vec![
@@ -114,8 +114,8 @@ pub fn compose_stage_agent(mut stage_agent: Agent, profile: &GenreAgentProfile) 
         .cloned()
         .collect::<Vec<_>>();
     stage_agent.system_prompt = format!(
-        "# 共享 Agent 协议\n{}\n\n# 题材专属 Agent 身份\n{}\n\n你当前绑定的主类型 Skill 是 `{}`。只允许使用白名单 Skill：{}。即使技能库中存在其他题材规则，也不能调用、混合或模仿它们。\n\n# 当前工作模式\n{}",
-        BASE_AGENT_PROTOCOL,
+        "# 当前工作模式\n{}\n\n# 题材专属 Agent 身份\n{}\n\n你当前绑定的主类型 Skill 是 `{}`。只允许使用白名单 Skill：{}。即使技能库中存在其他题材规则，也不能调用、混合或模仿它们。\n\n# 共享 Agent 协议（仅题材合成路径）\n{}",
+        stage_agent.system_prompt,
         profile.system_prompt,
         profile.primary_skill_key,
         if effective_skill_keys.is_empty() {
@@ -123,7 +123,7 @@ pub fn compose_stage_agent(mut stage_agent: Agent, profile: &GenreAgentProfile) 
         } else {
             effective_skill_keys.join("、")
         },
-        stage_agent.system_prompt
+        COMPOSED_AGENT_PROTOCOL
     );
     stage_agent.role = format!("{}；当前工作模式：{}", profile.role, stage_agent.role);
     stage_agent
@@ -206,13 +206,14 @@ mod tests {
             &profile,
         );
 
-        assert!(agent.system_prompt.contains("# 共享 Agent 协议"));
+        assert!(agent
+            .system_prompt
+            .contains("# 共享 Agent 协议（仅题材合成路径）"));
         assert!(agent
             .system_prompt
             .contains("Skill 只能提供方法，不能补充本书事实"));
-        assert!(agent
-            .system_prompt
-            .contains("不强制固定场景数、固定中段反转"));
+        assert!(agent.system_prompt.contains("只完成当前阶段职责"));
+        assert!(!agent.system_prompt.contains("固定中段反转"));
         assert!(agent.system_prompt.contains("# 题材专属 Agent 身份"));
         assert!(agent.system_prompt.contains("# 当前工作模式"));
         assert!(agent
@@ -256,16 +257,23 @@ mod tests {
         let profile = detect_genre_agent("悬疑").unwrap();
         for key in COMPOSED_AGENT_KEYS {
             let agent = compose_stage_agent(test_agent(key), &profile);
-            assert!(
-                agent.system_prompt.starts_with("# 共享 Agent 协议"),
-                "{key}"
-            );
+            assert!(agent.system_prompt.starts_with("# 当前工作模式"), "{key}");
             assert!(
                 agent.system_prompt.contains("# 题材专属 Agent 身份"),
                 "{key}"
             );
-            assert!(agent.system_prompt.contains("# 当前工作模式"), "{key}");
+            assert!(
+                agent
+                    .system_prompt
+                    .contains("# 共享 Agent 协议（仅题材合成路径）"),
+                "{key}"
+            );
             assert!(agent.system_prompt.contains("阶段任务"), "{key}");
+            assert!(
+                agent.system_prompt.find("# 共享 Agent 协议")
+                    > agent.system_prompt.find("# 当前工作模式"),
+                "{key}"
+            );
         }
     }
 }

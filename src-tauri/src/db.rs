@@ -5393,7 +5393,8 @@ mod tests {
             .unwrap();
 
         assert!(skill.content.contains("进入状态、章节模式、目标"));
-        assert!(skill.content.contains("不强制危险、反转或悬念句"));
+        assert!(skill.content.contains("变化可以缓慢形成"));
+        assert!(!skill.content.contains("优先完成一个主要章节功能"));
         assert!(!skill.content.contains("章末必须留下更具体的下一步"));
     }
 
