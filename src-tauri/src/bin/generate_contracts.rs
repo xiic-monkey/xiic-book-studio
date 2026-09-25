@@ -18,6 +18,7 @@ fn render() -> String {
     output.push_str(&declaration::<Project>());
     output.push_str(&declaration::<GenreAgentProfile>());
     output.push_str(&declaration::<Chapter>());
+    output.push_str(&declaration::<ChapterPlan>());
     output.push_str(&declaration::<Artifact>());
     output.push_str(&declaration::<WorkflowRun>());
     output.push_str(&declaration::<WorkflowRunSummary>());
@@ -39,6 +40,9 @@ fn render() -> String {
     output.push_str(&declaration::<StoryArc>());
     output.push_str(&declaration::<CanonIssue>());
     output.push_str(&declaration::<StoryBibleReview>());
+    output.push_str(&declaration::<CurrentPlanConfirmationStatus>());
+    output.push_str(&declaration::<ConfirmCurrentPlanRequest>());
+    output.push_str(&declaration::<CurrentPlanConfirmationResult>());
     output.push_str(&declaration::<AiSettings>());
     output.push_str(&declaration::<ToolKind>());
     output.push_str(&declaration::<AgentToolDefinition>());

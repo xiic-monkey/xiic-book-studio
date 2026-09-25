@@ -359,9 +359,22 @@ export function SettingsView({
       setLocalStorySearchStatus(null);
       return;
     }
-    void onRefreshStorySearchStatus(projectId)
-      .then((status) => setLocalStorySearchStatus(status))
-      .catch(() => setLocalStorySearchStatus(null));
+
+    // Keep the first settings frame free of non-critical backend work.
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void onRefreshStorySearchStatus(projectId)
+        .then((status) => {
+          if (!cancelled) setLocalStorySearchStatus(status);
+        })
+        .catch(() => {
+          if (!cancelled) setLocalStorySearchStatus(null);
+        });
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [projectId]);
 
   useEffect(() => {
@@ -402,23 +415,29 @@ export function SettingsView({
       return;
     }
     let cancelled = false;
-    setLoadingProviderCapabilities(true);
-    setProviderCapabilitiesError(null);
-    void onGetProviderCapabilities(providerBaseUrl)
-      .then((capabilities) => {
-        if (!cancelled) setProviderCapabilities(capabilities);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setProviderCapabilities(null);
-          setProviderCapabilitiesError(String(err));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingProviderCapabilities(false);
-      });
+    // Provider capability detection is only needed by the form controls, so
+    // let the settings shell paint before starting the backend lookup.
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      setLoadingProviderCapabilities(true);
+      setProviderCapabilitiesError(null);
+      void onGetProviderCapabilities(providerBaseUrl)
+        .then((capabilities) => {
+          if (!cancelled) setProviderCapabilities(capabilities);
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setProviderCapabilities(null);
+            setProviderCapabilitiesError(String(err));
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setLoadingProviderCapabilities(false);
+        });
+    }, 0);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [currentProvider?.base_url, onGetProviderCapabilities]);
 

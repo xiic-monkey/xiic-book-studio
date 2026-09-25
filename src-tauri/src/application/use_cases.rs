@@ -76,6 +76,23 @@ impl ApplicationGateway {
         Ok(chapter)
     }
 
+    pub fn save_chapter_plan(&self, input: SaveChapterPlan) -> AppResult<ChapterPlan> {
+        self.state.save_chapter_plan(input)
+    }
+
+    pub fn delete_chapter_plan(&self, input: DeleteChapterPlanRequest) -> AppResult<()> {
+        self.state
+            .delete_chapter_plan(input.project_id, input.plan_id)
+    }
+
+    pub fn create_chapter_from_plan(
+        &self,
+        input: CreateChapterFromPlanRequest,
+    ) -> AppResult<Chapter> {
+        self.state
+            .create_chapter_from_plan(input.project_id, input.plan_id)
+    }
+
     pub fn get_settings(&self) -> AppResult<AiSettings> {
         self.state.get_ai_settings()
     }
@@ -266,13 +283,43 @@ impl ApplicationGateway {
         self.state.list_story_arcs(project_id)
     }
 
-    pub fn approve_stage(
+    /// 审批通过。
+    ///
+    /// 正文阶段（`draft` / `revision`）转正是**不可绕过**的决策点：必须先从质量与
+    /// 连续性门禁拿到 `passed = true` 才允许写入正式稿；门禁未通过时一律拒绝，
+    /// 并回报具体 blocker。
+    ///
+    /// 门禁本身无法完成时同样拒绝（fail-closed）——无法证明达标，即不予转正。
+    /// 门禁编排放在这里而非 `db.rs`，是因为 `gate::analyze_chapter_gate` 需要
+    /// `.await`，而 `db.rs` 的 `with_conn` 闭包无法在持连接期间 await。
+    pub async fn approve_stage(
         &self,
         project_id: i64,
         stage: &str,
         artifact_id: i64,
         note: Option<&str>,
     ) -> AppResult<Approval> {
+        if matches!(stage, "draft" | "revision") {
+            let artifact = self.state.get_artifact(artifact_id)?;
+            let chapter_id = artifact
+                .chapter_id
+                .ok_or_else(|| AppError::Validation("正文产物必须属于章节".to_string()))?;
+            let report = gate::analyze_chapter_gate(
+                &self.state,
+                ChapterGateRequest {
+                    project_id,
+                    chapter_id,
+                    artifact_id,
+                },
+            )
+            .await
+            .map_err(|error| {
+                AppError::Validation(format!(
+                    "质量门禁无法完成，已阻止转正（fail-closed）：{error}"
+                ))
+            })?;
+            gate::ensure_gate_allows_transition(&report)?;
+        }
         let approval =
             self.state
                 .approve_stage(project_id, stage, artifact_id, note.unwrap_or(""))?;

@@ -30,6 +30,8 @@ const categories = [
   ["other", "其他"],
 ] as const;
 
+const adoptionActionLabel = "确认采用";
+
 function text(data: Record<string, unknown>, key: string) {
   return typeof data[key] === "string" ? data[key] as string : "";
 }
@@ -101,7 +103,7 @@ export function AdoptionDrawer({
 
   return createPortal(
     <div className="adoption-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <aside className="adoption-drawer" role="dialog" aria-modal="true" aria-label="待采纳资料变更">
+      <aside className="adoption-drawer" role="dialog" aria-modal="true" aria-label="待确认采用的资料变更">
         <header className="adoption-drawer-head">
           <div>
             <h2>资料变更</h2>
@@ -118,7 +120,7 @@ export function AdoptionDrawer({
 
         <div className="adoption-drawer-body">
           {grouped.pending.length === 0 && (
-            <div className="adoption-empty">暂无待采纳资料</div>
+            <div className="adoption-empty">暂无待确认采用的资料</div>
           )}
           {grouped.pending.map((proposal) => {
             const data = drafts[proposal.id] ?? proposal.data;
@@ -194,7 +196,7 @@ export function AdoptionDrawer({
               {[...grouped.stale, ...grouped.decided].map((proposal) => (
                 <div key={proposal.id}>
                   <strong>{text(proposal.data, "title") || `候选 #${proposal.id}`}</strong>
-                  <span>{proposal.status === "applied" ? "已采纳" : proposal.status === "rejected" ? "已拒绝" : "已失效"}</span>
+                  <span>{proposal.status === "applied" ? "已确认采用" : proposal.status === "rejected" ? "已拒绝" : "已失效"}</span>
                 </div>
               ))}
             </details>
@@ -208,7 +210,7 @@ export function AdoptionDrawer({
               <Trash2 size={14} /> 拒绝所选
             </button>
             <button className="btn-primary" onClick={() => onApply(selectedIds, note)} disabled={selectedIds.length === 0 || busy}>
-              <Check size={14} /> 采纳所选 ({selectedIds.length})
+              <Check size={14} /> {adoptionActionLabel}所选 ({selectedIds.length})
             </button>
           </div>
         </footer>

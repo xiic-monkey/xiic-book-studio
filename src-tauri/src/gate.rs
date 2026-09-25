@@ -10,6 +10,34 @@ use crate::{
 
 const MIN_ACCEPTABLE_QUALITY: u8 = 72;
 
+/// 门禁结论 -> 转正裁决。
+///
+/// 转正是**硬门禁**：`passed` 为假时一律拒绝，并把阻断项原样回报，
+/// 让"为什么不能通过"成为可读信息，而不是一次静默放行。
+///
+/// 抽成独立函数是为了让"是否放行"这一决策可以脱离 AI 依赖被直接测试。
+pub fn ensure_gate_allows_transition(report: &ChapterGateReport) -> AppResult<()> {
+    if report.passed {
+        return Ok(());
+    }
+    let blockers = report
+        .blockers
+        .iter()
+        .map(|blocker| format!("{}：{}", blocker.title, blocker.detail))
+        .collect::<Vec<_>>()
+        .join("；");
+    Err(AppError::Validation(format!(
+        "质量门禁未通过，已阻止转正（质量分 {}，判定 {}）。{}",
+        report.quality.score,
+        report.verdict,
+        if blockers.is_empty() {
+            report.summary.clone()
+        } else {
+            blockers
+        }
+    )))
+}
+
 pub async fn analyze_chapter_gate(
     state: &AppState,
     input: ChapterGateRequest,

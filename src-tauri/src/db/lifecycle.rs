@@ -468,6 +468,9 @@ fn table_exists(conn: &Connection, table: &str) -> AppResult<bool> {
 }
 
 fn recover_stale_workflow_runs(state: &AppState) -> AppResult<()> {
+    // 运行由进程内 tokio 任务承载；进程启动时仍处于非终态的运行必然来自上次
+    // 未正常退出的进程。若不清理，get_active_agent_run 会把它们永远视为活跃，
+    // 前端也会一直显示"执行中"且停止按钮无法生效。
     state.with_conn(|conn| {
         conn.execute(
             "UPDATE workflow_runs
@@ -477,7 +480,7 @@ fn recover_stale_workflow_runs(state: &AppState) -> AppResult<()> {
                      THEN '应用重启前未完成的 Agent 运行已中止'
                      ELSE error
                  END
-             WHERE status = 'streaming'",
+             WHERE status IN ('streaming', 'running', 'cancellation_requested')",
             [],
         )?;
         Ok(())

@@ -21,6 +21,8 @@ const toolLabels: Record<string, string> = {
   search_story: "检索故事内容",
 };
 
+const adoptionActionLabel = "确认采用";
+
 function toolLabel(toolKey: string) {
   return toolLabels[toolKey] ?? toolKey.replace(/[_-]+/g, " ").replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
 }
@@ -38,7 +40,7 @@ function invocationStatusClass(invocation: ToolInvocation) {
   return "success";
 }
 
-function resultSummary(invocation: ToolInvocation) {
+export function resultSummary(invocation: ToolInvocation) {
   if (invocation.error) return invocation.error;
   const result = invocation.result ?? {};
   const record = result as Record<string, unknown>;
@@ -190,7 +192,7 @@ export function AgentRunInspector({
                   disabled={busy}
                   onClick={() => onApplyProposal(proposal)}
                 >
-                  <Check size={13} /> 人工确认并应用
+                  <Check size={13} /> {adoptionActionLabel}
                 </button>
                 <button
                   type="button"

@@ -93,6 +93,31 @@ pub struct NewChapter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveChapterPlan {
+    pub id: Option<i64>,
+    pub project_id: i64,
+    pub chapter_no: i64,
+    pub title: String,
+    pub content: String,
+    pub status: String,
+    pub story_arc_id: Option<i64>,
+    pub chapter_id: Option<i64>,
+    pub source_artifact_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteChapterPlanRequest {
+    pub project_id: i64,
+    pub plan_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateChapterFromPlanRequest {
+    pub project_id: i64,
+    pub plan_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectUpdate {
     pub id: i64,
     pub title: String,
@@ -232,11 +257,25 @@ pub struct Chapter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ChapterPlan {
+    pub id: i64,
+    pub project_id: i64,
+    pub chapter_no: i64,
+    pub title: String,
+    pub content: String,
+    pub status: String,
+    pub story_arc_id: Option<i64>,
+    pub chapter_id: Option<i64>,
+    pub source_artifact_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Artifact {
     pub id: i64,
     pub project_id: i64,
     pub chapter_id: Option<i64>,
-    #[ts(type = "Stage")]
     pub stage: String,
     pub title: String,
     pub content: String,
@@ -669,6 +708,30 @@ pub struct ConfirmStoryBibleRequest {
     pub note: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentPlanConfirmationStatus {
+    Confirmed,
+    AwaitingReviewConfirmation,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ConfirmCurrentPlanRequest {
+    pub project_id: i64,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct CurrentPlanConfirmationResult {
+    pub status: CurrentPlanConfirmationStatus,
+    pub approved_card_count: i64,
+    pub approved_plan_count: i64,
+    pub story_bible: Option<StoryBible>,
+    pub review: Option<StoryBibleReview>,
+    pub blockers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryBibleReviewRequest {
     pub project_id: i64,
@@ -774,6 +837,7 @@ pub struct ProjectDetail {
     pub project: Project,
     pub genre_agent: GenreAgentProfile,
     pub chapters: Vec<Chapter>,
+    pub chapter_plans: Vec<ChapterPlan>,
     pub agents: Vec<Agent>,
     pub artifacts: Vec<Artifact>,
     pub approvals: Vec<Approval>,
@@ -804,6 +868,7 @@ pub struct ProjectWorkspace {
     pub project: Project,
     pub genre_agent: GenreAgentProfile,
     pub chapters: Vec<Chapter>,
+    pub chapter_plans: Vec<ChapterPlan>,
     pub formal_char_count: i64,
     pub artifacts: Vec<ArtifactSummary>,
     pub approvals: Vec<Approval>,
@@ -1168,6 +1233,8 @@ pub struct OrchestratorTask {
     pub source_artifact_id: Option<i64>,
     #[serde(default)]
     pub chapter_id: Option<i64>,
+    #[serde(default)]
+    pub story_architect_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1176,6 +1243,12 @@ pub struct OrchestratorTurnRequest {
     pub chapter_id: Option<i64>,
     pub message: String,
     pub stage: Option<String>,
+    #[serde(default)]
+    pub source_artifact_id: Option<i64>,
+    #[serde(default)]
+    pub story_architect_mode: Option<String>,
+    #[serde(default)]
+    pub reference_selection: Option<ReferenceSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1234,6 +1307,12 @@ pub struct ActiveAgentRun {
     pub error: Option<String>,
     pub elapsed_ms: i64,
     pub created_at: String,
+    #[serde(default)]
+    pub parent_run_id: Option<i64>,
+    #[serde(default)]
+    pub run_kind: String,
+    #[serde(default)]
+    pub task_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1241,7 +1320,6 @@ pub struct ArtifactSummary {
     pub id: i64,
     pub project_id: i64,
     pub chapter_id: Option<i64>,
-    #[ts(type = "Stage")]
     pub stage: String,
     pub title: String,
     pub version: i64,

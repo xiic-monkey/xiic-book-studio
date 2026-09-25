@@ -56,6 +56,7 @@ struct ChatChoice {
 
 const MAX_AI_RETRIES: usize = 10;
 const AI_REQUEST_TIMEOUT_SECONDS: u64 = 240;
+const AI_ORCHESTRATOR_TIMEOUT_SECONDS: u64 = 60;
 const AI_STREAM_MAX_ATTEMPTS: usize = 2;
 const AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: u64 = 30;
 const AI_RETRY_DELAY_MILLIS: u64 = 1_000;
@@ -162,13 +163,33 @@ pub async fn complete_json_chat(
     .await
 }
 
+pub async fn complete_json_chat_for_orchestrator(
+    settings: &AiSettings,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> AppResult<String> {
+    complete_chat_with_format_options(
+        settings,
+        api_key,
+        system_prompt,
+        user_prompt,
+        temperature,
+        true,
+        AI_ORCHESTRATOR_TIMEOUT_SECONDS,
+        0,
+    )
+    .await
+}
+
 pub async fn plan_tool_calls_native(
     settings: &AiSettings,
     api_key: &str,
     system_prompt: &str,
     user_prompt: &str,
     tools: &[AgentToolDefinition],
-) -> Result<Vec<ToolCall>, ToolPlanningError> {
+) -> Result<(Vec<ToolCall>, Option<String>), ToolPlanningError> {
     let normalized_base_url = normalize_base_url(&settings.base_url);
     if normalized_base_url.is_empty() {
         return Err(AppError::Validation("请先设置 API Base URL".to_string()).into());
@@ -177,7 +198,7 @@ pub async fn plan_tool_calls_native(
         return Err(AppError::Validation("请先设置模型名称".to_string()).into());
     }
     if tools.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
 
     let thinking_enabled =
@@ -250,7 +271,46 @@ pub async fn plan_tool_calls_native(
         ))));
     }
 
-    parse_native_tool_calls(&body).map_err(ToolPlanningError::Other)
+    parse_native_tool_calls(&body)
+        .map_err(ToolPlanningError::Other)
+        .map(|calls| {
+            let narrative = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .and_then(|choices| choices.first())
+                        .and_then(|choice| choice.get("message"))
+                        .and_then(narrative_from_message)
+                });
+            (calls, narrative)
+        })
+}
+
+/// 从模型的工具决策消息里提取真实思考文本：优先 reasoning_content，
+/// 其次与 tool_calls 同现的说明文字；纯 JSON 协议输出不算思考。
+fn narrative_from_message(message: &Value) -> Option<String> {
+    let reasoning = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    if let Some(text) = reasoning {
+        return Some(text.to_string());
+    }
+    let content = message.get("content").and_then(Value::as_str).map(str::trim);
+    match content {
+        Some(text)
+            if !text.is_empty()
+                && !(text.starts_with('{') && text.trim_end().ends_with('}'))
+                && !(text.starts_with('[') && text.trim_end().ends_with(']')) =>
+        {
+            Some(text.to_string())
+        }
+        _ => None,
+    }
 }
 
 pub async fn plan_tool_calls_structured(
@@ -259,9 +319,9 @@ pub async fn plan_tool_calls_structured(
     system_prompt: &str,
     task_prompt: &str,
     tools: &[AgentToolDefinition],
-) -> AppResult<Vec<ToolCall>> {
+) -> AppResult<(Vec<ToolCall>, Option<String>)> {
     if tools.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let catalog = tools
         .iter()
@@ -278,7 +338,24 @@ pub async fn plan_tool_calls_structured(
         serde_json::to_string_pretty(&catalog)?
     );
     let raw = complete_chat(settings, api_key, system_prompt, &prompt, 0.0).await?;
-    parse_structured_tool_calls(&raw)
+    let narrative = structured_preamble(&raw);
+    parse_structured_tool_calls(&raw).map(|calls| (calls, narrative))
+}
+
+/// 结构化协议下模型写在 JSON 前的分析文字（通常为空）。
+fn structured_preamble(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let preamble = raw[..start]
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if preamble.is_empty() {
+        None
+    } else {
+        Some(preamble.to_string())
+    }
 }
 
 fn native_tools_unsupported(status: u16, body: &str) -> bool {
@@ -400,6 +477,29 @@ async fn complete_chat_with_format(
     temperature: f64,
     json_mode: bool,
 ) -> AppResult<String> {
+    complete_chat_with_format_options(
+        settings,
+        api_key,
+        system_prompt,
+        user_prompt,
+        temperature,
+        json_mode,
+        AI_REQUEST_TIMEOUT_SECONDS,
+        MAX_AI_RETRIES,
+    )
+    .await
+}
+
+async fn complete_chat_with_format_options(
+    settings: &AiSettings,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+    json_mode: bool,
+    timeout_seconds: u64,
+    max_retries: usize,
+) -> AppResult<String> {
     let normalized_base_url = normalize_base_url(&settings.base_url);
     if normalized_base_url.is_empty() {
         return Err(AppError::Validation("请先设置 API Base URL".to_string()));
@@ -415,20 +515,29 @@ async fn complete_chat_with_format(
         });
     }
     let url = format!("{}/chat/completions", normalized_base_url);
-    let client = build_client()?;
+    let client = build_client_with_timeout(timeout_seconds)?;
     let mut last_error = None;
-    let max_attempts = MAX_AI_RETRIES + 1;
+    let max_attempts = max_retries + 1;
 
     for attempt in 1..=max_attempts {
-        let response = match client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&request)
-            .send()
-            .await
+        let response = match timeout(
+            Duration::from_secs(timeout_seconds),
+            client.post(&url).bearer_auth(api_key).json(&request).send(),
+        )
+        .await
         {
-            Ok(response) => response,
-            Err(error) => {
+            Ok(Ok(response)) => response,
+            Err(_) => {
+                last_error = Some(AppError::Validation(format!(
+                    "AI 请求超过 {} 秒仍未完成",
+                    timeout_seconds
+                )));
+                if should_retry(attempt, max_attempts) {
+                    sleep(Duration::from_millis(AI_RETRY_DELAY_MILLIS)).await;
+                }
+                continue;
+            }
+            Ok(Err(error)) => {
                 last_error = Some(AppError::Network(error));
                 if should_retry(attempt, max_attempts) {
                     sleep(Duration::from_millis(AI_RETRY_DELAY_MILLIS)).await;
@@ -480,7 +589,10 @@ async fn complete_chat_with_format(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        AppError::Validation(format!("AI 没有返回可用内容；已重试 {} 次", MAX_AI_RETRIES))
+        AppError::Validation(format!(
+            "AI 没有返回可用内容；已尝试 {} 次",
+            max_retries + 1
+        ))
     }))
 }
 
@@ -689,11 +801,15 @@ pub fn parse_review_issues(raw: &str) -> AppResult<Vec<ReviewIssue>> {
 }
 
 fn build_client() -> AppResult<reqwest::Client> {
+    build_client_with_timeout(AI_REQUEST_TIMEOUT_SECONDS)
+}
+
+fn build_client_with_timeout(timeout_seconds: u64) -> AppResult<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(AI_REQUEST_TIMEOUT_SECONDS))
+        .timeout(Duration::from_secs(timeout_seconds))
         .http1_only()
         .default_headers(headers)
         .no_gzip()

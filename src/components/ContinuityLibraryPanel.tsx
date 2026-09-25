@@ -22,7 +22,7 @@ export type EntityTimelineEntry =
   | { type: "fact"; id: number; chapterId: number | null; fact: StoryFact };
 
 type ContinuityLibraryPanelProps = {
-  focus: "characters" | "items" | "events";
+  focus: "character-timeline" | "items" | "events";
   readOnly?: boolean;
   detail: ProjectWorkspace | null;
   busy: boolean;
@@ -37,6 +37,27 @@ type ContinuityLibraryPanelProps = {
   onOpenEntity: (entityId: number, kind: string) => void;
   onOpenChapter: (chapterId?: number | null) => void;
 };
+
+const continuityViewMeta = {
+  "character-timeline": {
+    title: "角色时间线",
+    description: "按角色查看正文中的状态变化与相关事件。",
+    listLabel: "角色列表",
+    emptySelection: "选择角色查看时间线",
+  },
+  items: {
+    title: "物品状态",
+    description: "追踪物品与资源在正文中的持有、位置和状态变化。",
+    listLabel: "物品与资源列表",
+    emptySelection: "选择物品或资源查看状态",
+  },
+  events: {
+    title: "事件时间线",
+    description: "按正文发生顺序浏览已采用章节中的关键事件。",
+    listLabel: "事件时间线",
+    emptySelection: "",
+  },
+} as const;
 
 export function ContinuityLibraryPanel({
   focus,
@@ -54,8 +75,7 @@ export function ContinuityLibraryPanel({
   onOpenEntity,
   onOpenChapter,
 }: ContinuityLibraryPanelProps) {
-  const title = focus === "characters" ? "角色" : focus === "items" ? "物品与资源" : "事件";
-  const isCharacterView = focus === "characters";
+  const viewMeta = continuityViewMeta[focus];
   const indexJobs = detail?.index_jobs ?? [];
   const pendingJobs = indexJobs.filter((job) => job.status === "pending");
   const runningJobs = indexJobs.filter((job) => job.status === "running");
@@ -71,7 +91,9 @@ export function ContinuityLibraryPanel({
     <section className="library-workspace continuity-workspace">
       <header className="library-header">
         <div>
-          <h2>{title}</h2>
+          <span className="library-context-label">正文衍生资料</span>
+          <h2>{viewMeta.title}</h2>
+          <p>{viewMeta.description}</p>
           {status.approved > 0 && (
             <div className={status.failed.length > 0 ? "library-index-status has-error" : "library-index-status"}>
               <span>资料索引</span>
@@ -147,7 +169,7 @@ export function ContinuityLibraryPanel({
           </div>
         ) : (
           <div className="entity-timeline-layout">
-            <nav className="entity-list" aria-label={isCharacterView ? "角色列表" : "物品与资源列表"}>
+            <nav className="entity-list" aria-label={viewMeta.listLabel}>
               {entities.map((entity) => (
                 <button
                   key={entity.id}
@@ -208,7 +230,7 @@ export function ContinuityLibraryPanel({
                     {timeline.length === 0 && <div className="empty-inline">尚无该实体的状态变化记录</div>}
                   </div>
                 </>
-              ) : <div className="empty-state compact">选择{isCharacterView ? "角色" : "物品"}</div>}
+              ) : <div className="empty-state compact">{viewMeta.emptySelection}</div>}
             </section>
           </div>
         )}

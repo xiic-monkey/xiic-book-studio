@@ -6,6 +6,7 @@ export type {
   AgentRunSummary,
   AgentToolDefinition,
   ArtifactSummary,
+  ChapterPlan,
   ContextSegment,
   PreparedContext,
   ProposalApplyResult,
@@ -137,6 +138,20 @@ export interface StoryBible {
   updated_at: string;
 }
 
+export type CurrentPlanConfirmationStatus =
+  | "confirmed"
+  | "awaiting_review_confirmation"
+  | "blocked";
+
+export interface CurrentPlanConfirmationResult {
+  status: CurrentPlanConfirmationStatus;
+  approved_card_count: number;
+  approved_plan_count: number;
+  story_bible: StoryBible | null;
+  review: StoryBibleReview | null;
+  blockers: string[];
+}
+
 export interface StoryArc {
   id: number;
   project_id: number;
@@ -201,7 +216,7 @@ export interface Artifact {
   id: number;
   project_id: number;
   chapter_id?: number | null;
-  stage: Stage;
+  stage: string;
   title: string;
   content: string;
   version: number;
@@ -250,7 +265,7 @@ export interface Approval {
   id: number;
   project_id: number;
   chapter_id?: number | null;
-  stage: Stage;
+  stage: string;
   artifact_id: number;
   note: string;
   created_at: string;

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, time::Instant};
+use std::{collections::HashSet, future::Future, time::Instant};
 
 use serde_json::{json, Value};
 
@@ -8,8 +8,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         ActionProposal, Agent, AgentToolDefinition, ChapterSplitPlanRequest, ReferenceSelection,
-        SaveKnowledgeCard, Stage, StoryContextSearchInput, ToolCall, ToolKind, ToolProtocol,
-        ToolResult,
+        SaveChapterPlan, SaveKnowledgeCard, Stage, StoryContextSearchInput, ToolCall, ToolKind,
+        ToolProtocol, ToolResult,
     },
     quality, workflow,
 };
@@ -18,6 +18,7 @@ use crate::{
 // breaker for a malfunctioning provider repeatedly requesting new calls.
 const MAX_TOOL_CALLS: usize = 64;
 const MAX_RENDERED_CONTEXT_CHARS: usize = 24_000;
+const CANCELLATION_POLL_MILLIS: u64 = 250;
 
 pub struct ToolExecutionContext<'a> {
     pub state: &'a AppState,
@@ -40,6 +41,38 @@ pub struct ToolPreparation {
     pub protocol: Option<String>,
 }
 
+async fn await_run_result<T, F>(state: &AppState, run_id: Option<i64>, future: F) -> AppResult<T>
+where
+    F: Future<Output = AppResult<T>>,
+{
+    let Some(run_id) = run_id else {
+        return future.await;
+    };
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(CANCELLATION_POLL_MILLIS)) => {
+                if state.run_cancellation_requested(run_id)? {
+                    return Err(AppError::Validation("Agent 运行已取消".to_string()));
+                }
+            }
+        }
+    }
+}
+
+fn ensure_run_active(context: &ToolExecutionContext<'_>) -> AppResult<()> {
+    if context
+        .run_id
+        .map(|run_id| context.state.run_cancellation_requested(run_id))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return Err(AppError::Validation("Agent 运行已取消".to_string()));
+    }
+    Ok(())
+}
+
 pub fn definitions_for_agent(
     agent: &Agent,
     stage: &Stage,
@@ -58,6 +91,8 @@ pub fn definitions_for_agent(
                         definition.key.as_str(),
                         agent_tools::CREATE_KNOWLEDGE_CARD
                             | agent_tools::UPDATE_KNOWLEDGE_CARD
+                            | agent_tools::CREATE_CHAPTER_PLAN
+                            | agent_tools::UPDATE_CHAPTER_PLAN
                             | agent_tools::PROPOSE_KNOWLEDGE_CARD
                             | agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD
                     ))
@@ -97,6 +132,7 @@ pub async fn prepare_tools(
 
     let mut round = 0usize;
     loop {
+        ensure_run_active(&context)?;
         round += 1;
         if let Some(run_id) = context.run_id {
             let _ = context.state.insert_run_event(
@@ -108,31 +144,39 @@ pub async fn prepare_tools(
                 "thinking",
                 None,
             );
+        }
+        let (calls, protocol, narrative) = await_run_result(
+            context.state,
+            context.run_id,
+            plan_calls(
+                context.state,
+                &settings,
+                &api_key,
+                &context.agent.system_prompt,
+                &planning_context,
+                &definitions,
+                configured.clone(),
+                detected.clone(),
+            ),
+        )
+        .await?;
+        if let Some(run_id) = context.run_id {
+            // 优先记录模型本轮的真实决策/推理文本；供应商没给时退回占位说明。
+            let fallback = if round == 0 {
+                "正在分析任务并决定是否需要调用工具……"
+            } else {
+                "正在结合工具结果继续分析……"
+            };
             let _ = context.state.insert_run_event(
                 run_id,
                 context.project_id,
                 context.chapter_id,
                 "thinking_delta",
-                if round == 0 {
-                    "正在分析任务并决定是否需要调用工具……"
-                } else {
-                    "正在结合工具结果继续分析……"
-                },
+                narrative.as_deref().unwrap_or(fallback),
                 "thinking",
                 None,
             );
         }
-        let (calls, protocol) = plan_calls(
-            context.state,
-            &settings,
-            &api_key,
-            &context.agent.system_prompt,
-            &planning_context,
-            &definitions,
-            configured.clone(),
-            detected.clone(),
-        )
-        .await?;
         if matches!(configured, ToolProtocol::Auto) {
             detected = Some(ToolProtocol::parse(&protocol));
         }
@@ -213,6 +257,7 @@ pub async fn prepare_tools(
 
         let mut round_results = Vec::new();
         for (call, dedup_key) in pending_calls {
+            ensure_run_active(&context)?;
             seen.insert(dedup_key);
             total_calls += 1;
             emit_tool_event(
@@ -417,36 +462,36 @@ async fn plan_calls(
     definitions: &[AgentToolDefinition],
     configured: ToolProtocol,
     detected: Option<ToolProtocol>,
-) -> AppResult<(Vec<ToolCall>, String)> {
+) -> AppResult<(Vec<ToolCall>, String, Option<String>)> {
     match configured {
-        ToolProtocol::Structured => Ok((
-            ai::plan_tool_calls_structured(
+        ToolProtocol::Structured => {
+            let (calls, narrative) = ai::plan_tool_calls_structured(
                 settings,
                 api_key,
                 system_prompt,
                 task_prompt,
                 definitions,
             )
-            .await?,
-            "structured".to_string(),
-        )),
+            .await?;
+            Ok((calls, "structured".to_string(), narrative))
+        }
         ToolProtocol::Native => {
             ai::plan_tool_calls_native(settings, api_key, system_prompt, task_prompt, definitions)
                 .await
-                .map(|calls| (calls, "native".to_string()))
+                .map(|(calls, narrative)| (calls, "native".to_string(), narrative))
                 .map_err(|error| AppError::Validation(error.to_string()))
         }
-        ToolProtocol::Auto if matches!(detected, Some(ToolProtocol::Structured)) => Ok((
-            ai::plan_tool_calls_structured(
+        ToolProtocol::Auto if matches!(detected, Some(ToolProtocol::Structured)) => {
+            let (calls, narrative) = ai::plan_tool_calls_structured(
                 settings,
                 api_key,
                 system_prompt,
                 task_prompt,
                 definitions,
             )
-            .await?,
-            "structured".to_string(),
-        )),
+            .await?;
+            Ok((calls, "structured".to_string(), narrative))
+        }
         ToolProtocol::Auto => match ai::plan_tool_calls_native(
             settings,
             api_key,
@@ -456,13 +501,13 @@ async fn plan_calls(
         )
         .await
         {
-            Ok(calls) => {
+            Ok((calls, narrative)) => {
                 state.record_provider_tool_protocol(
                     &settings.base_url,
                     Some(ToolProtocol::Native),
                     None,
                 )?;
-                Ok((calls, "native".to_string()))
+                Ok((calls, "native".to_string(), narrative))
             }
             Err(ai::ToolPlanningError::Unsupported(message)) => {
                 state.record_provider_tool_protocol(
@@ -470,17 +515,15 @@ async fn plan_calls(
                     Some(ToolProtocol::Structured),
                     Some(&message),
                 )?;
-                Ok((
-                    ai::plan_tool_calls_structured(
-                        settings,
-                        api_key,
-                        system_prompt,
-                        task_prompt,
-                        definitions,
-                    )
-                    .await?,
-                    "structured".to_string(),
-                ))
+                let (calls, narrative) = ai::plan_tool_calls_structured(
+                    settings,
+                    api_key,
+                    system_prompt,
+                    task_prompt,
+                    definitions,
+                )
+                .await?;
+                Ok((calls, "structured".to_string(), narrative))
             }
             Err(ai::ToolPlanningError::Other(error)) => Err(error),
         },
@@ -846,6 +889,95 @@ async fn execute_call(
             &call.arguments,
             None,
         ),
+        agent_tools::CREATE_CHAPTER_PLAN => {
+            if !is_direct_story_architect_run(context) {
+                return create_proposal(
+                    context,
+                    "chapter_plan",
+                    "创建章节计划候选",
+                    &call.arguments,
+                    None,
+                );
+            }
+            if !matches!(context.stage, Stage::Outline) {
+                return Err(AppError::Validation(
+                    "章节计划只能在大纲阶段创建".to_string(),
+                ));
+            }
+            let chapter_no = required_i64(&call.arguments, "chapter_no")?;
+            let title = required_string(&call.arguments, "title")?;
+            let content = required_string(&call.arguments, "content")?;
+            let story_arc_id = optional_i64(&call.arguments, "story_arc_id").or(context
+                .state
+                .active_story_arc(context.project_id)?
+                .map(|arc| arc.id));
+            let plan = context.state.save_chapter_plan(SaveChapterPlan {
+                id: None,
+                project_id: context.project_id,
+                chapter_no,
+                title: title.trim().to_string(),
+                content: content.trim().to_string(),
+                status: "pending_human_approval".to_string(),
+                story_arc_id,
+                chapter_id: None,
+                source_artifact_id: context.source_artifact_id,
+            })?;
+            Ok((
+                json!({"plan_id": plan.id, "chapter_no": plan.chapter_no, "status": plan.status, "title": plan.title}),
+                Vec::new(),
+                false,
+                None,
+            ))
+        }
+        agent_tools::UPDATE_CHAPTER_PLAN => {
+            if !is_direct_story_architect_run(context) {
+                return create_proposal(
+                    context,
+                    "chapter_plan_update",
+                    "更新章节计划候选",
+                    &call.arguments,
+                    None,
+                );
+            }
+            if !matches!(context.stage, Stage::Outline) {
+                return Err(AppError::Validation(
+                    "章节计划只能在大纲阶段更新".to_string(),
+                ));
+            }
+            let plan_id = required_i64(&call.arguments, "plan_id")?;
+            let existing = context
+                .state
+                .list_chapter_plans(context.project_id)?
+                .into_iter()
+                .find(|plan| plan.id == plan_id)
+                .ok_or_else(|| AppError::Validation("章节计划不属于当前项目".to_string()))?;
+            let chapter_no = required_i64(&call.arguments, "chapter_no")?;
+            let title = required_string(&call.arguments, "title")?;
+            let content = required_string(&call.arguments, "content")?;
+            let story_arc_id = optional_i64(&call.arguments, "story_arc_id")
+                .or(existing.story_arc_id)
+                .or(context
+                    .state
+                    .active_story_arc(context.project_id)?
+                    .map(|arc| arc.id));
+            let plan = context.state.save_chapter_plan(SaveChapterPlan {
+                id: Some(plan_id),
+                project_id: context.project_id,
+                chapter_no,
+                title: title.trim().to_string(),
+                content: content.trim().to_string(),
+                status: "pending_human_approval".to_string(),
+                story_arc_id,
+                chapter_id: existing.chapter_id,
+                source_artifact_id: context.source_artifact_id.or(existing.source_artifact_id),
+            })?;
+            Ok((
+                json!({"plan_id": plan.id, "chapter_no": plan.chapter_no, "status": plan.status, "title": plan.title}),
+                Vec::new(),
+                false,
+                None,
+            ))
+        }
         agent_tools::CREATE_KNOWLEDGE_CARD | agent_tools::PROPOSE_KNOWLEDGE_CARD => {
             if is_direct_story_architect_run(context) {
                 let category = required_string(&call.arguments, "category")?;
@@ -964,7 +1096,7 @@ fn validate_story_architect_card_category(stage: &Stage, category: &str) -> AppR
             "item",
             "rule",
         ],
-        Stage::Outline => &["outline", "chapter_plan"],
+        Stage::Outline => &["outline"],
         Stage::Characters => &["character"],
         _ => return Ok(()),
     };
@@ -1115,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn story_architect_implicitly_receives_card_tools_only_for_foundation_stages() {
+    fn story_architect_implicitly_receives_foundation_write_tools_only_for_foundation_stages() {
         let mut agent = agent(&[]);
         agent.stage = "story_architect".to_string();
 
@@ -1133,5 +1265,12 @@ mod tests {
         assert!(preview.is_empty());
         let draft = definitions_for_agent(&agent, &Stage::Draft, false);
         assert!(draft.is_empty());
+        let outline = definitions_for_agent(&agent, &Stage::Outline, false);
+        assert!(outline
+            .iter()
+            .any(|definition| definition.key == agent_tools::CREATE_CHAPTER_PLAN));
+        assert!(outline
+            .iter()
+            .any(|definition| definition.key == agent_tools::UPDATE_CHAPTER_PLAN));
     }
 }

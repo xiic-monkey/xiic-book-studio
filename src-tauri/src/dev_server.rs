@@ -21,14 +21,15 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         AgentRunRequest, AiSpanRevisionRequest, ChapterGateRequest, ChapterSplitPlanRequest,
-        ClearChapterHistoryRequest, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
-        ContinuityReviewRequest, DecideActionProposalRequest, DecideAdoptionProposalsRequest,
-        DeleteArtifactRequest, DeleteKnowledgeCardRequest, ImportReferenceTextRequest,
+        ClearChapterHistoryRequest, ConfirmCurrentPlanRequest, ConfirmStoryBibleRequest,
+        ConfirmStoryBibleReviewRequest, ContinuityReviewRequest, CreateChapterFromPlanRequest,
+        DecideActionProposalRequest, DecideAdoptionProposalsRequest, DeleteArtifactRequest,
+        DeleteChapterPlanRequest, DeleteKnowledgeCardRequest, ImportReferenceTextRequest,
         LedgerContinuityCheckRequest, ListActionProposalsRequest, ListAdoptionProposalsRequest,
         ListModelsInput, OrchestratorTurnRequest, PrepareArtifactAdoptionsRequest,
         RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, RetryIndexJobsRequest,
         RevisionRequest, RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider,
-        SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill,
+        SaveAiSettings, SaveChapterPlan, SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill,
         SpanReplacementRequest, StoryBibleReviewRequest, StoryContextRerankRequest,
         StoryContextSearchInput, TestAiConnectionInput, UpdateAdoptionProposalRequest,
         UpdateReferenceMaterialRequest,
@@ -218,6 +219,17 @@ async fn dispatch_command(
         "update_chapter" => Ok(serde_json::to_value(
             gateway.update_chapter(read_required(&payload, "input")?)?,
         )?),
+        "save_chapter_plan" => Ok(serde_json::to_value(
+            gateway.save_chapter_plan(read_required::<SaveChapterPlan>(&payload, "input")?)?,
+        )?),
+        "delete_chapter_plan" => {
+            let input: DeleteChapterPlanRequest = read_required(&payload, "input")?;
+            gateway.delete_chapter_plan(input)?;
+            Ok(Value::Null)
+        }
+        "create_chapter_from_plan" => Ok(serde_json::to_value(gateway.create_chapter_from_plan(
+            read_required::<CreateChapterFromPlanRequest>(&payload, "input")?,
+        )?)?),
         "get_project" => {
             let project_id = read_i64(&payload, &["projectId", "project_id"])?;
             Ok(serde_json::to_value(
@@ -310,6 +322,12 @@ async fn dispatch_command(
             let input: ConfirmStoryBibleRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.confirm_story_bible(input)?)?)
         }
+        "confirm_current_plan" => {
+            let input: ConfirmCurrentPlanRequest = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(
+                gateway.confirm_current_plan(input).await?,
+            )?)
+        }
         "review_story_bible" => {
             let input: StoryBibleReviewRequest = read_required(&payload, "input")?;
             Ok(serde_json::to_value(
@@ -331,12 +349,11 @@ async fn dispatch_command(
             let stage = read_string(&payload, &["stage"])?;
             let artifact_id = read_i64(&payload, &["artifactId", "artifact_id"])?;
             let note = read_optional_string(&payload, &["note"])?;
-            Ok(serde_json::to_value(gateway.approve_stage(
-                project_id,
-                &stage,
-                artifact_id,
-                note.as_deref(),
-            )?)?)
+            Ok(serde_json::to_value(
+                gateway
+                    .approve_stage(project_id, &stage, artifact_id, note.as_deref())
+                    .await?,
+            )?)
         }
         "retry_index_jobs" => {
             let input: RetryIndexJobsRequest = read_required(&payload, "input")?;

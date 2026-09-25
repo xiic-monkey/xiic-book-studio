@@ -6,8 +6,10 @@ use crate::{
     db::AppState,
     error::{AppError, AppResult},
     models::{
-        AgentRunRequest, CanonIssue, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
-        RunStoryArchitectRequest, StoryBible, StoryBibleReview, StoryBibleReviewRequest,
+        AgentRunRequest, CanonIssue, ConfirmCurrentPlanRequest, ConfirmStoryBibleRequest,
+        ConfirmStoryBibleReviewRequest, CurrentPlanConfirmationResult,
+        CurrentPlanConfirmationStatus, RunStoryArchitectRequest, StoryBible, StoryBibleReview,
+        StoryBibleReviewRequest,
     },
 };
 
@@ -78,7 +80,12 @@ pub fn confirm_story_bible(
                         _ => false,
                     }
             });
-        if !has_approved_artifact && !has_approved_card {
+        let has_approved_plan = stage == "outline"
+            && state
+                .list_chapter_plans(input.project_id)?
+                .into_iter()
+                .any(|plan| plan.status == "approved" && !plan.content.trim().is_empty());
+        if !has_approved_artifact && !has_approved_card && !has_approved_plan {
             return Err(AppError::Validation(format!(
                 "确认创作基准前，请先人工通过{}资料",
                 stage_label(stage)
@@ -103,9 +110,113 @@ pub async fn review_story_bible(
             "请先确认一个进行中的故事阶段".to_string(),
         ));
     }
-    let snapshot = canonical_snapshot(state, input.project_id)?;
+    generate_story_bible_review(state, input.project_id).await
+}
+
+pub async fn confirm_current_plan(
+    state: &AppState,
+    input: ConfirmCurrentPlanRequest,
+) -> AppResult<CurrentPlanConfirmationResult> {
+    state.get_project(input.project_id)?;
+    let initial_story_bible = state.get_story_bible(input.project_id)?;
+    let initial_review = state.latest_story_bible_review(input.project_id)?;
+    if let (Some(review), Ok(fingerprint)) = (
+        initial_review.as_ref(),
+        canonical_fingerprint(state, input.project_id),
+    ) {
+        let blockers = major_review_blockers(review);
+        if review.canon_fingerprint == fingerprint && !blockers.is_empty() {
+            return Ok(CurrentPlanConfirmationResult {
+                status: CurrentPlanConfirmationStatus::Blocked,
+                approved_card_count: 0,
+                approved_plan_count: 0,
+                story_bible: initial_story_bible,
+                review: initial_review,
+                blockers,
+            });
+        }
+    }
+    let data = state.confirm_current_plan_data_atomic(input.project_id, &input.note)?;
+    let story_bible = data
+        .story_bible
+        .clone()
+        .or(state.get_story_bible(input.project_id)?);
+    let latest_review = state.latest_story_bible_review(input.project_id)?;
+
+    if !data.blockers.is_empty() {
+        return Ok(CurrentPlanConfirmationResult {
+            status: CurrentPlanConfirmationStatus::Blocked,
+            approved_card_count: data.approved_card_count,
+            approved_plan_count: data.approved_plan_count,
+            story_bible,
+            review: latest_review,
+            blockers: data.blockers,
+        });
+    }
+
+    let fingerprint = canonical_fingerprint(state, input.project_id)?;
+    let review_is_current = latest_review
+        .as_ref()
+        .is_some_and(|review| review.canon_fingerprint == fingerprint);
+    if !review_is_current {
+        let review = generate_story_bible_review(state, input.project_id).await?;
+        return Ok(CurrentPlanConfirmationResult {
+            status: CurrentPlanConfirmationStatus::AwaitingReviewConfirmation,
+            approved_card_count: data.approved_card_count,
+            approved_plan_count: data.approved_plan_count,
+            story_bible: state.get_story_bible(input.project_id)?,
+            review: Some(review),
+            blockers: Vec::new(),
+        });
+    }
+
+    let review = latest_review.expect("review_is_current implies a review exists");
+    let blockers = major_review_blockers(&review);
+    if !blockers.is_empty() {
+        return Ok(CurrentPlanConfirmationResult {
+            status: CurrentPlanConfirmationStatus::Blocked,
+            approved_card_count: data.approved_card_count,
+            approved_plan_count: data.approved_plan_count,
+            story_bible,
+            review: Some(review),
+            blockers,
+        });
+    }
+
+    if review.status == "confirmed"
+        && story_bible
+            .as_ref()
+            .is_some_and(|bible| bible.status == "confirmed")
+    {
+        return Ok(CurrentPlanConfirmationResult {
+            status: CurrentPlanConfirmationStatus::Confirmed,
+            approved_card_count: data.approved_card_count,
+            approved_plan_count: data.approved_plan_count,
+            story_bible,
+            review: Some(review),
+            blockers: Vec::new(),
+        });
+    }
+
+    let (story_bible, review) =
+        state.confirm_current_plan_review_atomic(input.project_id, review.id, &input.note)?;
+    Ok(CurrentPlanConfirmationResult {
+        status: CurrentPlanConfirmationStatus::Confirmed,
+        approved_card_count: data.approved_card_count,
+        approved_plan_count: data.approved_plan_count,
+        story_bible: Some(story_bible),
+        review: Some(review),
+        blockers: Vec::new(),
+    })
+}
+
+async fn generate_story_bible_review(
+    state: &AppState,
+    project_id: i64,
+) -> AppResult<StoryBibleReview> {
+    let snapshot = canonical_snapshot(state, project_id)?;
     let fingerprint = source_text_hash(&snapshot);
-    let agent = state.get_agent_for_project_stage(input.project_id, "story_architect")?;
+    let agent = state.get_agent_for_project_stage(project_id, "story_architect")?;
     let settings = agent.ai_settings();
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
@@ -135,19 +246,33 @@ pub async fn review_story_bible(
         "attention"
     };
     let review = state.insert_story_bible_review(
-        input.project_id,
+        project_id,
         &fingerprint,
         verdict,
         &summary,
         &serde_json::to_string(&issues)?,
     )?;
     state.insert_message(
-        input.project_id,
+        project_id,
         None,
         "agent_result",
         &format!("故事架构 Agent 完成一致性审校：{}", review.verdict),
     )?;
     Ok(review)
+}
+
+fn major_review_blockers(review: &StoryBibleReview) -> Vec<String> {
+    review
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == "major")
+        .map(|issue| {
+            format!(
+                "{}：{} 影响：{} 修复要求：{}",
+                issue.title, issue.conflict, issue.impact, issue.rework_instruction
+            )
+        })
+        .collect()
 }
 
 pub fn confirm_story_bible_review(
@@ -284,6 +409,22 @@ pub fn canonical_snapshot(state: &AppState, project_id: i64) -> AppResult<String
             })
         })
         .collect::<Vec<_>>();
+    let chapter_plans = state
+        .list_chapter_plans(project_id)?
+        .into_iter()
+        .filter(|plan| plan.status == "approved")
+        .map(|plan| {
+            serde_json::json!({
+                "id": plan.id,
+                "chapter_no": plan.chapter_no,
+                "title": plan.title,
+                "content": plan.content,
+                "story_arc_id": plan.story_arc_id,
+                "chapter_id": plan.chapter_id,
+                "source_artifact_id": plan.source_artifact_id,
+            })
+        })
+        .collect::<Vec<_>>();
     let foreshadowings = state
         .list_foreshadowings(project_id)?
         .into_iter()
@@ -311,6 +452,7 @@ pub fn canonical_snapshot(state: &AppState, project_id: i64) -> AppResult<String
         "foundation_artifacts": artifacts,
         "story_arcs": story_arcs,
         "canon_cards": canon_cards,
+        "chapter_plans": chapter_plans,
         "foreshadowings": foreshadowings,
     });
     serde_json::to_string_pretty(&value).map_err(AppError::from)
@@ -320,7 +462,7 @@ fn mode_contract(mode: &crate::models::StoryArchitectMode) -> &'static str {
     match mode {
         crate::models::StoryArchitectMode::Initialize => "建立基础世界模型、少量核心角色基础和故事方向，但按资料类别分流写入：世界观只描述世界长期如何运行，角色只写角色卡，故事方向只保留高层路标。禁止在世界观卡中写第一章、主角下一步、压迫链、资源循环、首次收益、升级路线或章节任务。远期方向只保留路标，禁止伪造完整章节细节。对需要沉淀的资料必须逐条调用创建/更新知识卡工具；不要把 Markdown 作为主要交付物。",
         crate::models::StoryArchitectMode::RefineCanon => "只补充当前 Canon 真正需要的长期世界规则、势力、地点、物件或边界。压迫链、资源循环、阶段目标和章节任务属于大纲，不属于世界观卡；角色变化属于角色卡。每项必须说明其稳定定义，并逐条调用创建/更新知识卡工具；不要把 Markdown 作为主要交付物。",
-        crate::models::StoryArchitectMode::PlanCurrentArc => "细化当前故事阶段：目标、进入局面、核心冲突、退出变化、相关角色和近期章节任务。已通过正式章节只能作为已发生事实被总结，必须从第一章尚无正式正文的章节继续规划；不得回写、改名或用规划版本替代已写内容。为当前阶段补充读者主要期待、推进证据、局部回报、尚未兑现项和对下一阶段形成的新条件；回报可以是理解、情绪、关系、能力、资源或目标变化，不规定固定章数和爽点频率。不要把更远阶段写死。",
+        crate::models::StoryArchitectMode::PlanCurrentArc => "细化当前故事阶段：目标、进入局面、核心冲突、退出变化、相关角色和近期章节计划。已通过正式章节只能作为已发生事实被总结，必须从第一章尚无正式正文的章节继续规划；不得回写、改名或用规划版本替代已写内容。对每个近期章节逐条调用创建章节计划或更新章节计划，提供 chapter_no、标题、目标、主要阻力、关键行动、必须发生的变化和离开状态；不要创建 category=chapter_plan 的知识卡。为当前阶段补充读者主要期待、推进证据、局部回报、尚未兑现项和对下一阶段形成的新条件；回报可以是理解、情绪、关系、能力、资源或目标变化，不规定固定章数和爽点频率。不要把更远阶段写死。",
         crate::models::StoryArchitectMode::ExtendNextArc => "基于当前阶段结局、正式章节、活跃伏笔与角色状态，提出下一故事阶段的候选方向；已通过正式章节和已经形成的阶段结果不可重写。每个候选阶段说明读者主要期待、可验证的推进证据、局部回报、继续保留的未兑现项和阶段结束后的新条件；不按目标字数平均切块，也不规定固定回报频率。新要素必须说明从何而来。",
         crate::models::StoryArchitectMode::DesignCharacters => "只补充或修订角色卡。角色必须有自身身份、目标、限制、已知信息、关系和长期变化条件；不要把世界规则、压迫链或章节任务写进角色卡。",
     }

@@ -5,11 +5,13 @@ use crate::{
     index_jobs,
     models::{
         ActionProposal, ActiveAgentRun, Agent, AgentRunRequest, AgentRunSummary, Artifact,
-        ArtifactFilters, ArtifactSummary, DecideActionProposalRequest, DerivedIndexJob,
-        ListActionProposalsRequest, OrchestratorTurnRequest, OrchestratorTurnResponse,
-        PreparedContext, ProjectWorkspace, ProposalApplyResult, ProviderCapabilities,
-        RevisionRequest, RunEvent, RunStoryArchitectRequest,
+        ArtifactFilters, ArtifactSummary, ConfirmCurrentPlanRequest, CurrentPlanConfirmationResult,
+        DecideActionProposalRequest, DerivedIndexJob, ListActionProposalsRequest,
+        OrchestratorTurnRequest, OrchestratorTurnResponse, PreparedContext, ProjectWorkspace,
+        ProposalApplyResult, ProviderCapabilities, RevisionRequest, RunEvent,
+        RunStoryArchitectRequest,
     },
+    story_architecture,
 };
 
 mod use_cases;
@@ -54,6 +56,13 @@ impl ApplicationGateway {
         agent_run_service::start_story_architect_run(&self.state, input).await
     }
 
+    pub async fn confirm_current_plan(
+        &self,
+        input: ConfirmCurrentPlanRequest,
+    ) -> AppResult<CurrentPlanConfirmationResult> {
+        story_architecture::confirm_current_plan(&self.state, input).await
+    }
+
     pub async fn start_revision_run(&self, input: RevisionRequest) -> AppResult<AgentRunSummary> {
         agent_run_service::start_revision_run(&self.state, input).await
     }
@@ -87,6 +96,7 @@ impl ApplicationGateway {
             project,
             genre_agent: self.state.get_genre_agent_for_project(project_id)?,
             chapters: self.state.list_chapters(project_id)?,
+            chapter_plans: self.state.list_chapter_plans(project_id)?,
             formal_char_count: self.state.formal_char_count(project_id)?,
             artifacts: self.state.list_artifact_summaries(ArtifactFilters {
                 project_id,
@@ -184,6 +194,89 @@ mod tests {
 
     use super::*;
     use crate::{index_jobs, models::NewProject};
+
+    /// 门禁硬阻断：正文质量不过关时审批必须被拒绝，且不得污染章节指针。
+    ///
+    /// 用的是第一章，跨章连续性评审会被跳过（见 `gate.rs`），因此本用例
+    /// 不依赖任何 AI 调用即可端到端验证"门禁确实挡在审批前面"。
+    #[tokio::test]
+    async fn body_approval_is_blocked_when_quality_gate_fails() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "门禁拦截".to_string(),
+                genre: "玄幻".to_string(),
+                target_words: 100_000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let chapter = state.list_chapters(project.id).unwrap().remove(0);
+        let artifact = state
+            .insert_artifact(
+                project.id,
+                Some(chapter.id),
+                "draft",
+                "带标题的劣质正文",
+                "# 第1章 开端\n\n他拿到了赤髓。",
+                None,
+            )
+            .unwrap();
+
+        let gateway = ApplicationGateway::new(state.clone());
+        let error = gateway
+            .approve_stage(project.id, "draft", artifact.id, None)
+            .await
+            .expect_err("质量门禁未通过时审批必须被拒绝");
+        assert!(
+            error.to_string().contains("质量门禁未通过"),
+            "实际错误信息：{error}"
+        );
+
+        let stored = state.get_artifact(artifact.id).unwrap();
+        assert_ne!(stored.status, "approved", "被拦下的产物不应被标记为已通过");
+        assert!(
+            state.list_chapters(project.id).unwrap()[0]
+                .current_artifact_id
+                .is_none(),
+            "被拦下的产物不应成为章节正式稿"
+        );
+    }
+
+    /// 门禁作用域：只拦正文阶段的转正，项目级资料阶段照常审批。
+    ///
+    /// 此处刻意复用上一用例里"含 Markdown 标题"的劣质内容——同样的内容
+    /// 在 `setting` 阶段必须放行，证明拦截是"按阶段"而不是"按内容"。
+    #[tokio::test]
+    async fn foundation_approval_skips_the_body_quality_gate() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "资料审批".to_string(),
+                genre: "玄幻".to_string(),
+                target_words: 100_000,
+                premise: "测试".to_string(),
+            })
+            .unwrap();
+        let artifact = state
+            .insert_artifact(
+                project.id,
+                None,
+                "setting",
+                "世界观",
+                "# 第1章 开端\n\n他拿到了赤髓。",
+                None,
+            )
+            .unwrap();
+
+        let gateway = ApplicationGateway::new(state.clone());
+        let approval = gateway
+            .approve_stage(project.id, "setting", artifact.id, None)
+            .await
+            .expect("项目级资料阶段不应被正文门禁拦截");
+        assert_eq!(approval.artifact_id, artifact.id);
+    }
 
     #[test]
     fn applying_a_knowledge_card_proposal_queues_search_rebuild() {

@@ -822,6 +822,7 @@ fn normalize_category(category: &str) -> Option<&'static str> {
         "faction" | "势力" | "组织" => Some("faction"),
         "taboo" | "禁忌" | "边界" => Some("taboo"),
         "item" | "物件" | "道具" => Some("item"),
+        "rule" | "规则" => Some("rule"),
         "outline" | "大纲" => Some("outline"),
         "character" | "角色" | "人物" => Some("character"),
         "other" | "其他" => Some("other"),
@@ -1173,6 +1174,12 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_category_accepts_setting_rule_cards() {
+        assert_eq!(normalize_category("rule"), Some("rule"));
+        assert_eq!(normalize_category("规则"), Some("rule"));
+    }
     use crate::models::{NewProject, SaveKnowledgeCard};
     use std::ops::Deref;
 

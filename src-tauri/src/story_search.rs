@@ -306,6 +306,23 @@ pub fn search_story_context(
     state: &AppState,
     input: &StoryContextSearchInput,
 ) -> AppResult<Vec<StoryContextSnippet>> {
+    search_story_context_with_embeddings(state, input, true)
+}
+
+/// Rebuilds of derived continuity metadata should remain cheap during startup.
+/// Interactive searches use the semantic model through `search_story_context`.
+pub(crate) fn search_story_context_lexical(
+    state: &AppState,
+    input: &StoryContextSearchInput,
+) -> AppResult<Vec<StoryContextSnippet>> {
+    search_story_context_with_embeddings(state, input, false)
+}
+
+fn search_story_context_with_embeddings(
+    state: &AppState,
+    input: &StoryContextSearchInput,
+    use_embeddings: bool,
+) -> AppResult<Vec<StoryContextSnippet>> {
     state.get_project(input.project_id)?;
     let query = normalize_text(&input.query);
     if query.is_empty() {
@@ -328,15 +345,17 @@ pub fn search_story_context(
         add_rank(&mut ranks, document, rank, &query);
     }
 
-    if let Ok(runtime) = EmbeddingRuntime::load(state) {
-        if ensure_vector_table(state).is_ok() {
-            if let Ok(vector) = runtime.encode(&query) {
-                for (rank, document) in
-                    vector_candidates(state, input.project_id, upper_bound, &vector)?
-                        .into_iter()
-                        .enumerate()
-                {
-                    add_rank(&mut ranks, document, rank, &query);
+    if use_embeddings {
+        if let Ok(runtime) = EmbeddingRuntime::load(state) {
+            if ensure_vector_table(state).is_ok() {
+                if let Ok(vector) = runtime.encode(&query) {
+                    for (rank, document) in
+                        vector_candidates(state, input.project_id, upper_bound, &vector)?
+                            .into_iter()
+                            .enumerate()
+                    {
+                        add_rank(&mut ranks, document, rank, &query);
+                    }
                 }
             }
         }

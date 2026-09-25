@@ -65,6 +65,7 @@ pub fn search_story_context(
         query,
         input.include_immediate_previous,
         true,
+        true,
     )?;
     let limit = input.limit.unwrap_or(6).clamp(1, 12);
     Ok(snippets.into_iter().take(limit).collect())
@@ -232,8 +233,14 @@ pub(super) fn retrieve_history_snippets(
     query: &str,
     include_immediate_previous: bool,
     include_messages: bool,
+    use_embeddings: bool,
 ) -> AppResult<Vec<StoryContextSnippet>> {
-    let indexed = crate::story_search::search_story_context(
+    let search = if use_embeddings {
+        crate::story_search::search_story_context
+    } else {
+        crate::story_search::search_story_context_lexical
+    };
+    let indexed = search(
         state,
         &StoryContextSearchInput {
             project_id,

@@ -23,17 +23,25 @@ use crate::{
     genre_agent, genre_skill,
     models::{
         Agent, AiProvider, AiSettings, Approval, Artifact, ArtifactFilters, Chapter,
-        ChapterMemoryRecord, ChapterUpdate, ContinuityLedgerEntry, DerivedIndexJob, Foreshadowing,
-        GenreAgentProfile, ImportReferenceTextRequest, KnowledgeCard, Message, NewChapter,
-        NewProject, Project, ProjectDetail, ProjectUpdate, ReferenceMaterial, RunEvent,
-        SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
-        SaveWritingSkill, StoryArc, StoryBible, StoryBibleReview, StoryEntity, StoryEvent,
-        StoryEventParticipant, StoryFact, StoryIndexSource, StorySearchSource, StoryThread,
-        UpdateReferenceMaterialRequest, WorkflowRun, WritingSkill,
+        ChapterMemoryRecord, ChapterPlan, ChapterUpdate, ContinuityLedgerEntry, DerivedIndexJob,
+        Foreshadowing, GenreAgentProfile, ImportReferenceTextRequest, KnowledgeCard, Message,
+        NewChapter, NewProject, Project, ProjectDetail, ProjectUpdate, ReferenceMaterial, RunEvent,
+        SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveChapterPlan, SaveForeshadowing,
+        SaveKnowledgeCard, SaveWritingSkill, StoryArc, StoryBible, StoryBibleReview, StoryEntity,
+        StoryEvent, StoryEventParticipant, StoryFact, StoryIndexSource, StorySearchSource,
+        StoryThread, UpdateReferenceMaterialRequest, WorkflowRun, WritingSkill,
     },
     reference::ReferenceStore,
     workflow,
 };
+
+#[derive(Debug)]
+pub struct CurrentPlanDataResult {
+    pub story_bible: Option<StoryBible>,
+    pub approved_card_count: i64,
+    pub approved_plan_count: i64,
+    pub blockers: Vec<String>,
+}
 
 mod lifecycle;
 
@@ -96,6 +104,14 @@ impl AppState {
         path: PathBuf,
         mut resource_roots: Vec<PathBuf>,
     ) -> AppResult<Self> {
+        // reqwest 会读取 macOS 系统代理并把回环请求也路由进去；本地代理无法回连
+        // 127.0.0.1，会以 502 拒绝。为回环地址补默认 NO_PROXY，用户显式设置优先。
+        if std::env::var_os("NO_PROXY").is_none() {
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
+        }
+        if std::env::var_os("no_proxy").is_none() {
+            std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
+        }
         resource_roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"));
         let api_key_cipher = ApiKeyCipher::new(&path)?;
         let manager = SqliteConnectionManager::file(path).with_init(|conn| {
@@ -697,6 +713,29 @@ impl AppState {
                     FOREIGN KEY(source_artifact_id) REFERENCES artifacts(id) ON DELETE SET NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS chapter_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL,
+                    chapter_no INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending_human_approval',
+                    story_arc_id INTEGER,
+                    chapter_id INTEGER,
+                    source_artifact_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(story_arc_id) REFERENCES story_arcs(id) ON DELETE SET NULL,
+                    FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE SET NULL,
+                    FOREIGN KEY(source_artifact_id) REFERENCES artifacts(id) ON DELETE SET NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chapter_plans_project_no_active
+                    ON chapter_plans(project_id, chapter_no)
+                    WHERE status <> 'archived';
+                CREATE INDEX IF NOT EXISTS idx_chapter_plans_project_status_no
+                    ON chapter_plans(project_id, status, chapter_no, id);
+
                 CREATE TABLE IF NOT EXISTS story_bible_reviews (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id INTEGER NOT NULL,
@@ -961,6 +1000,7 @@ impl AppState {
             project: self.get_project(project_id)?,
             genre_agent: self.get_genre_agent_for_project(project_id)?,
             chapters: self.list_chapters(project_id)?,
+            chapter_plans: self.list_chapter_plans(project_id)?,
             agents: self.list_agents_for_project(project_id)?,
             artifacts: self.list_artifacts(ArtifactFilters {
                 project_id,
@@ -1634,6 +1674,370 @@ impl AppState {
             }),
             None => Ok(None),
         }
+    }
+
+    pub fn list_chapter_plans(&self, project_id: i64) -> AppResult<Vec<ChapterPlan>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, chapter_no, title, content, status, story_arc_id,
+                        chapter_id, source_artifact_id, created_at, updated_at
+                 FROM chapter_plans WHERE project_id = ?1
+                 ORDER BY CASE status WHEN 'approved' THEN 0 WHEN 'pending_human_approval' THEN 1 ELSE 2 END,
+                          chapter_no ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![project_id], map_chapter_plan)?;
+            collect_rows(rows)
+        })
+    }
+
+    pub fn approved_chapter_plan(
+        &self,
+        project_id: i64,
+        chapter_no: i64,
+    ) -> AppResult<Option<ChapterPlan>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, project_id, chapter_no, title, content, status, story_arc_id,
+                        chapter_id, source_artifact_id, created_at, updated_at
+                 FROM chapter_plans
+                 WHERE project_id = ?1 AND chapter_no = ?2 AND status = 'approved'
+                 ORDER BY id DESC LIMIT 1",
+                params![project_id, chapter_no],
+                map_chapter_plan,
+            )
+            .optional()
+            .map_err(AppError::from)
+        })
+    }
+
+    pub fn save_chapter_plan(&self, input: SaveChapterPlan) -> AppResult<ChapterPlan> {
+        if input.project_id <= 0 {
+            return Err(AppError::Validation("项目不存在".to_string()));
+        }
+        if input.chapter_no <= 0 {
+            return Err(AppError::Validation("章节序号必须大于 0".to_string()));
+        }
+        if input.title.trim().is_empty() {
+            return Err(AppError::Validation("章节计划标题不能为空".to_string()));
+        }
+        if input.title.chars().count() > 160 {
+            return Err(AppError::Validation(
+                "章节计划标题不能超过 160 个字".to_string(),
+            ));
+        }
+        if input.content.trim().is_empty() {
+            return Err(AppError::Validation("章节计划内容不能为空".to_string()));
+        }
+        if input.content.chars().count() > 50_000 {
+            return Err(AppError::Validation(
+                "章节计划内容不能超过 50000 个字".to_string(),
+            ));
+        }
+        if !matches!(
+            input.status.trim(),
+            "pending_human_approval" | "approved" | "archived"
+        ) {
+            return Err(AppError::Validation("章节计划状态无效".to_string()));
+        }
+        if input.id.is_some_and(|id| id <= 0) {
+            return Err(AppError::Validation("章节计划 ID 无效".to_string()));
+        }
+
+        self.get_project(input.project_id)?;
+        let timestamp = now();
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let previous_status = input
+                    .id
+                    .map(|id| {
+                        conn.query_row(
+                            "SELECT status FROM chapter_plans WHERE id = ?1 AND project_id = ?2",
+                            params![id, input.project_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                    })
+                    .transpose()?
+                    .flatten();
+                if input.id.is_some() && previous_status.is_none() {
+                    return Err(AppError::Validation(
+                        "章节计划不存在或不属于当前项目".to_string(),
+                    ));
+                }
+
+                if input.status.trim() != "archived" {
+                    let duplicate_id: Option<i64> = conn
+                        .query_row(
+                            "SELECT id FROM chapter_plans
+                             WHERE project_id = ?1 AND chapter_no = ?2
+                               AND status <> 'archived'
+                               AND (?3 IS NULL OR id <> ?3)
+                             ORDER BY id DESC LIMIT 1",
+                            params![input.project_id, input.chapter_no, input.id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if duplicate_id.is_some() {
+                        return Err(AppError::Validation(format!(
+                            "第 {} 章已有章节计划，请编辑现有计划",
+                            input.chapter_no
+                        )));
+                    }
+                }
+
+                if let Some(story_arc_id) = input.story_arc_id {
+                    let belongs: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM story_arcs WHERE id = ?1 AND project_id = ?2)",
+                        params![story_arc_id, input.project_id],
+                        |row| row.get(0),
+                    )?;
+                    if !belongs {
+                        return Err(AppError::Validation("故事阶段不属于当前项目".to_string()));
+                    }
+                }
+                if let Some(chapter_id) = input.chapter_id {
+                    let chapter_no: Option<i64> = conn
+                        .query_row(
+                            "SELECT chapter_no FROM chapters WHERE id = ?1 AND project_id = ?2",
+                            params![chapter_id, input.project_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    match chapter_no {
+                        Some(chapter_no) if chapter_no == input.chapter_no => {}
+                        Some(_) => {
+                            return Err(AppError::Validation(
+                                "正文章节序号与章节计划不一致".to_string(),
+                            ));
+                        }
+                        None => {
+                            return Err(AppError::Validation("正文章节不属于当前项目".to_string()));
+                        }
+                    }
+                }
+                if let Some(source_artifact_id) = input.source_artifact_id {
+                    let belongs: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = ?1 AND project_id = ?2)",
+                        params![source_artifact_id, input.project_id],
+                        |row| row.get(0),
+                    )?;
+                    if !belongs {
+                        return Err(AppError::Validation("来源产物不属于当前项目".to_string()));
+                    }
+                }
+
+                let status = input.status.trim();
+                if let Some(id) = input.id {
+                    conn.execute(
+                        "UPDATE chapter_plans
+                         SET chapter_no = ?1, title = ?2, content = ?3, status = ?4,
+                             story_arc_id = ?5, chapter_id = ?6, source_artifact_id = ?7,
+                             updated_at = ?8
+                         WHERE id = ?9 AND project_id = ?10",
+                        params![
+                            input.chapter_no,
+                            input.title.trim(),
+                            input.content.trim(),
+                            status,
+                            input.story_arc_id,
+                            input.chapter_id,
+                            input.source_artifact_id,
+                            &timestamp,
+                            id,
+                            input.project_id
+                        ],
+                    )?;
+                } else {
+                    conn.execute(
+                        "INSERT INTO chapter_plans
+                            (project_id, chapter_no, title, content, status, story_arc_id,
+                             chapter_id, source_artifact_id, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                        params![
+                            input.project_id,
+                            input.chapter_no,
+                            input.title.trim(),
+                            input.content.trim(),
+                            status,
+                            input.story_arc_id,
+                            input.chapter_id,
+                            input.source_artifact_id,
+                            &timestamp
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![&timestamp, input.project_id],
+                )?;
+                if status == "approved" || previous_status.as_deref() == Some("approved") {
+                    mark_story_bible_changed_tx(conn, input.project_id, &timestamp)?;
+                }
+                let id = input.id.unwrap_or_else(|| conn.last_insert_rowid());
+                conn.query_row(
+                    "SELECT id, project_id, chapter_no, title, content, status, story_arc_id,
+                            chapter_id, source_artifact_id, created_at, updated_at
+                     FROM chapter_plans WHERE id = ?1 AND project_id = ?2",
+                    params![id, input.project_id],
+                    map_chapter_plan,
+                )
+                .map_err(AppError::from)
+            })();
+            match result {
+                Ok(plan) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(plan)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    pub fn delete_chapter_plan(&self, project_id: i64, plan_id: i64) -> AppResult<()> {
+        if project_id <= 0 || plan_id <= 0 {
+            return Err(AppError::Validation("项目或章节计划不存在".to_string()));
+        }
+        let timestamp = now();
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let status: String = conn
+                    .query_row(
+                        "SELECT status FROM chapter_plans WHERE id = ?1 AND project_id = ?2",
+                        params![plan_id, project_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        AppError::Validation("章节计划不存在或不属于当前项目".to_string())
+                    })?;
+                conn.execute(
+                    "DELETE FROM chapter_plans WHERE id = ?1 AND project_id = ?2",
+                    params![plan_id, project_id],
+                )?;
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![&timestamp, project_id],
+                )?;
+                if status == "approved" {
+                    mark_story_bible_changed_tx(conn, project_id, &timestamp)?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    pub fn create_chapter_from_plan(&self, project_id: i64, plan_id: i64) -> AppResult<Chapter> {
+        if project_id <= 0 || plan_id <= 0 {
+            return Err(AppError::Validation("项目或章节计划不存在".to_string()));
+        }
+        let timestamp = now();
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let plan = conn
+                    .query_row(
+                        "SELECT id, project_id, chapter_no, title, content, status, story_arc_id,
+                                chapter_id, source_artifact_id, created_at, updated_at
+                         FROM chapter_plans WHERE id = ?1 AND project_id = ?2",
+                        params![plan_id, project_id],
+                        map_chapter_plan,
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        AppError::Validation("章节计划不存在或不属于当前项目".to_string())
+                    })?;
+                if plan.status != "approved" {
+                    return Err(AppError::Validation(
+                        "请先确认章节计划，再创建正文".to_string(),
+                    ));
+                }
+
+                let mut chapter = conn
+                    .query_row(
+                        "SELECT id, project_id, chapter_no, title, status, current_artifact_id,
+                                created_at, updated_at
+                         FROM chapters WHERE id = ?1 AND project_id = ?2",
+                        params![plan.chapter_id, project_id],
+                        map_chapter,
+                    )
+                    .optional()?;
+                if chapter.is_none() {
+                    chapter = conn
+                        .query_row(
+                            "SELECT id, project_id, chapter_no, title, status, current_artifact_id,
+                                    created_at, updated_at
+                             FROM chapters WHERE project_id = ?1 AND chapter_no = ?2",
+                            params![project_id, plan.chapter_no],
+                            map_chapter,
+                        )
+                        .optional()?;
+                }
+                let chapter = if let Some(mut chapter) = chapter {
+                    let placeholder = chapter.title.trim().is_empty()
+                        || chapter.title.trim() == format!("第 {} 章", plan.chapter_no)
+                        || chapter.title.trim() == format!("第{}章", plan.chapter_no);
+                    if placeholder {
+                        conn.execute(
+                            "UPDATE chapters SET title = ?1, updated_at = ?2
+                             WHERE id = ?3 AND project_id = ?4",
+                            params![plan.title.trim(), &timestamp, chapter.id, project_id],
+                        )?;
+                        chapter.title = plan.title.trim().to_string();
+                        chapter.updated_at = timestamp.clone();
+                    }
+                    chapter
+                } else {
+                    conn.execute(
+                        "INSERT INTO chapters
+                            (project_id, chapter_no, title, status, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 'planning', ?4, ?4)",
+                        params![project_id, plan.chapter_no, plan.title.trim(), &timestamp],
+                    )?;
+                    conn.query_row(
+                        "SELECT id, project_id, chapter_no, title, status, current_artifact_id,
+                                created_at, updated_at
+                         FROM chapters WHERE id = ?1",
+                        params![conn.last_insert_rowid()],
+                        map_chapter,
+                    )?
+                };
+                conn.execute(
+                    "UPDATE chapter_plans SET chapter_id = ?1, updated_at = ?2
+                     WHERE id = ?3 AND project_id = ?4",
+                    params![chapter.id, &timestamp, plan_id, project_id],
+                )?;
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![&timestamp, project_id],
+                )?;
+                Ok(chapter)
+            })();
+            match result {
+                Ok(chapter) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(chapter)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
     }
 
     pub fn list_artifacts(&self, filters: ArtifactFilters) -> AppResult<Vec<Artifact>> {
@@ -3472,6 +3876,189 @@ impl AppState {
         })
     }
 
+    /// Confirm all pending foundation cards and establish the project-level
+    /// story bible in one transaction. Review confirmation is deliberately
+    /// handled by the story-architecture use case after the AI review exists.
+    pub fn confirm_current_plan_data_atomic(
+        &self,
+        project_id: i64,
+        note: &str,
+    ) -> AppResult<CurrentPlanDataResult> {
+        let timestamp = now();
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.query_row(
+                    "SELECT id FROM projects WHERE id = ?1",
+                    params![project_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("项目不存在".to_string()))?;
+
+                let mut blockers = Vec::new();
+                for stage in ["setting", "outline", "characters"] {
+                    if !has_foundation_material_tx(conn, project_id, stage)? {
+                        blockers.push(format!("缺少{}基础资料", stage_label(stage)));
+                    }
+                }
+                if !blockers.is_empty() {
+                    return Ok(CurrentPlanDataResult {
+                        story_bible: None,
+                        approved_card_count: 0,
+                        approved_plan_count: 0,
+                        blockers,
+                    });
+                }
+
+                let approved_card_count = conn.execute(
+                    "UPDATE knowledge_cards
+                     SET status = 'approved', updated_at = ?1
+                     WHERE project_id = ?2
+                       AND status = 'pending_human_approval'
+                       AND source_chapter_id IS NULL
+                       AND category IN ('world', 'cultivation', 'map', 'faction', 'taboo', 'item', 'rule',
+                                        'outline', 'chapter_plan', 'character')",
+                    params![&timestamp, project_id],
+                )? as i64;
+                let approved_plan_count = conn.execute(
+                    "UPDATE chapter_plans
+                     SET status = 'approved', updated_at = ?1
+                     WHERE project_id = ?2 AND status = 'pending_human_approval'",
+                    params![&timestamp, project_id],
+                )? as i64;
+
+                let setting_artifact = approved_foundation_artifact_tx(conn, project_id, "setting")?;
+                let outline_artifact = approved_foundation_artifact_tx(conn, project_id, "outline")?;
+                let setting_content = setting_artifact
+                    .as_ref()
+                    .map(|artifact| artifact.content.clone())
+                    .unwrap_or(approved_foundation_card_content_tx(conn, project_id, "setting")?);
+                let outline_content = outline_artifact
+                    .as_ref()
+                    .map(|artifact| artifact.content.clone())
+                    .unwrap_or(approved_foundation_card_content_tx(conn, project_id, "outline")?);
+                let premise: String = conn.query_row(
+                    "SELECT premise FROM projects WHERE id = ?1",
+                    params![project_id],
+                    |row| row.get(0),
+                )?;
+
+                let has_active_arc: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM story_arcs
+                                   WHERE project_id = ?1 AND status = 'active')",
+                    params![project_id],
+                    |row| row.get(0),
+                )?;
+                let data_changed = approved_card_count > 0 || approved_plan_count > 0 || !has_active_arc;
+                let existing_bible = query_story_bible_by_project_tx(conn, project_id)?;
+                let bible_created = existing_bible.is_none();
+
+                match existing_bible {
+                    Some(bible) if data_changed => {
+                        conn.execute(
+                            "UPDATE story_bibles
+                             SET reader_promise = ?1, protagonist_engine = ?2,
+                                 canon_version = canon_version + 1,
+                                 status = 'needs_review', source_artifact_id = ?3,
+                                 updated_at = ?4
+                             WHERE project_id = ?5",
+                            params![
+                                setting_content,
+                                premise,
+                                setting_artifact.as_ref().map(|artifact| artifact.id),
+                                &timestamp,
+                                project_id
+                            ],
+                        )?;
+                        let _ = bible;
+                    }
+                    Some(_) => {}
+                    None => {
+                        conn.execute(
+                            "INSERT INTO story_bibles
+                                (project_id, reader_promise, protagonist_engine, core_conflict,
+                                 endgame_direction, immutable_rules, canon_version, status,
+                                 source_artifact_id, created_at, updated_at)
+                             VALUES (?1, ?2, ?3, '', '', '', 1, 'needs_review', ?4, ?5, ?5)",
+                            params![
+                                project_id,
+                                setting_content,
+                                premise,
+                                setting_artifact.as_ref().map(|artifact| artifact.id),
+                                &timestamp
+                            ],
+                        )?;
+                    }
+                }
+
+                if !has_active_arc {
+                    let arc_no: i64 = conn.query_row(
+                        "SELECT COALESCE(MAX(arc_no), 0) + 1
+                         FROM story_arcs WHERE project_id = ?1",
+                        params![project_id],
+                        |row| row.get(0),
+                    )?;
+                    conn.execute(
+                        "INSERT INTO story_arcs
+                            (project_id, arc_no, title, objective, entry_state, exit_change,
+                             core_conflict, involved_characters, status, source_artifact_id,
+                             created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, '', '', '', '', 'active', ?5, ?6, ?6)",
+                        params![
+                            project_id,
+                            arc_no,
+                            format!("第 {} 故事阶段", arc_no),
+                            outline_content,
+                            outline_artifact.as_ref().map(|artifact| artifact.id),
+                            &timestamp
+                        ],
+                    )?;
+                }
+
+                if data_changed || bible_created {
+                    conn.execute(
+                        "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                        params![&timestamp, project_id],
+                    )?;
+                }
+                if data_changed || bible_created {
+                    conn.execute(
+                        "INSERT INTO messages (project_id, chapter_id, role, content, created_at)
+                         VALUES (?1, NULL, 'approval_note', ?2, ?3)",
+                        params![
+                            project_id,
+                            format!(
+                                "确认当前计划：本次确认 {} 张资料卡、{} 个章节计划。{}",
+                                approved_card_count,
+                                approved_plan_count,
+                                note.trim()
+                            ),
+                            &timestamp
+                        ],
+                    )?;
+                }
+
+                Ok(CurrentPlanDataResult {
+                    story_bible: query_story_bible_by_project_tx(conn, project_id)?,
+                    approved_card_count,
+                    approved_plan_count,
+                    blockers: Vec::new(),
+                })
+            })();
+            match result {
+                Ok(data) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(data)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
     pub fn get_story_bible(&self, project_id: i64) -> AppResult<Option<StoryBible>> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -3653,6 +4240,62 @@ impl AppState {
                 return Err(AppError::Validation("审校记录不存在或已处理".to_string()));
             }
             query_story_bible_review(conn, review_id)
+        })
+    }
+
+    pub fn confirm_current_plan_review_atomic(
+        &self,
+        project_id: i64,
+        review_id: i64,
+        note: &str,
+    ) -> AppResult<(StoryBible, StoryBibleReview)> {
+        let timestamp = now();
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let changed = conn.execute(
+                    "UPDATE story_bible_reviews
+                     SET status = 'confirmed', note = ?1, confirmed_at = ?2
+                     WHERE id = ?3 AND project_id = ?4
+                       AND status = 'pending_human_confirmation'",
+                    params![note.trim(), &timestamp, review_id, project_id],
+                )?;
+                if changed == 0 {
+                    return Err(AppError::Validation("审校记录不存在或已处理".to_string()));
+                }
+                let bible_changed = conn.execute(
+                    "UPDATE story_bibles
+                     SET status = 'confirmed', updated_at = ?1
+                     WHERE project_id = ?2",
+                    params![&timestamp, project_id],
+                )?;
+                if bible_changed == 0 {
+                    return Err(AppError::Validation("创作基准不存在".to_string()));
+                }
+                conn.execute(
+                    "INSERT INTO messages (project_id, chapter_id, role, content, created_at)
+                     VALUES (?1, NULL, 'approval_note', ?2, ?3)",
+                    params![
+                        project_id,
+                        format!("确认当前计划的审校结论。{}", note.trim()),
+                        &timestamp
+                    ],
+                )?;
+                let bible = query_story_bible_by_project_tx(conn, project_id)?
+                    .ok_or_else(|| AppError::Validation("创作基准不存在".to_string()))?;
+                let review = query_story_bible_review(conn, review_id)?;
+                Ok((bible, review))
+            })();
+            match result {
+                Ok(data) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(data)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -4171,6 +4814,126 @@ pub(crate) fn mark_story_bible_changed_tx(
     Ok(())
 }
 
+fn foundation_categories_sql(stage: &str) -> &'static str {
+    match stage {
+        "setting" => "'world', 'cultivation', 'map', 'faction', 'taboo', 'item', 'rule'",
+        "outline" => "'outline', 'chapter_plan'",
+        "characters" => "'character'",
+        _ => "''",
+    }
+}
+
+fn has_foundation_material_tx(conn: &Connection, project_id: i64, stage: &str) -> AppResult<bool> {
+    let has_approved_artifact: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM artifacts a
+            INNER JOIN approvals ap ON ap.artifact_id = a.id
+            WHERE a.project_id = ?1 AND a.stage = ?2 AND a.chapter_id IS NULL
+        )",
+        params![project_id, stage],
+        |row| row.get(0),
+    )?;
+    if has_approved_artifact != 0 {
+        return Ok(true);
+    }
+    if stage == "outline" {
+        let has_plan: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM chapter_plans
+                WHERE project_id = ?1
+                  AND status IN ('pending_human_approval', 'approved')
+                  AND trim(content) <> ''
+            )",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        if has_plan != 0 {
+            return Ok(true);
+        }
+    }
+    let categories = foundation_categories_sql(stage);
+    let sql = format!(
+        "SELECT EXISTS(
+            SELECT 1 FROM knowledge_cards
+            WHERE project_id = ?1
+              AND status IN ('pending_human_approval', 'approved')
+              AND source_chapter_id IS NULL
+              AND category IN ({categories})
+              AND trim(content) <> ''
+        )"
+    );
+    let has_card: i64 = conn.query_row(&sql, params![project_id], |row| row.get(0))?;
+    Ok(has_card != 0)
+}
+
+fn approved_foundation_artifact_tx(
+    conn: &Connection,
+    project_id: i64,
+    stage: &str,
+) -> AppResult<Option<Artifact>> {
+    conn.query_row(
+        "SELECT a.id, a.project_id, a.chapter_id, a.stage, a.title, a.content,
+                a.version, a.status, a.parent_artifact_id, a.created_at
+         FROM artifacts a
+         INNER JOIN approvals ap ON ap.artifact_id = a.id
+         WHERE a.project_id = ?1 AND a.stage = ?2 AND a.chapter_id IS NULL
+         ORDER BY ap.created_at DESC, ap.id DESC LIMIT 1",
+        params![project_id, stage],
+        map_artifact,
+    )
+    .optional()
+    .map_err(AppError::from)
+}
+
+fn approved_foundation_card_content_tx(
+    conn: &Connection,
+    project_id: i64,
+    stage: &str,
+) -> AppResult<String> {
+    let categories = foundation_categories_sql(stage);
+    let sql = format!(
+        "SELECT COALESCE(group_concat(title || ': ' || content, char(10) || char(10)), '')
+         FROM knowledge_cards
+         WHERE project_id = ?1 AND status = 'approved' AND source_chapter_id IS NULL
+           AND category IN ({categories})"
+    );
+    let cards: String = conn
+        .query_row(&sql, params![project_id], |row| row.get(0))
+        .map_err(AppError::from)?;
+    if stage != "outline" {
+        return Ok(cards);
+    }
+    let plans: String = conn.query_row(
+        "SELECT COALESCE(group_concat(title || ': ' || content, char(10) || char(10)), '')
+         FROM chapter_plans
+         WHERE project_id = ?1 AND status = 'approved'",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    match (cards.trim().is_empty(), plans.trim().is_empty()) {
+        (true, true) => Ok(String::new()),
+        (true, false) => Ok(plans),
+        (false, true) => Ok(cards),
+        (false, false) => Ok(format!("{cards}\n\n{plans}")),
+    }
+}
+
+fn query_story_bible_by_project_tx(
+    conn: &Connection,
+    project_id: i64,
+) -> AppResult<Option<StoryBible>> {
+    conn.query_row(
+        "SELECT id, project_id, reader_promise, protagonist_engine, core_conflict,
+                endgame_direction, immutable_rules, canon_version, status,
+                source_artifact_id, created_at, updated_at
+         FROM story_bibles WHERE project_id = ?1",
+        params![project_id],
+        map_story_bible,
+    )
+    .optional()
+    .map_err(AppError::from)
+}
+
 fn delete_project_search_data_tx(conn: &Connection, project_id: i64) -> AppResult<()> {
     if table_exists(conn, "story_search_embeddings")? {
         conn.execute(
@@ -4365,6 +5128,22 @@ fn map_chapter(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chapter> {
         current_artifact_id: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+    })
+}
+
+fn map_chapter_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChapterPlan> {
+    Ok(ChapterPlan {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        chapter_no: row.get(2)?,
+        title: row.get(3)?,
+        content: row.get(4)?,
+        status: row.get(5)?,
+        story_arc_id: row.get(6)?,
+        chapter_id: row.get(7)?,
+        source_artifact_id: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -4754,7 +5533,7 @@ fn dedupe_approvals(conn: &Connection) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ToolProtocol;
+    use crate::models::{NewProject, SaveKnowledgeCard, ToolProtocol};
 
     #[test]
     fn initializes_database_and_defaults() {
@@ -5081,6 +5860,69 @@ mod tests {
                 .unwrap()
                 .agent_key,
             "mystery"
+        );
+    }
+
+    #[test]
+    fn reaps_orphaned_agent_runs_left_by_previous_process() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let (project_id, running_id, cancelling_id) = {
+            let state = AppState::from_path(path.clone()).unwrap();
+            let project = state
+                .create_project(NewProject {
+                    title: "僵尸运行清理".to_string(),
+                    genre: "悬疑".to_string(),
+                    target_words: 60000,
+                    premise: "测试孤儿运行恢复".to_string(),
+                })
+                .unwrap();
+            let running = state
+                .insert_workflow_run_with_meta(
+                    project.id,
+                    None,
+                    "draft",
+                    "输入",
+                    "",
+                    "running",
+                    None,
+                    0,
+                    None,
+                    Some("chapter_review"),
+                    "subagent",
+                    Some("第 1 章试读检查"),
+                )
+                .unwrap();
+            let cancelling = state
+                .insert_workflow_run_with_meta(
+                    project.id,
+                    None,
+                    "draft",
+                    "输入",
+                    "",
+                    "cancellation_requested",
+                    None,
+                    0,
+                    None,
+                    Some("orchestrator"),
+                    "orchestrator",
+                    None,
+                )
+                .unwrap();
+            (project.id, running.id, cancelling.id)
+        };
+
+        // 重新打开数据库：上次进程遗留的非终态运行必须被清理，
+        // 否则 get_active_agent_run 会把它们永远视为活跃。
+        let state = AppState::from_path(path).unwrap();
+        assert!(state.get_active_agent_run(project_id).unwrap().is_none());
+        assert_eq!(
+            state.get_workflow_run_v2(running_id).unwrap().status,
+            "failed"
+        );
+        assert_eq!(
+            state.get_workflow_run_v2(cancelling_id).unwrap().status,
+            "failed"
         );
     }
 
@@ -6470,5 +7312,228 @@ mod tests {
             .collect::<Vec<_>>();
         versions.sort_unstable();
         assert_eq!(versions, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn current_plan_confirmation_approves_all_foundation_cards_and_is_idempotent() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "统一确认".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "测试统一确认".to_string(),
+            })
+            .unwrap();
+        for (category, title) in [
+            ("world", "世界规则"),
+            ("outline", "当前阶段"),
+            ("character", "主角"),
+        ] {
+            state
+                .save_knowledge_card(SaveKnowledgeCard {
+                    id: None,
+                    project_id: project.id,
+                    category: category.to_string(),
+                    title: title.to_string(),
+                    content: format!("{title}的稳定资料"),
+                    status: "pending_human_approval".to_string(),
+                    source_artifact_id: None,
+                    source_chapter_id: None,
+                })
+                .unwrap();
+        }
+        let archived = state
+            .save_knowledge_card(SaveKnowledgeCard {
+                id: None,
+                project_id: project.id,
+                category: "world".to_string(),
+                title: "已归档规则".to_string(),
+                content: "不应重新启用".to_string(),
+                status: "archived".to_string(),
+                source_artifact_id: None,
+                source_chapter_id: None,
+            })
+            .unwrap();
+
+        let first = state
+            .confirm_current_plan_data_atomic(project.id, "首次确认")
+            .unwrap();
+        assert!(first.blockers.is_empty());
+        assert_eq!(first.approved_card_count, 3);
+        assert_eq!(first.story_bible.as_ref().unwrap().status, "needs_review");
+        assert!(state.active_story_arc(project.id).unwrap().is_some());
+        assert_eq!(
+            state
+                .get_knowledge_card(project.id, archived.id)
+                .unwrap()
+                .status,
+            "archived"
+        );
+
+        let bible_before = first.story_bible.unwrap();
+        let second = state
+            .confirm_current_plan_data_atomic(project.id, "重复确认")
+            .unwrap();
+        let bible_after = second.story_bible.unwrap();
+        assert_eq!(second.approved_card_count, 0);
+        assert_eq!(bible_after.id, bible_before.id);
+        assert_eq!(bible_after.canon_version, bible_before.canon_version);
+        assert_eq!(bible_after.updated_at, bible_before.updated_at);
+    }
+
+    #[test]
+    fn current_plan_confirmation_blocks_without_all_three_foundations() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "缺失基础资料".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "测试缺失".to_string(),
+            })
+            .unwrap();
+        for (category, title) in [("world", "世界规则"), ("outline", "阶段大纲")] {
+            state
+                .save_knowledge_card(SaveKnowledgeCard {
+                    id: None,
+                    project_id: project.id,
+                    category: category.to_string(),
+                    title: title.to_string(),
+                    content: "待确认资料".to_string(),
+                    status: "pending_human_approval".to_string(),
+                    source_artifact_id: None,
+                    source_chapter_id: None,
+                })
+                .unwrap();
+        }
+        let result = state
+            .confirm_current_plan_data_atomic(project.id, "")
+            .unwrap();
+        assert_eq!(result.approved_card_count, 0);
+        assert!(result.story_bible.is_none());
+        assert!(result.blockers.iter().any(|item| item.contains("角色")));
+        assert!(state.get_story_bible(project.id).unwrap().is_none());
+        assert!(state.active_story_arc(project.id).unwrap().is_none());
+        assert!(state
+            .list_knowledge_cards(project.id)
+            .unwrap()
+            .iter()
+            .all(|card| card.status == "pending_human_approval"));
+        assert!(state.list_messages(project.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn current_plan_confirmation_rolls_back_card_approval_when_bible_write_fails() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "事务回滚".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "测试事务回滚".to_string(),
+            })
+            .unwrap();
+        for category in ["world", "outline", "character"] {
+            state
+                .save_knowledge_card(SaveKnowledgeCard {
+                    id: None,
+                    project_id: project.id,
+                    category: category.to_string(),
+                    title: category.to_string(),
+                    content: "待确认资料".to_string(),
+                    status: "pending_human_approval".to_string(),
+                    source_artifact_id: None,
+                    source_chapter_id: None,
+                })
+                .unwrap();
+        }
+        state
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_current_plan_bible
+                     BEFORE INSERT ON story_bibles
+                     BEGIN SELECT RAISE(ABORT, 'forced current plan failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(state
+            .confirm_current_plan_data_atomic(project.id, "")
+            .is_err());
+        assert!(state.get_story_bible(project.id).unwrap().is_none());
+        assert!(state.active_story_arc(project.id).unwrap().is_none());
+        assert!(state
+            .list_knowledge_cards(project.id)
+            .unwrap()
+            .iter()
+            .all(|card| card.status == "pending_human_approval"));
+    }
+
+    #[test]
+    fn chapter_plan_is_independent_until_confirmed_then_can_create_body_chapter() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "独立章节计划".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "测试章节计划先于正文".to_string(),
+            })
+            .unwrap();
+        for (category, title) in [("world", "世界规则"), ("character", "主角")] {
+            state
+                .save_knowledge_card(SaveKnowledgeCard {
+                    id: None,
+                    project_id: project.id,
+                    category: category.to_string(),
+                    title: title.to_string(),
+                    content: "稳定资料".to_string(),
+                    status: "pending_human_approval".to_string(),
+                    source_artifact_id: None,
+                    source_chapter_id: None,
+                })
+                .unwrap();
+        }
+        let plan = state
+            .save_chapter_plan(SaveChapterPlan {
+                id: None,
+                project_id: project.id,
+                chapter_no: 2,
+                title: "雨夜入城".to_string(),
+                content: "主角必须在封锁前入城，付出代价后带着新的限制离开。".to_string(),
+                status: "pending_human_approval".to_string(),
+                story_arc_id: None,
+                chapter_id: None,
+                source_artifact_id: None,
+            })
+            .unwrap();
+        assert!(state
+            .list_chapters(project.id)
+            .unwrap()
+            .iter()
+            .all(|chapter| chapter.chapter_no != 2));
+        assert_eq!(plan.status, "pending_human_approval");
+
+        let confirmation = state
+            .confirm_current_plan_data_atomic(project.id, "确认")
+            .unwrap();
+        assert_eq!(confirmation.approved_plan_count, 1);
+        assert_eq!(
+            state.list_chapter_plans(project.id).unwrap()[0].status,
+            "approved"
+        );
+        let chapter = state.create_chapter_from_plan(project.id, plan.id).unwrap();
+        assert_eq!(chapter.chapter_no, 2);
+        assert_eq!(chapter.title, "雨夜入城");
+        assert_eq!(
+            state.list_chapter_plans(project.id).unwrap()[0].chapter_id,
+            Some(chapter.id)
+        );
     }
 }

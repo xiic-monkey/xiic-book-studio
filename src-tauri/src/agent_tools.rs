@@ -18,6 +18,8 @@ pub const PROPOSE_RENAME_CHAPTER: &str = "propose_rename_chapter";
 pub const PROPOSE_ARTIFACT_CANDIDATE: &str = "propose_artifact_candidate";
 pub const CREATE_KNOWLEDGE_CARD: &str = "create_knowledge_card";
 pub const UPDATE_KNOWLEDGE_CARD: &str = "update_knowledge_card";
+pub const CREATE_CHAPTER_PLAN: &str = "create_chapter_plan";
+pub const UPDATE_CHAPTER_PLAN: &str = "update_chapter_plan";
 pub const PROPOSE_KNOWLEDGE_CARD: &str = "propose_knowledge_card";
 pub const PROPOSE_UPDATE_KNOWLEDGE_CARD: &str = "propose_update_knowledge_card";
 pub const PROPOSE_DELETE_KNOWLEDGE_CARD: &str = "propose_delete_knowledge_card";
@@ -374,6 +376,47 @@ pub fn definitions() -> Vec<AgentToolDefinition> {
                     "content": {"type": "string", "minLength": 1}
                 },
                 "required": ["card_id", "category", "title", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            CREATE_CHAPTER_PLAN,
+            "创建章节计划",
+            "为一个尚未写正文的章节创建独立章节计划，自动保存为待人工确认；仅故事架构 Agent 可用。",
+            "章节计划写入",
+            "proposal",
+            &["outline"],
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "chapter_no": {"type": "integer", "minimum": 1},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "content": {"type": "string", "minLength": 1, "maxLength": 50000},
+                    "story_arc_id": {"type": "integer", "minimum": 1}
+                },
+                "required": ["chapter_no", "title", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            UPDATE_CHAPTER_PLAN,
+            "更新章节计划",
+            "更新独立章节计划并重新置为待人工确认；仅故事架构 Agent 可用。",
+            "章节计划写入",
+            "proposal",
+            &["outline"],
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "integer", "minimum": 1},
+                    "chapter_no": {"type": "integer", "minimum": 1},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "content": {"type": "string", "minLength": 1, "maxLength": 50000},
+                    "story_arc_id": {"type": "integer", "minimum": 1}
+                },
+                "required": ["plan_id", "chapter_no", "title", "content"],
                 "additionalProperties": false
             }),
         ),

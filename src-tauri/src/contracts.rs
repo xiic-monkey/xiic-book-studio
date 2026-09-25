@@ -9,6 +9,9 @@ pub const V2_COMMANDS: &[(&str, &str)] = &[
     ("listRunEvents", "list_run_events"),
     ("getActiveAgentRun", "get_active_agent_run"),
     ("getProjectWorkspace", "get_project_workspace"),
+    ("saveChapterPlan", "save_chapter_plan"),
+    ("deleteChapterPlan", "delete_chapter_plan"),
+    ("createChapterFromPlan", "create_chapter_from_plan"),
     ("getArtifact", "get_artifact_v2"),
     ("listArtifactSummaries", "list_artifact_summaries"),
     ("listIndexJobs", "list_index_jobs"),
@@ -17,4 +20,5 @@ pub const V2_COMMANDS: &[(&str, &str)] = &[
     ("rejectActionProposal", "reject_action_proposal"),
     ("getProviderCapabilities", "get_provider_capabilities"),
     ("resetAgentPrompt", "reset_agent_prompt"),
+    ("confirmCurrentPlan", "confirm_current_plan"),
 ];

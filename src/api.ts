@@ -18,6 +18,7 @@ import type {
   Artifact,
   ArtifactSummary,
   Chapter,
+  ChapterPlan,
   ChapterMemoryRecord,
   ChapterGateReport,
   ChapterSplitPlan,
@@ -61,6 +62,7 @@ import type {
   StoryArc,
   StoryBible,
   StoryBibleReview,
+  CurrentPlanConfirmationResult,
   StoryArchitectMode,
   WritingSkill
 } from "./types";
@@ -130,6 +132,25 @@ export const api = {
   deleteChapter: (projectId: number, chapterId: number) =>
     invokeCommand<void>("delete_chapter", { projectId, chapterId }),
   updateChapter: (input: ChapterUpdate) => invokeCommand<Chapter>("update_chapter", { input }),
+  saveChapterPlan: (input: {
+    id?: number | null;
+    project_id: number;
+    chapter_no: number;
+    title: string;
+    content: string;
+    status: "pending_human_approval" | "approved" | "archived";
+    story_arc_id?: number | null;
+    chapter_id?: number | null;
+    source_artifact_id?: number | null;
+  }) => invokeCommand<ChapterPlan>(V2_COMMANDS.saveChapterPlan, { input }),
+  deleteChapterPlan: (projectId: number, planId: number) =>
+    invokeCommand<void>(V2_COMMANDS.deleteChapterPlan, {
+      input: { project_id: projectId, plan_id: planId },
+    }),
+  createChapterFromPlan: (projectId: number, planId: number) =>
+    invokeCommand<Chapter>(V2_COMMANDS.createChapterFromPlan, {
+      input: { project_id: projectId, plan_id: planId },
+    }),
   getProject: (projectId: number) =>
     invokeCommand<ProjectWorkspace>(V2_COMMANDS.getProjectWorkspace, { projectId }),
   getArtifact: (projectId: number, artifactId: number) =>
@@ -218,6 +239,9 @@ export const api = {
     chapter_id?: number | null;
     message: string;
     stage?: string | null;
+    source_artifact_id?: number | null;
+    story_architect_mode?: string | null;
+    reference_selection?: ReferenceSelection | null;
   }) => invokeCommand<OrchestratorTurnResponse>(V2_COMMANDS.startOrchestratorTurn, { input }),
   startStoryArchitectRun: (input: {
     project_id: number;
@@ -290,12 +314,14 @@ export const api = {
     invokeCommand<StorySearchStatus>("get_story_search_status", { projectId }),
   confirmStoryBible: (input: { project_id: number; note: string }) =>
     invokeCommand<StoryBible>("confirm_story_bible", { input }),
+  confirmCurrentPlan: (input: { project_id: number; note: string }) =>
+    invokeCommand<CurrentPlanConfirmationResult>(V2_COMMANDS.confirmCurrentPlan, { input }),
   reviewStoryBible: (input: { project_id: number }) =>
     invokeCommand<StoryBibleReview>("review_story_bible", { input }),
   confirmStoryBibleReview: (input: { project_id: number; review_id: number; note: string }) =>
     invokeCommand<StoryBibleReview>("confirm_story_bible_review", { input }),
   listStoryArcs: (projectId: number) => invokeCommand<StoryArc[]>("list_story_arcs", { projectId }),
-  approveStage: (projectId: number, stage: Stage, artifactId: number, note?: string) =>
+  approveStage: (projectId: number, stage: string, artifactId: number, note?: string) =>
     invokeCommand<Approval>("approve_stage", {
       projectId,
       stage,

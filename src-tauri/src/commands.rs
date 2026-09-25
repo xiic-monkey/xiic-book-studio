@@ -7,20 +7,22 @@ use crate::{
         ActionProposal, ActiveAgentRun, AdoptionBatchResult, AdoptionProposal, Agent,
         AgentRunRequest, AgentRunSummary, AgentStepResult, AgentToolDefinition, AiProvider,
         AiSettings, AiSpanRevisionRequest, Approval, Artifact, ArtifactFilters, ArtifactSummary,
-        Chapter, ChapterGateReport, ChapterGateRequest, ChapterSplitPlan, ChapterSplitPlanRequest,
-        ChapterUpdate, ClearChapterHistoryRequest, ConfirmStoryBibleRequest,
-        ConfirmStoryBibleReviewRequest, ContinuityReport, ContinuityReviewRequest,
-        DecideActionProposalRequest, DecideAdoptionProposalsRequest, DeleteArtifactRequest,
-        DeleteKnowledgeCardRequest, DerivedIndexJob, Foreshadowing, HistoryCleanupResult,
-        ImportReferenceTextRequest, KnowledgeCard, LedgerContinuityCheckRequest,
-        LedgerContinuityReport, ListActionProposalsRequest, ListAdoptionProposalsRequest,
-        ListModelsInput, NewChapter, NewProject, OrchestratorTurnRequest, OrchestratorTurnResponse,
+        Chapter, ChapterGateReport, ChapterGateRequest, ChapterPlan, ChapterSplitPlan,
+        ChapterSplitPlanRequest, ChapterUpdate, ClearChapterHistoryRequest,
+        ConfirmCurrentPlanRequest, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
+        ContinuityReport, ContinuityReviewRequest, CreateChapterFromPlanRequest,
+        CurrentPlanConfirmationResult, DecideActionProposalRequest, DecideAdoptionProposalsRequest,
+        DeleteArtifactRequest, DeleteChapterPlanRequest, DeleteKnowledgeCardRequest,
+        DerivedIndexJob, Foreshadowing, HistoryCleanupResult, ImportReferenceTextRequest,
+        KnowledgeCard, LedgerContinuityCheckRequest, LedgerContinuityReport,
+        ListActionProposalsRequest, ListAdoptionProposalsRequest, ListModelsInput, NewChapter,
+        NewProject, OrchestratorTurnRequest, OrchestratorTurnResponse,
         PrepareArtifactAdoptionsRequest, PreparedContext, Project, ProjectDetail, ProjectUpdate,
         ProjectWorkspace, ProposalApplyResult, ProviderCapabilities, QualityReport,
         RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, ReferenceMaterial,
         RetryIndexJobsRequest, RevisionRequest, RunEvent, RunStoryArchitectRequest,
-        SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveForeshadowing, SaveKnowledgeCard,
-        SaveWritingSkill, SpanReplacementRequest, StoryBible, StoryBibleReview,
+        SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveChapterPlan, SaveForeshadowing,
+        SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest, StoryBible, StoryBibleReview,
         StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextRerankResult,
         StoryContextSearchInput, StoryContextSnippet, StoryFactSearchResult, StoryIndexSummary,
         TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
@@ -118,6 +120,30 @@ pub fn update_chapter(
     input: ChapterUpdate,
 ) -> AppResult<Chapter> {
     gateway.update_chapter(input)
+}
+
+#[tauri::command]
+pub fn save_chapter_plan(
+    gateway: State<'_, ApplicationGateway>,
+    input: SaveChapterPlan,
+) -> AppResult<ChapterPlan> {
+    gateway.save_chapter_plan(input)
+}
+
+#[tauri::command]
+pub fn delete_chapter_plan(
+    gateway: State<'_, ApplicationGateway>,
+    input: DeleteChapterPlanRequest,
+) -> AppResult<()> {
+    gateway.delete_chapter_plan(input)
+}
+
+#[tauri::command]
+pub fn create_chapter_from_plan(
+    gateway: State<'_, ApplicationGateway>,
+    input: CreateChapterFromPlanRequest,
+) -> AppResult<Chapter> {
+    gateway.create_chapter_from_plan(input)
 }
 
 #[tauri::command]
@@ -282,6 +308,14 @@ pub fn confirm_story_bible(
 }
 
 #[tauri::command]
+pub async fn confirm_current_plan(
+    gateway: State<'_, ApplicationGateway>,
+    input: ConfirmCurrentPlanRequest,
+) -> AppResult<CurrentPlanConfirmationResult> {
+    gateway.confirm_current_plan(input).await
+}
+
+#[tauri::command]
 pub async fn review_story_bible(
     gateway: State<'_, ApplicationGateway>,
     input: StoryBibleReviewRequest,
@@ -306,14 +340,16 @@ pub fn list_story_arcs(
 }
 
 #[tauri::command]
-pub fn approve_stage(
+pub async fn approve_stage(
     gateway: State<'_, ApplicationGateway>,
     project_id: i64,
     stage: String,
     artifact_id: i64,
     note: Option<String>,
 ) -> AppResult<Approval> {
-    gateway.approve_stage(project_id, &stage, artifact_id, note.as_deref())
+    gateway
+        .approve_stage(project_id, &stage, artifact_id, note.as_deref())
+        .await
 }
 
 #[tauri::command]

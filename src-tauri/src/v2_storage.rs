@@ -316,7 +316,8 @@ impl AppState {
     pub fn get_active_agent_run(&self, project_id: i64) -> AppResult<Option<ActiveAgentRun>> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT id, project_id, chapter_id, stage, output, status, error, elapsed_ms, created_at
+                "SELECT id, project_id, chapter_id, stage, output, status, error, elapsed_ms, created_at,
+                        parent_run_id, run_kind, task_title
                  FROM workflow_runs
                  WHERE project_id = ?1 AND status IN ('streaming', 'running', 'cancellation_requested')
                  ORDER BY id DESC LIMIT 1",
@@ -332,6 +333,9 @@ impl AppState {
                         error: row.get(6)?,
                         elapsed_ms: row.get(7)?,
                         created_at: row.get(8)?,
+                        parent_run_id: row.get(9)?,
+                        run_kind: row.get(10)?,
+                        task_title: row.get(11)?,
                     })
                 },
             )
@@ -467,6 +471,34 @@ impl AppState {
             )
             .optional()?
             .ok_or_else(|| AppError::Validation("Agent 运行不存在".to_string()))
+        })
+    }
+
+    pub fn list_child_workflow_runs(&self, parent_run_id: i64) -> AppResult<Vec<WorkflowRun>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, chapter_id, stage, input, output, status, error, elapsed_ms, created_at, parent_run_id, agent_key, run_kind, task_title
+                 FROM workflow_runs WHERE parent_run_id = ?1 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map([parent_run_id], |row| {
+                Ok(WorkflowRun {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    chapter_id: row.get(2)?,
+                    stage: row.get(3)?,
+                    input: row.get(4)?,
+                    output: row.get(5)?,
+                    status: row.get(6)?,
+                    error: row.get(7)?,
+                    elapsed_ms: row.get(8)?,
+                    created_at: row.get(9)?,
+                    parent_run_id: row.get(10)?,
+                    agent_key: row.get(11)?,
+                    run_kind: row.get(12)?,
+                    task_title: row.get(13)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
         })
     }
 

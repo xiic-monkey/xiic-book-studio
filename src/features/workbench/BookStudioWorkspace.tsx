@@ -1,10 +1,9 @@
 import {
   AlertCircle,
+  Archive,
   BarChart3,
-  Box,
   BookOpen,
-  CalendarDays,
-  CalendarPlus,
+  Bot,
   Check,
   Copy,
   ChevronLeft,
@@ -13,6 +12,7 @@ import {
   Download,
   Eye,
   FileText,
+  History,
   Loader2,
   Rows3,
   MessageSquare,
@@ -27,10 +27,9 @@ import {
   Settings,
   Sparkles,
   Trash2,
-  Users,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import type { ChangeEvent, KeyboardEvent, PointerEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../../api";
@@ -40,7 +39,6 @@ import type { EntityTimelineEntry, StoryIndexStatus } from "../../components/Con
 import { KnowledgeSectionCard } from "../../components/KnowledgeSectionCard";
 import { Select } from "../../components/Select";
 import type {
-  AdoptionProposal,
   ActionProposal,
   ActiveAgentRun,
   AiProvider,
@@ -52,6 +50,7 @@ import type {
   ChapterGateReport,
   ChapterSplitPlan,
   Chapter,
+  ChapterPlan,
   Foreshadowing,
   KnowledgeCard,
   LedgerContinuityReport,
@@ -89,7 +88,6 @@ import { NewProjectModal } from "../../components/NewProjectModal";
 import { ProjectEditorModal } from "../../components/ProjectEditorModal";
 import { SettingsView } from "../../components/SettingsView";
 import { DropdownMenu } from "../../components/DropdownMenu";
-import { AdoptionDrawer } from "../../components/AdoptionDrawer";
 import { AgentRunInspector } from "../agent-runs/AgentRunInspector";
 import { useActionProposals } from "../proposals/useActionProposals";
 import { useArtifact } from "./useArtifact";
@@ -109,7 +107,70 @@ const productionStages: Array<{ id: Stage; label: string; scope: "chapter" }> = 
 
 const stages = [...foundationStages, ...productionStages];
 
-const bodyStages: Stage[] = ["revision", "draft"];
+const bodyStages: string[] = ["revision", "draft"];
+const adoptionActionLabel = "确认采用";
+const adoptedStatusLabel = "已采用";
+
+type ChapterFlowState = "empty" | "awaiting_review" | "needs_revision" | "ready_to_adopt" | "adopted";
+
+type ChapterFlow = {
+  state: ChapterFlowState;
+  label: string;
+  actionLabel: string;
+  bodyArtifact: Pick<Artifact, "id" | "project_id" | "chapter_id" | "stage" | "title" | "version" | "status" | "parent_artifact_id" | "created_at"> | null;
+  reviewArtifact: Artifact | null;
+  reviewIssueCount: number;
+};
+
+function parseReviewIssues(content: string): ReviewIssue[] {
+  try {
+    const parsed: unknown = JSON.parse(content);
+    return Array.isArray(parsed) ? parsed as ReviewIssue[] : [];
+  } catch {
+    return [];
+  }
+}
+
+export function formatReviewInstructions(issues: ReviewIssue[]): string {
+  if (issues.length === 0) return "";
+  const details = issues.map((issue, index) => {
+    const lines = [
+      `${index + 1}. [${issue.severity}] ${issue.issue_type}`,
+      `位置：${issue.location}`,
+      `原因：${issue.reason}`,
+      `修订建议：${issue.suggestion}`,
+    ];
+    if (issue.evidence_quote) lines.push(`依据：${issue.evidence_quote}`);
+    if (issue.action_evidence_quote) lines.push(`动作依据：${issue.action_evidence_quote}`);
+    return lines.join("\n");
+  });
+  return [
+    "请根据当前候选稿的试读建议进行修订。",
+    "优先处理以下问题，其他内容尽量保持不变。请生成新的候选稿，不要直接替换正式正文。",
+    "",
+    details.join("\n\n"),
+  ].join("\n");
+}
+
+export function buildChapterAgentPrompt(
+  projectTitle: string,
+  chapterLabel: string,
+  stage: Extract<Stage, "draft" | "review" | "revision">,
+  extraInstruction = "",
+) {
+  const action = stage === "review"
+    ? "提交一轮试读检查"
+    : stage === "revision"
+      ? "生成一版章节修订候选稿"
+      : "生成一版新的章节候选版本";
+  const prompt = `请由主 Agent 处理《${projectTitle}》的${chapterLabel}：${action}。请先确认任务类型，再委托对应的专业 Agent 执行。结果必须作为候选版本放入工作区供我确认采用，不要直接替换正式正文。`;
+  const hint = extraInstruction.trim();
+  return hint ? `${prompt}\n\n补充要求：${hint}` : prompt;
+}
+
+function artifactStageOr(value: string | null | undefined, fallback: Stage): Stage {
+  return asStage(value) ?? fallback;
+}
 
 const architectModeByStage: Record<"setting" | "outline" | "characters", StoryArchitectMode> = {
   setting: "refine_canon",
@@ -137,6 +198,67 @@ function resolveArchitectMode(value: string): StoryArchitectMode {
     : "refine_canon";
 }
 
+const foundationKnowledgeCategories = [
+  "world",
+  "cultivation",
+  "map",
+  "faction",
+  "taboo",
+  "item",
+  "rule",
+  "outline",
+  "chapter_plan",
+  "character",
+];
+
+function isFoundationKnowledgeCard(card: Pick<KnowledgeCard, "category" | "source_chapter_id">) {
+  return card.source_chapter_id == null && foundationKnowledgeCategories.includes(card.category);
+}
+
+export function currentPlanStatus(
+  workspace: (Pick<ProjectWorkspace, "story_bible" | "story_bible_review" | "canonical_fingerprint" | "knowledge_cards"> &
+    Partial<Pick<ProjectWorkspace, "chapter_plans">>) | null,
+) {
+  if (!workspace) return { label: "待打开项目", tone: "idle" };
+  const review = workspace.story_bible_review;
+  const reviewIsCurrent = Boolean(review && review.canon_fingerprint === workspace.canonical_fingerprint);
+  if (reviewIsCurrent && review?.issues.some((issue) => issue.severity === "major")) {
+    return { label: "存在阻断问题", tone: "blocked" };
+  }
+  if (
+    reviewIsCurrent
+    && review?.status === "confirmed"
+    && workspace.story_bible?.status === "confirmed"
+  ) {
+    return { label: adoptedStatusLabel, tone: "confirmed" };
+  }
+  if (reviewIsCurrent && review?.status === "pending_human_confirmation") {
+    return { label: "待确认审校", tone: "awaiting" };
+  }
+  if (workspace.story_bible?.status === "confirmed" || workspace.story_bible?.status === "needs_review" || review) {
+    return { label: "待审校", tone: "review" };
+  }
+  const hasFoundationCards = workspace.knowledge_cards.some((card) =>
+    card.status !== "archived"
+    && isFoundationKnowledgeCard(card),
+  );
+  const hasChapterPlans = (workspace.chapter_plans ?? []).some((plan) => plan.status !== "archived");
+  return { label: hasFoundationCards || hasChapterPlans ? "待确认资料" : "待完善计划", tone: "draft" };
+}
+
+function pendingFoundationCardCount(workspace: ProjectWorkspace | null) {
+  if (!workspace) return 0;
+  return workspace.knowledge_cards.filter((card) =>
+    card.status === "pending_human_approval"
+    && isFoundationKnowledgeCard(card),
+  ).length;
+}
+
+function pendingChapterPlanCount(workspace: ProjectWorkspace | null) {
+  if (!workspace) return 0;
+  return (workspace.chapter_plans ?? []).filter((plan) => plan.status === "pending_human_approval").length;
+}
+
 const defaultProject: NewProject = {
   title: "未命名小说",
   genre: "都市异能",
@@ -157,14 +279,57 @@ type ViewMode = "main" | "settings";
 type MainSurface = "official" | "workbench" | "library";
 type ContentSurface = "official" | "workbench";
 type LibrarySection = "setting" | "outline" | "characters";
-type LibraryFocus = LibrarySection | "items" | "events" | "foreshadowing";
+type LibraryFocus = LibrarySection | "character-timeline" | "items" | "events" | "foreshadowing";
+
+const libraryFocusMeta: Record<LibraryFocus, { group: string; title: string; description: string }> = {
+  setting: {
+    group: "创作计划",
+    title: "世界观",
+    description: "维护故事发生所依赖的世界规则、地点与重要设定。",
+  },
+  outline: {
+    group: "创作计划",
+    title: "大纲",
+    description: "安排故事阶段与章节任务，确认下一步要写什么。",
+  },
+  characters: {
+    group: "创作计划",
+    title: "角色",
+    description: "维护角色目标、关系与创作阶段需要遵守的基准。",
+  },
+  "character-timeline": {
+    group: "正文衍生资料",
+    title: "角色时间线",
+    description: "按角色查看正文中的状态变化与相关事件。",
+  },
+  events: {
+    group: "正文衍生资料",
+    title: "事件时间线",
+    description: "按正文发生顺序浏览已采用章节中的关键事件。",
+  },
+  items: {
+    group: "正文衍生资料",
+    title: "物品状态",
+    description: "追踪物品与资源在正文中的持有、位置和状态变化。",
+  },
+  foreshadowing: {
+    group: "主动维护",
+    title: "伏笔账本",
+    description: "登记、跟进并回收创作者主动维护的线索与承诺。",
+  },
+};
 type SettingsCategory = "ai" | "agents" | "skills" | "editor" | "data" | "appearance";
-type AgentRunMode = "smart" | "fresh";
+type AssistantMessageOptions = {
+  sourceArtifactId?: number | null;
+  stage?: Stage;
+  storyArchitectMode?: StoryArchitectMode | null;
+  referenceSelection?: ReferenceSelection | null;
+};
 type AssistantChatMessage = { id: string; role: "user" | "assistant"; content: string; order: number };
 type AssistantThinkingRound = { id: string; content: string; active: boolean };
 type AssistantTimelineItem =
   | { kind: "thinking"; id: string; content: string; active: boolean; sequence: number; order: number }
-  | { kind: "tool"; id: string; toolKey: string; status: "running" | "success" | "failed" | "rejected"; summary?: string; sequence: number; order: number }
+  | { kind: "tool"; id: string; toolKey: string; status: "running" | "success" | "failed" | "rejected"; summary?: string; invocationId?: number | null; sequence: number; order: number }
   | { kind: "output"; id: string; content: string; sequence: number; order: number }
   | { kind: "subagent"; id: string; runId: number; title: string; agentKey?: string | null; status: string; sequence: number; order: number };
 
@@ -181,6 +346,10 @@ const SIDEBAR_DEFAULT_WIDTH = 280;
 const SIDEBAR_COLLAPSED_WIDTH = 52;
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 420;
+const ASSISTANT_PANEL_WIDTH_STORAGE_KEY = "book-studio.agent-panel-width";
+const ASSISTANT_PANEL_DEFAULT_WIDTH = 360;
+const ASSISTANT_PANEL_MIN_WIDTH = 300;
+const ASSISTANT_PANEL_MAX_WIDTH = 520;
 const MAX_REFERENCE_FILE_BYTES = 20 * 1024 * 1024;
 
 function decodeReferenceText(buffer: ArrayBuffer) {
@@ -202,6 +371,10 @@ function clampSidebarWidth(width: number) {
   return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, width));
 }
 
+function clampAssistantPanelWidth(width: number) {
+  return Math.min(ASSISTANT_PANEL_MAX_WIDTH, Math.max(ASSISTANT_PANEL_MIN_WIDTH, width));
+}
+
 const assistantToolLabels: Record<string, string> = {
   story_context_search: "检索故事资料",
   prepare_agent_context: "准备创作上下文",
@@ -221,6 +394,26 @@ const assistantToolLabels: Record<string, string> = {
 
 function assistantToolLabel(toolKey: string) {
   return assistantToolLabels[toolKey] ?? toolKey.replace(/[_-]+/g, " ");
+}
+
+function runStatusLabel(status: string) {
+  if (status === "success") return "已完成";
+  if (status === "failed") return "失败";
+  if (status === "cancelled") return "已停止";
+  if (["running", "streaming", "cancellation_requested"].includes(status)) return "执行中";
+  return status;
+}
+
+function timelineToolStatus(status: string, hasError: boolean): "running" | "success" | "failed" | "rejected" {
+  if (hasError) return "failed";
+  if (status === "success") return "success";
+  if (status === "rejected") return "rejected";
+  if (["running", "started", "pending"].includes(status)) return "running";
+  return "failed";
+}
+
+export function isTopLevelStreamingRun(run: ActiveAgentRun | null | undefined) {
+  return Boolean(run && run.parent_run_id == null && run.run_kind !== "orchestrator");
 }
 
 function assistantToolTimeline(events: RunEvent[]): AssistantToolTimelineItem[] {
@@ -314,20 +507,67 @@ function applyThinkingEvent(
   ];
 }
 
-function thinkingSummaryTitle(content: string, active: boolean) {
-  const summary = content.trim().split(/\n|。|！|？/)[0]?.trim();
-  if (!summary) return active ? "思考中" : "思考摘要";
-  return summary.length > 52 ? `${summary.slice(0, 52)}…` : summary;
+export function splitThinkingContent(content: string, active: boolean) {
+  const trimmed = content.trim();
+  const first = trimmed.split(/\n|。|！|？/)[0]?.trim() ?? "";
+  const title = first.length > 52 ? `${first.slice(0, 52)}…` : first;
+  const rest = first && trimmed.length > first.length
+    ? trimmed.slice(first.length).replace(/^[。！？\n]+/, "")
+    : "";
+  return { title: title || (active ? "思考中" : "思考摘要"), rest };
 }
 
+function AssistantThinkingPanel({ content, active }: { content: string; active: boolean }) {
+  const { title, rest } = splitThinkingContent(content, active);
+  return (
+    <details
+      className={`assistant-thinking-panel${active ? " assistant-thinking-panel-current" : ""}`}
+      open={active}
+    >
+      <summary>
+        <span><Sparkles size={12} /> {title}</span>
+        <small>{active ? "实时更新" : "已完成"}</small>
+      </summary>
+      {rest ? <p>{rest}</p> : null}
+    </details>
+  );
+}
+
+export function compactAssistantOutput(content: string) {
+  const trimmed = content.trim();
+  const completion = trimmed.match(/^(已完成\s+\d+\s+个子任务)[。.!！]?/);
+  if (!completion) return content;
+
+  // 委托运行的前言一律折叠成短状态行，摘录正文留在子任务详情与候选稿面板里。
+  const remainder = trimmed.slice(completion[0].length).trim();
+  let label = remainder.split(/[:：]/, 1)[0]?.trim() ?? "";
+  if (label.length > 40) label = `${label.slice(0, 40)}…`;
+  return label ? `${completion[1]} · ${label}` : completion[1];
+}
+
+export function compactAssistantModelName(model: string) {
+  const trimmed = model.trim();
+  const withoutProvider = trimmed.replace(/^(?:deepseek|qwen|openai|anthropic|google|mistral)[-_\/]+/i, "");
+  return withoutProvider.replace(/[-_\/]+/g, " ") || trimmed;
+}
+
+const assistantEventOrderCache = new WeakMap<RunEvent, number>();
+
 function assistantEventOrder(event: RunEvent) {
+  // 排序比较器会反复调用：Date.parse 每个事件只算一次。
+  const cached = assistantEventOrderCache.get(event);
+  if (cached !== undefined) return cached;
   const timestamp = Date.parse(event.created_at);
-  return (Number.isFinite(timestamp) ? timestamp : 0) * 1000 + event.sequence;
+  const order = (Number.isFinite(timestamp) ? timestamp : 0) * 1000 + event.sequence;
+  assistantEventOrderCache.set(event, order);
+  return order;
 }
 
 function buildAssistantTimeline(events: RunEvent[]): AssistantTimelineItem[] {
   const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
   const items: AssistantTimelineItem[] = [];
+  const openThinking: Extract<AssistantTimelineItem, { kind: "thinking" }>[] = [];
+  const openTools = new Map<string, Extract<AssistantTimelineItem, { kind: "tool" }>>();
   for (const event of sorted) {
     if (event.parent_run_id && event.kind === "started") {
       items.push({
@@ -343,50 +583,85 @@ function buildAssistantTimeline(events: RunEvent[]): AssistantTimelineItem[] {
       continue;
     }
     if (event.kind === "thinking_start") {
-      items.push({ kind: "thinking", id: `thinking-${event.sequence}`, content: "", active: true, sequence: event.sequence, order: assistantEventOrder(event) });
+      const item: AssistantTimelineItem = { kind: "thinking", id: `thinking-${event.sequence}`, content: "", active: true, sequence: event.sequence, order: assistantEventOrder(event) };
+      items.push(item);
+      openThinking.push(item);
       continue;
     }
     if (event.kind === "thinking_delta") {
-      const current = [...items].reverse().find((item): item is Extract<AssistantTimelineItem, { kind: "thinking" }> => item.kind === "thinking" && item.active);
-      if (current) current.content += event.delta;
+      const current = openThinking[openThinking.length - 1];
+      if (current && current.active) {
+        current.content += event.delta;
+        continue;
+      }
+      // start 缺失时兜底，避免逐 token 内容被丢弃。
+      const item: AssistantTimelineItem = { kind: "thinking", id: `thinking-${event.sequence}`, content: event.delta, active: true, sequence: event.sequence, order: assistantEventOrder(event) };
+      items.push(item);
+      openThinking.push(item);
       continue;
     }
     if (event.kind === "thinking_end") {
-      const current = [...items].reverse().find((item): item is Extract<AssistantTimelineItem, { kind: "thinking" }> => item.kind === "thinking" && item.active);
+      const current = openThinking.pop();
       if (current) current.active = false;
       continue;
     }
     if (event.kind === "tool_started" && event.tool_key) {
-      items.push({ kind: "tool", id: `tool-${event.sequence}`, toolKey: event.tool_key, status: "running", sequence: event.sequence, order: assistantEventOrder(event) });
+      const item: AssistantTimelineItem = { kind: "tool", id: `tool-${event.sequence}`, toolKey: event.tool_key, status: "running", invocationId: event.tool_invocation_id, sequence: event.sequence, order: assistantEventOrder(event) };
+      items.push(item);
+      openTools.set(event.tool_key, item);
       continue;
     }
     if (event.kind === "tool_completed" && event.tool_key) {
-      const current = [...items].reverse().find((item): item is Extract<AssistantTimelineItem, { kind: "tool" }> => item.kind === "tool" && item.toolKey === event.tool_key && item.status === "running");
+      const current = openTools.get(event.tool_key);
       if (current) {
         current.status = event.status === "success" ? "success" : event.status === "rejected" ? "rejected" : "failed";
         current.summary = event.delta || event.error || undefined;
+        if (event.tool_invocation_id != null) current.invocationId = event.tool_invocation_id;
+        openTools.delete(event.tool_key);
       }
       continue;
     }
     if ((event.kind === "output_delta" || event.kind === "output_reset") && event.delta) {
       if (event.kind === "output_reset") continue;
-      items.push({ kind: "output", id: `output-${event.sequence}`, content: event.delta, sequence: event.sequence, order: assistantEventOrder(event) });
+      const previous = items[items.length - 1];
+      if (previous?.kind === "output") {
+        previous.content += event.delta;
+        previous.sequence = event.sequence;
+        previous.order = assistantEventOrder(event);
+      } else {
+        items.push({ kind: "output", id: `output-${event.sequence}`, content: event.delta, sequence: event.sequence, order: assistantEventOrder(event) });
+      }
     }
   }
-  return items;
+  return items.filter(
+    (item) => item.kind !== "thinking" || item.active || item.content.trim().length > 0,
+  );
 }
 
-function downloadMarkdownFile(markdown: string, projectTitle: string) {
-  const safeTitle = projectTitle.trim().replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").slice(0, 80) || "book";
-  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `${safeTitle}.md`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
+function runEventKey(event: RunEvent) {
+  return `${event.run_id}:${event.sequence}`;
+}
+
+function mergeRunEvents(current: RunEvent[], incoming: RunEvent[]) {
+  const merged = new Map(current.map((event) => [runEventKey(event), event]));
+  incoming.forEach((event) => merged.set(runEventKey(event), event));
+  return [...merged.values()].sort((left, right) => {
+    const orderDelta = assistantEventOrder(left) - assistantEventOrder(right);
+    return orderDelta || left.run_id - right.run_id || left.sequence - right.sequence;
+  });
+}
+
+function assistantMessageKey(role: string, content: string) {
+  return `${role}:${content.trim()}`;
+}
+
+function outlineTextSummary(content: string, fallback: string) {
+  const line = content
+    .split("\n")
+    .map((value) => value.replace(/^#{1,6}\s*/, "").replace(/^[-*]\s*/, "").trim())
+    .find((value) => value.length >= 18 && !/^【[^】]+】$/.test(value));
+  if (!line) return fallback;
+  return line.length > 150 ? `${line.slice(0, 150)}…` : line;
 }
 
 function resolveChapterBody(detail: ProjectWorkspace | null, chapter: Chapter | null) {
@@ -429,19 +704,18 @@ export function BookStudioWorkspace() {
   const [apiKey, setApiKey] = useState("");
   const [instruction, setInstruction] = useState("");
   const [assistantMessages, setAssistantMessages] = useState<AssistantChatMessage[]>([]);
+  const [assistantHistoryCutoff, setAssistantHistoryCutoff] = useState<number | null>(null);
   const [liveToolEvents, setLiveToolEvents] = useState<RunEvent[]>([]);
   const [assistantTimelineEvents, setAssistantTimelineEvents] = useState<RunEvent[]>([]);
   const [selectedSubagentRunId, setSelectedSubagentRunId] = useState<number | null>(null);
   const [thinkingRounds, setThinkingRounds] = useState<AssistantThinkingRound[]>([]);
-  const [workflowStepsCollapsed, setWorkflowStepsCollapsed] = useState(false);
+  const [workflowStepsCollapsed, setWorkflowStepsCollapsed] = useState(true);
+  const [assistantAdvancedOpen, setAssistantAdvancedOpen] = useState(false);
   const [orchestratorParentRunId, setOrchestratorParentRunId] = useState<number | null>(null);
+  const [orchestratorCancellationRequested, setOrchestratorCancellationRequested] = useState(false);
   const [delegatedRunEvents, setDelegatedRunEvents] = useState<Record<number, RunEvent[]>>({});
-  const [revisionFeedback, setRevisionFeedback] = useState("");
-  const [patchFindText, setPatchFindText] = useState("");
-  const [patchReplaceText, setPatchReplaceText] = useState("");
-  const [aiPatchInstruction, setAiPatchInstruction] = useState("");
-  const [approvalNote, setApprovalNote] = useState("");
-  const [reviewIssues, setReviewIssues] = useState<ReviewIssue[]>([]);
+  const [delegatedRunSummaries, setDelegatedRunSummaries] = useState<Record<number, AgentRunSummary>>({});
+  const [versionDrawerOpen, setVersionDrawerOpen] = useState(false);
   const [qualityReport, setQualityReport] = useState<QualityReport | null>(null);
   const [continuityReport, setContinuityReport] = useState<ContinuityReport | null>(null);
   const [ledgerContinuityReport, setLedgerContinuityReport] = useState<LedgerContinuityReport | null>(null);
@@ -452,13 +726,11 @@ export function BookStudioWorkspace() {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [exportText, setExportText] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [contextQuery, setContextQuery] = useState("");
   const [contextSnippets, setContextSnippets] = useState<StoryContextSnippet[]>([]);
   const [contextRerank, setContextRerank] = useState<StoryContextRerankResult | null>(null);
   const [contextPreview, setContextPreview] = useState<PreparedContext | null>(null);
-  const [showAdoptionDrawer, setShowAdoptionDrawer] = useState(false);
   const [referenceMaterials, setReferenceMaterials] = useState<ReferenceMaterial[]>([]);
   const [referenceSelections, setReferenceSelections] = useState<Record<string, ReferenceSelection>>({});
   const {
@@ -480,6 +752,11 @@ export function BookStudioWorkspace() {
   const [knowledgeContent, setKnowledgeContent] = useState("");
   const [knowledgeCategory, setKnowledgeCategory] = useState("world");
   const [editingKnowledgeCardId, setEditingKnowledgeCardId] = useState<number | null>(null);
+  const [showChapterPlanComposer, setShowChapterPlanComposer] = useState(false);
+  const [editingChapterPlanId, setEditingChapterPlanId] = useState<number | null>(null);
+  const [chapterPlanNo, setChapterPlanNo] = useState(1);
+  const [chapterPlanTitle, setChapterPlanTitle] = useState("");
+  const [chapterPlanContent, setChapterPlanContent] = useState("");
   const [showForeshadowingComposer, setShowForeshadowingComposer] = useState(false);
   const [foreshadowingTitle, setForeshadowingTitle] = useState("");
   const [foreshadowingContent, setForeshadowingContent] = useState("");
@@ -490,6 +767,7 @@ export function BookStudioWorkspace() {
   const [showProjectEditor, setShowProjectEditor] = useState(false);
   const [projectPendingDeletion, setProjectPendingDeletion] = useState<Project | null>(null);
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>("ai");
+  const [, startViewTransition] = useTransition();
   const [chapterDraft, setChapterDraft] = useState("");
   const [compareArtifactId, setCompareArtifactId] = useState<number | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
@@ -505,21 +783,35 @@ export function BookStudioWorkspace() {
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true";
   });
   const [sidebarResizing, setSidebarResizing] = useState(false);
+  const [assistantPanelWidth, setAssistantPanelWidth] = useState(() => {
+    if (typeof window === "undefined") return ASSISTANT_PANEL_DEFAULT_WIDTH;
+    const raw = window.localStorage.getItem(ASSISTANT_PANEL_WIDTH_STORAGE_KEY);
+    const parsed = Number(raw);
+    return Number.isFinite(parsed)
+      ? clampAssistantPanelWidth(parsed)
+      : ASSISTANT_PANEL_DEFAULT_WIDTH;
+  });
+  const [assistantPanelResizing, setAssistantPanelResizing] = useState(false);
   const activeProjectRequestRef = useRef<number | null>(null);
   const activeAgentRunIdRef = useRef<number | null>(null);
   const referenceFileInputRef = useRef<HTMLInputElement | null>(null);
+  const assistantInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const assistantFeedRef = useRef<HTMLDivElement | null>(null);
+  const assistantStickToBottomRef = useRef(true);
+  const mainFeedScrollTopRef = useRef<number | null>(null);
+  const loadedHistoryRunIdsRef = useRef<Set<number>>(new Set());
+  const assistantPanelRef = useRef<HTMLElement | null>(null);
+  const autoFilledReviewArtifactRef = useRef<string | null>(null);
 
   function currentContentSurface(): ContentSurface {
     return mainSurface === "library" ? libraryMode : mainSurface;
   }
 
   function switchContentSurface(surface: ContentSurface) {
-    if (mainSurface === "library") {
-      setLibraryOriginSurface(surface);
-      setLibraryMode(surface);
-      setMainSurface("library");
-      return;
-    }
+    // Leaving a knowledge-library view must actually enter the requested
+    // content surface. Keeping mainSurface as "library" makes chapter clicks
+    // update context without changing the visible editor.
+    setLibraryOriginSurface(surface);
     setMainSurface(surface);
     setLibraryMode(surface);
   }
@@ -528,28 +820,37 @@ export function BookStudioWorkspace() {
     // 资料页的“创作工作台”应进入对应的资料工具，而不是跳到章节编辑器。
     // 章节正文页才进入 draft/review/revision 流水线。
     if (mainSurface === "library") {
-      setLibraryOriginSurface("workbench");
-      setLibraryMode("workbench");
+      if (libraryFocus === "foreshadowing") {
+        setLibraryOriginSurface("workbench");
+        setLibraryMode("workbench");
+        setSelectedChapterId(null);
+        setSelectedArtifactId(null);
+        return;
+      }
       if (libraryFocus === "setting" || libraryFocus === "outline" || libraryFocus === "characters") {
+        setLibraryOriginSurface("workbench");
+        setLibraryMode("workbench");
         setSelectedChapterId(null);
         setSelectedStage(librarySection);
         setSelectedArtifactId(null);
-        openKnowledgeEditor();
+        if (libraryFocus !== "setting") openKnowledgeEditor();
+        return;
       }
+      const chapterBody = resolveChapterBody(detail, selectedChapter);
+      setSelectedStage(artifactStageOr(chapterBody?.stage, "draft"));
+      setSelectedArtifactId(chapterBody?.id ?? null);
+      setLibraryMode("workbench");
+      setMainSurface("workbench");
       return;
     }
     // 从“正式正文”进入时必须回到章节正文工作台，不能沿用资料页
     // 上一次的 setting/outline/characters 选择，否则会把旧的 Markdown
     // 基础资料误当成当前工作区内容。
     const chapterBody = resolveChapterBody(detail, selectedChapter);
-    setSelectedStage(chapterBody?.stage ?? "draft");
+    setSelectedStage(artifactStageOr(chapterBody?.stage, "draft"));
     setSelectedArtifactId(chapterBody?.id ?? null);
     setLibraryMode("workbench");
     setMainSurface("workbench");
-  }
-
-  function exitLibrary() {
-    switchContentSurface(libraryOriginSurface);
   }
 
   function openLibrary(focus?: LibraryFocus, mode?: ContentSurface) {
@@ -570,7 +871,33 @@ export function BookStudioWorkspace() {
     }
     setSelectedLibraryEntityId(null);
     resetKnowledgeComposer();
+    resetChapterPlanComposer();
+    resetForeshadowingComposer();
     setMainSurface("library");
+  }
+
+  function resetChapterPlanComposer() {
+    setShowChapterPlanComposer(false);
+    setEditingChapterPlanId(null);
+    setChapterPlanNo((detail?.chapter_plans?.length ?? 0) + 1);
+    setChapterPlanTitle("");
+    setChapterPlanContent("");
+  }
+
+  function editChapterPlan(plan: ChapterPlan) {
+    setEditingChapterPlanId(plan.id);
+    setChapterPlanNo(plan.chapter_no);
+    setChapterPlanTitle(plan.title);
+    setChapterPlanContent(plan.content);
+    setShowChapterPlanComposer(true);
+  }
+
+  function openChapterPlanEditor(chapterNo?: number) {
+    setEditingChapterPlanId(null);
+    setChapterPlanNo(chapterNo ?? ((detail?.chapter_plans?.length ?? 0) + 1));
+    setChapterPlanTitle(chapterNo ? `第 ${chapterNo} 章` : "");
+    setChapterPlanContent("");
+    setShowChapterPlanComposer(true);
   }
 
   useEffect(() => {
@@ -587,8 +914,13 @@ export function BookStudioWorkspace() {
     void api.getActiveAgentRun(selectedProjectId)
       .then((run) => {
         if (activeProjectRequestRef.current !== selectedProjectId) return;
-        setStreamingRun(run);
-        activeAgentRunIdRef.current = run?.id ?? null;
+        setStreamingRun(isTopLevelStreamingRun(run) ? run : null);
+        activeAgentRunIdRef.current = run?.parent_run_id ?? run?.id ?? null;
+        if (run?.run_kind === "orchestrator") {
+          setOrchestratorParentRunId(run.id);
+        } else if (run?.parent_run_id != null) {
+          setOrchestratorParentRunId(run.parent_run_id);
+        }
         if (!run) return;
         void api.listRunEvents(run.id)
           .then((events) => {
@@ -634,6 +966,15 @@ export function BookStudioWorkspace() {
       if (activeProjectRequestRef.current !== event.project_id) return;
       if (!event.parent_run_id) {
         setAssistantTimelineEvents((current) => [...current, event]);
+        if (event.stage === "orchestrator" && event.kind === "cancellation_requested") {
+          setOrchestratorCancellationRequested(true);
+        }
+        if (event.stage === "orchestrator" && ["completed", "failed", "cancelled"].includes(event.kind)) {
+          setOrchestratorCancellationRequested(false);
+        }
+      }
+      if (event.parent_run_id && event.parent_run_id !== activeAgentRunIdRef.current) {
+        return;
       }
       if (event.parent_run_id && event.parent_run_id === activeAgentRunIdRef.current) {
         setDelegatedRunEvents((current) => ({
@@ -693,6 +1034,9 @@ export function BookStudioWorkspace() {
             error: event.error,
             elapsed_ms: sameRun ? current.elapsed_ms : 0,
             created_at: sameRun ? current.created_at : event.created_at,
+            parent_run_id: event.parent_run_id,
+            run_kind: event.parent_run_id == null ? "legacy" : "subagent",
+            task_title: event.task_title,
           };
         }
         return current;
@@ -708,6 +1052,36 @@ export function BookStudioWorkspace() {
       unsubscribe?.();
     };
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!detail || !selectedProjectId) return;
+    let disposed = false;
+    const parentRuns = detail.workflow_runs
+      .filter((run) => run.run_kind === "orchestrator")
+      .filter((run) => run.chapter_id == null || run.chapter_id === selectedChapterId)
+      .slice(0, 8);
+    const parentIds = new Set(parentRuns.map((run) => run.id));
+    const childRuns = detail.workflow_runs.filter(
+      (run) => run.parent_run_id != null && parentIds.has(run.parent_run_id),
+    );
+    const runIds = [...parentRuns, ...childRuns].map((run) => run.id)
+      .filter((runId) => !loadedHistoryRunIdsRef.current.has(runId));
+    for (const runId of runIds) loadedHistoryRunIdsRef.current.add(runId);
+    if (runIds.length === 0) return;
+
+    void Promise.all(runIds.map((runId) => api.listRunEvents(runId)))
+      .then((eventLists) => {
+        if (!disposed) mergeAssistantRunEvents(eventLists.flat());
+      })
+      .catch(() => {
+        // Persisted messages remain available when historical event loading fails.
+      });
+    const activeParent = parentRuns.find((run) => ["running", "streaming", "cancellation_requested"].includes(run.status));
+    if (activeParent) setOrchestratorParentRunId(activeParent.id);
+    return () => {
+      disposed = true;
+    };
+  }, [detail, selectedChapterId, selectedProjectId]);
 
   useEffect(() => {
     setContextPreview(null);
@@ -730,6 +1104,11 @@ export function BookStudioWorkspace() {
   }, [sidebarCollapsed]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(ASSISTANT_PANEL_WIDTH_STORAGE_KEY, String(assistantPanelWidth));
+  }, [assistantPanelWidth]);
+
+  useEffect(() => {
     if (!detail) return;
     // 资料工具页不应自动选中第一章；章节选择只属于正文工作台。
     if (mainSurface === "library") return;
@@ -743,7 +1122,14 @@ export function BookStudioWorkspace() {
         artifact.stage === "setting" &&
         (artifact.status === "approved" || detail.approvals.some((approval) => approval.artifact_id === artifact.id))
     );
-    selectChapter(firstChapter, hasApprovedFoundation ? "draft" : "setting");
+    if (!hasApprovedFoundation) {
+      // 资料阶段（世界观/大纲/角色）不属于任何章节：不拖带章节选择，
+      // 否则世界观视图会出现"第 1 章"+ 章节流水线的不一致状态。
+      setSelectedStage("setting");
+      setSelectedArtifactId(null);
+      return;
+    }
+    selectChapter(firstChapter, "draft");
   }, [detail, mainSurface, selectedChapterId]);
 
   const selectedChapter = useMemo(
@@ -855,13 +1241,32 @@ export function BookStudioWorkspace() {
     if (!detail) return [];
     const categoryMatch = (card: KnowledgeCard) => {
       if (librarySection === "characters") return card.category === "character";
-      if (librarySection === "outline") return card.category === "outline" || card.category === "chapter_plan";
+      if (librarySection === "outline") return card.category === "outline";
       return ["world", "cultivation", "map", "faction", "taboo", "item", "rule"].includes(card.category);
     };
     const modeMatch = (card: KnowledgeCard) =>
       libraryMode === "official" ? card.status === "approved" : card.status !== "archived";
     return (detail.knowledge_cards ?? []).filter((card) => categoryMatch(card) && modeMatch(card));
   }, [detail, librarySection, libraryMode]);
+
+  const outlineCards = useMemo(() => {
+    const unique = new Map<string, KnowledgeCard>();
+    for (const card of libraryCards) {
+      const key = card.title.replace(/[\s:：，。]+/g, "").toLowerCase();
+      const current = unique.get(key);
+      if (!current || (card.status === "approved" && current.status !== "approved") || card.id > current.id) {
+        unique.set(key, card);
+      }
+    }
+    return [...unique.values()].sort((left, right) => right.id - left.id);
+  }, [libraryCards]);
+
+  const outlinePlans = useMemo(() => {
+    const plans = detail?.chapter_plans ?? [];
+    return [...plans]
+      .filter((plan) => libraryMode === "official" ? plan.status === "approved" : plan.status !== "archived")
+      .sort((left, right) => left.chapter_no - right.chapter_no || left.id - right.id);
+  }, [detail, libraryMode]);
 
   const visibleForeshadowings = useMemo(
     () => detail?.foreshadowings?.filter((item) =>
@@ -872,7 +1277,7 @@ export function BookStudioWorkspace() {
     [detail, libraryMode]
   );
 
-  const timelineEntityKind = libraryFocus === "characters"
+  const timelineEntityKind = libraryFocus === "character-timeline"
     ? "character"
     : libraryFocus === "items"
       ? null
@@ -886,7 +1291,7 @@ export function BookStudioWorkspace() {
   }, [detail, libraryFocus, timelineEntityKind]);
 
   useEffect(() => {
-    if (libraryFocus !== "characters" && libraryFocus !== "items") return;
+    if (libraryFocus !== "character-timeline" && libraryFocus !== "items") return;
     if (visibleTimelineEntities.some((entity) => entity.id === selectedLibraryEntityId)) return;
     setSelectedLibraryEntityId(visibleTimelineEntities[0]?.id ?? null);
   }, [libraryFocus, selectedLibraryEntityId, visibleTimelineEntities]);
@@ -1019,7 +1424,8 @@ export function BookStudioWorkspace() {
 
     const body = resolveChapterBody(detail, selectedChapter);
     if (!body) return;
-    if (body.stage !== selectedStage) setSelectedStage(body.stage);
+    const bodyStage = asStage(body.stage);
+    if (bodyStage && bodyStage !== selectedStage) setSelectedStage(bodyStage);
     if (body.id !== selectedArtifactId) setSelectedArtifactId(body.id);
   }, [detail, selectedChapter, selectedArtifactId, selectedArtifactSummary, selectedStage]);
 
@@ -1046,32 +1452,8 @@ export function BookStudioWorkspace() {
 
   const selectedReviewIssues = useMemo(() => {
     if (!selectedArtifact || selectedArtifact.stage !== "review") return [];
-    try {
-      const parsed = JSON.parse(selectedArtifact.content);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
+    return parseReviewIssues(selectedArtifact.content);
   }, [selectedArtifact]);
-
-  const selectedArtifactApproved = useMemo(() => {
-    if (!detail || !selectedArtifact) return false;
-    return (
-      selectedArtifact.status === "approved" ||
-      detail.approvals.some((approval) => approval.artifact_id === selectedArtifact.id)
-    );
-  }, [detail, selectedArtifact]);
-
-  const selectedArtifactProposals = useMemo(
-    () => detail?.adoption_proposals?.filter((proposal) => proposal.source_artifact_id === selectedArtifact?.id) ?? [],
-    [detail, selectedArtifact]
-  );
-
-  const selectedArtifactSupportsAdoption = Boolean(
-    selectedArtifactApproved
-      && selectedArtifact
-      && ["setting", "outline", "characters", "draft", "revision"].includes(selectedArtifact.stage)
-  );
 
   const selectedArtifactIsCurrentBody =
     Boolean(selectedChapter?.current_artifact_id && selectedArtifact) &&
@@ -1095,10 +1477,6 @@ export function BookStudioWorkspace() {
     return detail.artifacts.find((artifact) => artifact.id === qualityReport.artifact_id) ?? null;
   }, [detail, qualityReport]);
 
-  const selectedArtifactSupportsLocalPatch = Boolean(
-    selectedArtifact &&
-      ["setting", "outline", "characters", "draft", "revision"].includes(selectedArtifact.stage)
-  );
   const selectedBookArtifactCanIterate = Boolean(
     selectedArtifact &&
       explicitArchitectSourceId === selectedArtifact.id &&
@@ -1138,40 +1516,233 @@ export function BookStudioWorkspace() {
       .slice(0, 12);
   }, [detail, selectedChapterId]);
 
-  const assistantFeedItems = useMemo(() => [
-    ...assistantMessages.filter((message) => message.role === "user").map((message) => ({
-      kind: "user" as const,
-      id: message.id,
-      content: message.content,
-      order: message.order,
-    })),
-    ...buildAssistantTimeline(assistantTimelineEvents),
-  ].sort((a, b) => a.order - b.order), [assistantMessages, assistantTimelineEvents]);
+  const visibleAssistantTimelineEvents = useMemo(
+    () => assistantTimelineEvents.filter(
+      // Orchestrator output is internal delegation narration. The final answer
+      // is persisted as a normal assistant message after the run completes.
+      (event) =>
+        event.stage !== "orchestrator" &&
+        (event.chapter_id == null || event.chapter_id === selectedChapterId),
+    ),
+    [assistantTimelineEvents, selectedChapterId],
+  );
 
-  const visibleRuns = useMemo(() => {
-    if (!detail) return [];
-    return detail.workflow_runs
-      .filter((run) => {
-        if (run.stage === "context_search_plan") {
-          return run.chapter_id === selectedChapterId;
-        }
-        const stageMeta = stages.find((stage) => stage.id === run.stage);
-        if (!stageMeta) return false;
-        if (stageMeta.scope === "book") return run.chapter_id == null;
-        return run.chapter_id === selectedChapterId;
+  const orchestratorRunIsActive = useMemo(() => {
+    if (orchestratorParentRunId == null) return false;
+    return !assistantTimelineEvents.some(
+      (event) => event.run_id === orchestratorParentRunId && ["completed", "failed", "cancelled"].includes(event.kind),
+    );
+  }, [assistantTimelineEvents, orchestratorParentRunId]);
+
+  const assistantFeedItems = useMemo(() => {
+    const timeline = buildAssistantTimeline(visibleAssistantTimelineEvents);
+    const timelineOutputs = new Set(
+      timeline
+        .filter((item): item is Extract<AssistantTimelineItem, { kind: "output" }> => item.kind === "output")
+        .map((item) => item.content.trim())
+        .filter(Boolean),
+    );
+    const persistedMessages = visibleMessages
+      .filter((message) => message.role === "user" || message.role === "assistant")
+      .filter((message) => assistantHistoryCutoff == null || Date.parse(message.created_at) >= assistantHistoryCutoff - 2000);
+    const persistedItems = persistedMessages
+      .filter((message) => message.role !== "assistant" || !timelineOutputs.has(message.content.trim()))
+      .map((message) => ({
+        kind: message.role === "user" ? "user" as const : "output" as const,
+        id: `message-${message.id}`,
+        content: message.content,
+        order: (Date.parse(message.created_at) || 0) * 1000 + message.id,
+      }));
+    const persistedKeys = new Set(persistedMessages.map((message) => assistantMessageKey(message.role, message.content)));
+    const localItems = assistantMessages
+      .filter((message) => !persistedKeys.has(assistantMessageKey(message.role, message.content)))
+      .map((message) => ({
+        kind: message.role === "user" ? "user" as const : "output" as const,
+        id: message.id,
+        content: message.content,
+        order: message.order,
+      }));
+    // 交接记忆重建失败必须可见：否则下一章会在无前情记忆的情况下静默续写。
+    const memoryWarningItems = detail
+      ? detail.workflow_runs
+          .filter((run) => run.stage === "chapter_memory" && run.status === "failed")
+          .filter((run) => run.chapter_id == null || run.chapter_id === selectedChapterId)
+          .filter((run) => assistantHistoryCutoff == null || Date.parse(run.created_at) >= assistantHistoryCutoff - 2000)
+          .slice(-3)
+          .map((run) => ({
+            kind: "memory_warning" as const,
+            id: `memory-run-${run.id}`,
+            content: run.error?.trim() || "未知错误",
+            order: (Date.parse(run.created_at) || 0) * 1000 + run.id,
+          }))
+      : [];
+    return [...persistedItems, ...localItems, ...memoryWarningItems, ...timeline].sort((a, b) => a.order - b.order);
+  }, [
+    assistantHistoryCutoff,
+    assistantMessages,
+    detail,
+    selectedChapterId,
+    visibleAssistantTimelineEvents,
+    visibleMessages,
+  ]);
+
+  const liveToolTimeline = useMemo(() => assistantToolTimeline(liveToolEvents), [liveToolEvents]);
+  const activeLiveTool = liveToolTimeline.some((item) => item.status === "running");
+  const completedLiveTool = liveToolTimeline.some((item) => item.status !== "running");
+  const waitingForModelOutput = Boolean(streamingRun && !streamingRun.output.trim() && liveToolTimeline.length === 0);
+  const pendingActionProposalCount = actionProposals.filter((proposal) => proposal.status === "pending").length;
+  const selectedSubagentEvents = useMemo(
+    () => (selectedSubagentRunId != null ? delegatedRunEvents[selectedSubagentRunId] ?? [] : []),
+    [delegatedRunEvents, selectedSubagentRunId]
+  );
+  const selectedSubagentTimeline = useMemo(() => buildAssistantTimeline(selectedSubagentEvents), [selectedSubagentEvents]);
+  const selectedSubagentSummary = selectedSubagentRunId != null ? delegatedRunSummaries[selectedSubagentRunId] : undefined;
+  const selectedSubagentTerminal = selectedSubagentSummary
+    ? ["success", "failed", "cancelled"].includes(selectedSubagentSummary.run.status)
+    : false;
+  const selectedSubagentToolCount = selectedSubagentEvents.filter((event) => event.kind === "tool_completed").length;
+
+  // 过程 = 事件时间线 ∪ 运行摘要里的工具调用。历史运行的事件流可能缺失工具/思考
+  // 事件，摘要中的 tool_invocations 是权威数据，缺失的按发生时间补进过程。
+  const selectedSubagentProcess = useMemo(() => {
+    const items: AssistantTimelineItem[] = [...selectedSubagentTimeline];
+    const summary = selectedSubagentSummary;
+    if (summary) {
+      const represented = new Set(
+        items
+          .filter((item): item is Extract<AssistantTimelineItem, { kind: "tool" }> => item.kind === "tool" && item.invocationId != null)
+          .map((item) => item.invocationId as number)
+      );
+      for (const invocation of summary.tool_invocations) {
+        if (represented.has(invocation.id)) continue;
+        items.push({
+          kind: "tool",
+          id: `invocation-${invocation.id}`,
+          toolKey: invocation.tool_key,
+          status: timelineToolStatus(invocation.status, Boolean(invocation.error)),
+          invocationId: invocation.id,
+          sequence: 0,
+          order: (Number.isFinite(Date.parse(invocation.created_at)) ? Date.parse(invocation.created_at) : 0) * 1000,
+        });
+      }
+      if (!items.some((item) => item.kind === "output") && summary.run.output.trim()) {
+        items.push({
+          kind: "output",
+          id: "run-output",
+          content: summary.run.output,
+          sequence: 0,
+          order: (Number.isFinite(Date.parse(summary.run.created_at)) ? Date.parse(summary.run.created_at) : 0) * 1000 + 1,
+        });
+      }
+    }
+    return items.sort((left, right) => left.order - right.order || left.sequence - right.sequence);
+  }, [selectedSubagentTimeline, selectedSubagentSummary]);
+
+  // 子会话的真实工具载荷在运行摘要里：选中时拉取；未结束的运行随工具完成而刷新。
+  useEffect(() => {
+    if (selectedSubagentRunId == null || selectedSubagentTerminal) return;
+    let disposed = false;
+    api.getAgentRun(selectedSubagentRunId)
+      .then((summary) => {
+        if (!disposed) setDelegatedRunSummaries((current) => ({ ...current, [selectedSubagentRunId]: summary }));
       })
-      .slice(0, 10);
-  }, [detail, selectedChapterId]);
+      .catch(() => {
+        // 事件时间线仍然可见，只是没有可展开的载荷。
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [selectedSubagentRunId, selectedSubagentTerminal, selectedSubagentToolCount]);
 
-  const canRunReview =
-    selectedArtifact?.stage === "draft" ||
-    selectedArtifact?.stage === "revision" ||
-    selectedStage === "review";
+  const feedOutputIds = useMemo(
+    () => assistantFeedItems.filter((item) => item.kind === "output").map((item) => item.id),
+    [assistantFeedItems]
+  );
+  const lastOutputItemId = feedOutputIds[feedOutputIds.length - 1] ?? null;
+  const liveOutputItemId = streamingRun ? lastOutputItemId : null;
 
-  const canRequestRevision =
-    selectedArtifact?.stage === "draft" ||
-    selectedArtifact?.stage === "revision" ||
-    selectedArtifact?.stage === "review";
+  // 只在用户本来就读底部时跟随滚动；上翻阅读历史时不拽回。
+  // 从子会话返回时不跳最新输出，恢复进入前主会话的阅读位置。
+  useEffect(() => {
+    const feed = assistantFeedRef.current;
+    if (!feed) return;
+    if (selectedSubagentRunId == null && mainFeedScrollTopRef.current != null) {
+      feed.scrollTop = mainFeedScrollTopRef.current;
+      mainFeedScrollTopRef.current = null;
+      return;
+    }
+    if (!assistantStickToBottomRef.current) return;
+    feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
+  }, [assistantFeedItems, selectedSubagentRunId]);
+
+  // 输入框随内容自增高，上限 180px 后内部滚动。
+  useEffect(() => {
+    const input = assistantInputRef.current;
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+  }, [instruction]);
+
+  const isChapterWorkbench = Boolean(
+    selectedChapter && (
+      bodyStages.includes(selectedStage) ||
+      selectedStage === "review"
+    ),
+  );
+
+  const chapterFlow = useMemo<ChapterFlow | null>(() => {
+    if (!selectedChapter) return null;
+
+    const reviewSelected = selectedArtifact?.stage === "review";
+    const bodyArtifact = reviewSelected
+      ? reviewSourceArtifact
+      : selectedArtifact && bodyStages.includes(selectedArtifact.stage)
+        ? selectedArtifact
+        : currentChapterBodySummary;
+
+    if (reviewSelected) {
+      const reviewIssueCount = selectedArtifact ? parseReviewIssues(selectedArtifact.content).length : 0;
+      return {
+        state: reviewIssueCount > 0 ? "needs_revision" : "ready_to_adopt",
+        label: reviewIssueCount > 0 ? `试读发现 ${reviewIssueCount} 个问题` : "试读完成，可采用",
+        actionLabel: reviewIssueCount > 0 ? "修订建议已就绪" : adoptionActionLabel,
+        bodyArtifact,
+        reviewArtifact: selectedArtifact,
+        reviewIssueCount,
+      };
+    }
+
+    if (!bodyArtifact) {
+      return {
+        state: "empty",
+        label: "尚无候选稿",
+        actionLabel: "生成正文",
+        bodyArtifact: null,
+        reviewArtifact: null,
+        reviewIssueCount: 0,
+      };
+    }
+
+    const adopted = (
+      bodyArtifact.status === "approved" ||
+      detail?.approvals.some((approval) => approval.artifact_id === bodyArtifact.id)
+    ) && selectedChapter.current_artifact_id === bodyArtifact.id;
+
+    return {
+      state: adopted ? "adopted" : "awaiting_review",
+      label: adopted ? adoptedStatusLabel : "待试读",
+      actionLabel: adopted ? "生成新版本" : "提交试读",
+      bodyArtifact,
+      reviewArtifact: null,
+      reviewIssueCount: 0,
+    };
+  }, [
+    currentChapterBodySummary,
+    detail,
+    reviewSourceArtifact,
+    selectedArtifact,
+    selectedChapter,
+  ]);
 
   const sidebarShellStyle = useMemo(
     () => ({
@@ -1209,25 +1780,23 @@ export function BookStudioWorkspace() {
     setLedgerContinuityReport(null);
     setChapterGateReport(null);
     setChapterSplitPlan(null);
-    setReviewIssues([]);
-    setExportText("");
+    autoFilledReviewArtifactRef.current = null;
     setInstruction("");
     setAssistantMessages([]);
+    setAssistantHistoryCutoff(null);
     setLiveToolEvents([]);
     setAssistantTimelineEvents([]);
     setSelectedSubagentRunId(null);
+    setAssistantAdvancedOpen(false);
+    setOrchestratorParentRunId(null);
+    setOrchestratorCancellationRequested(false);
+    setDelegatedRunEvents({});
     setThinkingRounds([]);
-    setRevisionFeedback("");
-    setPatchFindText("");
-    setPatchReplaceText("");
-    setAiPatchInstruction("");
-    setApprovalNote("");
     setChapterDraft("");
     setContextQuery("");
     setContextSnippets([]);
     setContextRerank(null);
     setContextPreview(null);
-    setShowAdoptionDrawer(false);
     setReferenceMaterials([]);
     setReferenceSelections({});
     setProjectDraft(null);
@@ -1279,6 +1848,56 @@ export function BookStudioWorkspace() {
     finishSidebarResize();
   }
 
+  function assistantPanelWidthFromPointer(clientX: number) {
+    const contentGrid = assistantPanelRef.current?.parentElement;
+    const contentRight = contentGrid?.getBoundingClientRect().right ?? window.innerWidth;
+    return clampAssistantPanelWidth(contentRight - clientX - 5);
+  }
+
+  function finishAssistantPanelResize() {
+    setAssistantPanelResizing(false);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  }
+
+  function beginAssistantPanelResize(event: PointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setAssistantPanelWidth(assistantPanelWidthFromPointer(event.clientX));
+    setAssistantPanelResizing(true);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }
+
+  function resizeAssistantPanel(event: PointerEvent<HTMLDivElement>) {
+    if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+    setAssistantPanelWidth(assistantPanelWidthFromPointer(event.clientX));
+  }
+
+  function endAssistantPanelResize(event: PointerEvent<HTMLDivElement>) {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    finishAssistantPanelResize();
+  }
+
+  function resizeAssistantPanelWithKeyboard(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "Home") {
+      event.preventDefault();
+      setAssistantPanelWidth(ASSISTANT_PANEL_MIN_WIDTH);
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      setAssistantPanelWidth(ASSISTANT_PANEL_MAX_WIDTH);
+      return;
+    }
+    const delta = event.key === "ArrowLeft" ? 16 : event.key === "ArrowRight" ? -16 : 0;
+    if (!delta) return;
+    event.preventDefault();
+    setAssistantPanelWidth((width) => clampAssistantPanelWidth(width + delta));
+  }
+
   function resizeSidebarWithKeyboard(event: KeyboardEvent<HTMLDivElement>) {
     const delta = event.key === "ArrowLeft" ? -16 : event.key === "ArrowRight" ? 16 : 0;
     if (!delta) return;
@@ -1301,8 +1920,86 @@ export function BookStudioWorkspace() {
     if (activeProjectRequestRef.current === projectId) {
       // An orchestrator run is rendered in the assistant timeline only; the
       // central surface is reserved for specialist artifact generation.
-      setStreamingRun(activeRun && activeRun.stage !== "orchestrator" ? activeRun : null);
+      setStreamingRun(isTopLevelStreamingRun(activeRun) ? activeRun : null);
+      activeAgentRunIdRef.current = activeRun?.parent_run_id ?? activeRun?.id ?? null;
+      if (activeRun?.run_kind === "orchestrator") {
+        setOrchestratorParentRunId(activeRun.id);
+      } else if (activeRun?.parent_run_id != null) {
+        setOrchestratorParentRunId(activeRun.parent_run_id);
+      }
     }
+  }
+
+  function mergeAssistantRunEvents(events: RunEvent[]) {
+    const timelineEvents = events.filter((event) => !event.parent_run_id || event.kind === "started");
+    if (timelineEvents.length > 0) {
+      setAssistantTimelineEvents((current) => mergeRunEvents(current, timelineEvents));
+    }
+    const childEvents = events.filter((event) => event.parent_run_id != null);
+    if (childEvents.length > 0) {
+      // 先按 run 分组再合并：逐条 mergeRunEvents 是 O(n²)，万级 token 流会卡死主线程。
+      const grouped = new Map<number, RunEvent[]>();
+      for (const event of childEvents) {
+        const list = grouped.get(event.run_id);
+        if (list) list.push(event);
+        else grouped.set(event.run_id, [event]);
+      }
+      setDelegatedRunEvents((current) => {
+        const next = { ...current };
+        for (const [runId, list] of grouped) {
+          next[runId] = mergeRunEvents(next[runId] ?? [], list);
+        }
+        return next;
+      });
+    }
+  }
+
+  async function syncOrchestratorRun(runId: number) {
+    const [summary, events] = await Promise.all([
+      api.getAgentRun(runId),
+      api.listRunEvents(runId),
+    ]);
+    if (activeProjectRequestRef.current !== summary.run.project_id) return true;
+    mergeAssistantRunEvents(events);
+    const terminal = ["success", "failed", "cancelled"].includes(summary.run.status);
+    if (!terminal) return false;
+
+    if (summary.run.status === "failed") {
+      const message = summary.run.error || "主 Agent 运行失败，请检查配置后重试。";
+      setError(message);
+      appendAssistantMessage(`run-${runId}-failed`, `这次主 Agent 任务没有完成：${message}`);
+    } else if (summary.run.status === "cancelled") {
+      appendAssistantMessage(`run-${runId}-cancelled`, "已停止主 Agent 任务，当前内容没有自动应用。");
+    } else if (summary.run.output.trim() && !events.some((event) => event.kind === "output_delta" && event.delta.trim())) {
+      const started = events.find((event) => event.kind === "started") ?? events[0];
+      if (started) {
+        setAssistantTimelineEvents((current) => mergeRunEvents(current, [{
+          ...started,
+          kind: "output_delta",
+          delta: summary.run.output,
+          status: "success",
+          sequence: Math.max(...events.map((event) => event.sequence), 0) + 1,
+          tool_key: null,
+          tool_invocation_id: null,
+          elapsed_ms: summary.run.elapsed_ms,
+        }]));
+      }
+    }
+    await refreshDetailBestEffort(summary.run.project_id, "主 Agent 回复");
+    return true;
+  }
+
+  function watchOrchestratorRun(runId: number) {
+    void (async () => {
+      for (let attempt = 0; attempt < 2400; attempt += 1) {
+        try {
+          if (await syncOrchestratorRun(runId)) return;
+        } catch {
+          // The event subscription remains the fast path; polling retries transient failures.
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+      }
+    })();
   }
 
   function appendAssistantMessage(id: string, content: string) {
@@ -1415,25 +2112,6 @@ export function BookStudioWorkspace() {
     }
   }
 
-  function showStartedAgentRun(result: AgentRunSummary) {
-    activeAgentRunIdRef.current = result.run.id;
-    setLiveToolEvents([]);
-    setThinkingRounds([]);
-    setWorkflowStepsCollapsed(false);
-    setLastAgentRun(result);
-    setStreamingRun({
-      id: result.run.id,
-      project_id: result.run.project_id,
-      chapter_id: result.run.chapter_id,
-      stage: result.run.stage,
-      output: result.run.output,
-      status: result.run.status,
-      error: result.run.error,
-      elapsed_ms: result.run.elapsed_ms,
-      created_at: result.run.created_at,
-    });
-  }
-
   async function refreshDetailBestEffort(projectId: number, operation: string) {
     try {
       await refreshDetail(projectId);
@@ -1496,15 +2174,6 @@ export function BookStudioWorkspace() {
     updateActiveReferenceSelection({
       source_ids: nextIds.length === enabledIds.length ? null : nextIds,
     });
-  }
-
-  function toggleReferenceTag(tag: ReferenceTag) {
-    const currentTags = activeReferenceSelection.tags ?? ["style", "structure"];
-    const nextTags = currentTags.includes(tag)
-      ? currentTags.filter((item) => item !== tag)
-      : [...currentTags, tag];
-    if (nextTags.length === 0) return;
-    updateActiveReferenceSelection({ tags: nextTags });
   }
 
   async function importReferenceFile(event: ChangeEvent<HTMLInputElement>) {
@@ -1805,7 +2474,7 @@ export function BookStudioWorkspace() {
     }
     const currentBody = resolveChapterBody(detail, chapter);
     setSelectedChapterId(chapter.id);
-    setSelectedStage(stage ?? currentBody?.stage ?? "draft");
+    setSelectedStage(stage ?? artifactStageOr(currentBody?.stage, "draft"));
     setSelectedArtifactId(stage ? null : currentBody?.id ?? null);
   }
 
@@ -1814,7 +2483,7 @@ export function BookStudioWorkspace() {
     if (!chapter) return;
     const body = resolveChapterBody(detail, chapter);
     setSelectedChapterId(chapter.id);
-    setSelectedStage(body?.stage ?? "draft");
+    setSelectedStage(artifactStageOr(body?.stage, "draft"));
     setSelectedArtifactId(body?.id ?? null);
     switchContentSurface("official");
   }
@@ -1873,14 +2542,6 @@ export function BookStudioWorkspace() {
     setShowKnowledgeComposer(true);
   }
 
-  function editKnowledgeSection(section: { title: string; content: string[] }) {
-    setKnowledgeTitle(section.title);
-    setKnowledgeContent(section.content.join("\n"));
-    setKnowledgeCategory(librarySection === "characters" ? "character" : librarySection === "outline" ? "outline" : "world");
-    setEditingKnowledgeCardId(null);
-    setShowKnowledgeComposer(true);
-  }
-
   function openKnowledgeEditor() {
     const firstCard = libraryCards[0];
     if (firstCard) {
@@ -1889,6 +2550,63 @@ export function BookStudioWorkspace() {
     }
     resetKnowledgeComposer();
     setShowKnowledgeComposer(true);
+  }
+
+  async function saveChapterPlan(status: "pending_human_approval" | "approved") {
+    if (!detail || !chapterPlanTitle.trim() || !chapterPlanContent.trim() || chapterPlanNo < 1) return;
+    const existing = detail.chapter_plans?.find((plan) => plan.id === editingChapterPlanId);
+    await runTask(
+      status === "approved"
+        ? adoptionActionLabel
+        : editingChapterPlanId ? "更新章节计划" : "保存章节计划",
+      async () => {
+        await api.saveChapterPlan({
+          id: editingChapterPlanId,
+          project_id: detail.project.id,
+          chapter_no: chapterPlanNo,
+          title: chapterPlanTitle.trim(),
+          content: chapterPlanContent.trim(),
+          status,
+          story_arc_id: existing?.story_arc_id ?? activeStoryArc?.id ?? null,
+          chapter_id: existing?.chapter_id ?? null,
+          source_artifact_id: existing?.source_artifact_id ?? null,
+        });
+        resetChapterPlanComposer();
+        await refreshDetailBestEffort(detail.project.id, "章节计划保存");
+        setNotice(status === "approved" ? `章节计划已${adoptionActionLabel}` : "章节计划已保存，等待人工确认");
+      },
+    );
+  }
+
+  async function updateChapterPlanStatus(plan: ChapterPlan, status: "approved" | "archived") {
+    if (!detail) return;
+    await runTask(status === "approved" ? adoptionActionLabel : "归档章节计划", async () => {
+      await api.saveChapterPlan({ ...plan, status });
+      await refreshDetailBestEffort(detail.project.id, "章节计划更新");
+      setNotice(status === "approved" ? `第 ${plan.chapter_no} 章计划已${adoptionActionLabel}` : `第 ${plan.chapter_no} 章计划已归档`);
+    });
+  }
+
+  async function deleteChapterPlan(plan: ChapterPlan) {
+    if (!detail) return;
+    if (!window.confirm(`确定删除第 ${plan.chapter_no} 章计划“${plan.title}”吗？`)) return;
+    await runTask("删除章节计划", async () => {
+      await api.deleteChapterPlan(detail.project.id, plan.id);
+      if (editingChapterPlanId === plan.id) resetChapterPlanComposer();
+      await refreshDetailBestEffort(detail.project.id, "章节计划删除");
+      setNotice(`已删除第 ${plan.chapter_no} 章计划`);
+    });
+  }
+
+  async function createChapterFromPlan(plan: ChapterPlan) {
+    if (!detail) return;
+    await runTask("创建正文", async () => {
+      const chapter = await api.createChapterFromPlan(detail.project.id, plan.id);
+      await refreshDetailBestEffort(detail.project.id, "正文创建");
+      selectChapter(chapter, "draft");
+      switchContentSurface("workbench");
+      setNotice(`已进入第 ${chapter.chapter_no} 章正文`);
+    });
   }
 
   function resetForeshadowingComposer() {
@@ -1911,7 +2629,7 @@ export function BookStudioWorkspace() {
 
   async function saveKnowledgeCard(status: "pending_human_approval" | "approved") {
     if (!detail || !knowledgeTitle.trim() || !knowledgeContent.trim()) return;
-    await runTask("保存资料卡", async () => {
+    await runTask(status === "approved" ? adoptionActionLabel : "保存资料卡", async () => {
       const input: SaveKnowledgeCardInput = {
         id: editingKnowledgeCardId,
         project_id: detail.project.id,
@@ -1925,13 +2643,13 @@ export function BookStudioWorkspace() {
       await api.saveKnowledgeCard(input);
       resetKnowledgeComposer();
       await refreshDetailBestEffort(detail.project.id, "资料卡保存");
-      setNotice(status === "approved" ? "资料卡已确认并加入写作依据" : "资料卡已保存，等待人工确认");
+      setNotice(status === "approved" ? `资料卡已${adoptionActionLabel}并加入写作依据` : "资料卡已保存，等待人工确认");
     });
   }
 
   async function saveForeshadowing(status: "pending_human_approval" | "active") {
     if (!detail || !foreshadowingTitle.trim() || !foreshadowingContent.trim()) return;
-    await runTask("保存伏笔", async () => {
+    await runTask(status === "active" ? adoptionActionLabel : "保存伏笔", async () => {
       const input: SaveForeshadowingInput = {
         id: editingForeshadowingId,
         project_id: detail.project.id,
@@ -1946,16 +2664,16 @@ export function BookStudioWorkspace() {
       await api.saveForeshadowing(input);
       resetForeshadowingComposer();
       await refreshDetailBestEffort(detail.project.id, "伏笔保存");
-      setNotice(status === "active" ? "伏笔已确认并加入追踪" : "伏笔已保存，等待人工确认");
+      setNotice(status === "active" ? `伏笔已${adoptionActionLabel}并加入追踪` : "伏笔已保存，等待人工确认");
     });
   }
 
   async function updateKnowledgeCardStatus(card: KnowledgeCard, status: "approved" | "archived") {
     if (!detail) return;
-    await runTask(status === "approved" ? "确认资料卡" : "归档资料卡", async () => {
+    await runTask(status === "approved" ? adoptionActionLabel : "归档资料卡", async () => {
       await api.saveKnowledgeCard({ ...card, status });
       await refreshDetailBestEffort(detail.project.id, "资料卡更新");
-      setNotice(status === "approved" ? "资料卡已确认并加入写作依据" : "资料卡已归档，不再作为写作依据");
+      setNotice(status === "approved" ? `资料卡已${adoptionActionLabel}并加入写作依据` : "资料卡已归档，不再作为写作依据");
     });
   }
 
@@ -1978,12 +2696,12 @@ export function BookStudioWorkspace() {
     status: "active" | "ready_for_payoff" | "resolved" | "archived"
   ) {
     if (!detail) return;
-    await runTask("更新伏笔", async () => {
+    await runTask(status === "active" ? adoptionActionLabel : "更新伏笔", async () => {
       await api.saveForeshadowing({ ...item, status });
       await refreshDetailBestEffort(detail.project.id, "伏笔更新");
       setNotice(
         status === "active"
-          ? "伏笔已确认追踪"
+          ? `伏笔已${adoptionActionLabel}并加入追踪`
           : status === "ready_for_payoff"
             ? "伏笔已标记为可回收"
             : status === "resolved"
@@ -2071,9 +2789,9 @@ export function BookStudioWorkspace() {
 
     let message: string | null = null;
     if (!detail.story_bible || detail.story_bible.status !== "confirmed") {
-      message = "请先确认创作基准。";
+      message = "请先确认采用创作基准。";
     } else if (!activeStoryArc) {
-      message = "请先确认故事阶段。";
+      message = "请先确认采用故事阶段。";
     } else if (!detail.story_bible_review) {
       message = "请先完成一致性审校。";
     } else if (detail.story_bible_review.canon_fingerprint !== detail.canonical_fingerprint) {
@@ -2081,7 +2799,7 @@ export function BookStudioWorkspace() {
     } else if (detail.story_bible_review.issues.some((issue) => issue.severity === "major")) {
       message = "一致性审校有未解决问题。";
     } else if (detail.story_bible_review.status !== "confirmed") {
-      message = "请确认最新审校结论。";
+      message = "请确认采用最新审校结论。";
     }
 
     if (!message) return false;
@@ -2095,29 +2813,49 @@ export function BookStudioWorkspace() {
     return true;
   }
 
-  function submitAssistantPrompt() {
-    const prompt = instruction.trim();
-    if (!prompt) return;
+  async function submitAssistantMessage(
+    message: string,
+    options: AssistantMessageOptions = {},
+  ): Promise<boolean> {
+    const prompt = message.trim();
+    if (!prompt) return false;
     if (!detail) {
       setNotice("请先打开一本书");
-      return;
+      return false;
     }
+    if (busy) {
+      setNotice("当前操作正在执行");
+      return false;
+    }
+    if (orchestratorRunIsActive) {
+      setNotice("主 Agent 仍在处理上一条消息");
+      return false;
+    }
+    if (streamingRun) {
+      setNotice("Agent 运行中");
+      return false;
+    }
+
+    assistantStickToBottomRef.current = true;
+    const createdAt = Date.now();
     setAssistantMessages((current) => [
       ...current,
-      { id: `user-${Date.now()}`, role: "user", content: prompt, order: Date.now() * 1000 },
+      { id: `user-${createdAt}`, role: "user", content: prompt, order: createdAt * 1000 },
     ]);
-    // Every message goes through the project-level orchestrator. It decides whether this is
-    // ordinary conversation or needs specialist execution; the frontend no longer routes by keywords.
-    void runTask("主 Agent", async () => {
-      const result = await api.startOrchestratorTurn({
+
+    const result = await runTask("主 Agent", async () => {
+      const response = await api.startOrchestratorTurn({
         project_id: detail.project.id,
         chapter_id: selectedChapterId,
         message: prompt,
-        stage: selectedStage,
+        stage: options.stage ?? selectedStage,
+        source_artifact_id: options.sourceArtifactId ?? null,
+        story_architect_mode: options.storyArchitectMode ?? null,
+        reference_selection: options.referenceSelection ?? activeReferenceSelection,
       });
-      if (result.parent_run) {
-        activeAgentRunIdRef.current = result.parent_run.id;
-        setOrchestratorParentRunId(result.parent_run.id);
+      if (response.parent_run) {
+        activeAgentRunIdRef.current = response.parent_run.id;
+        setOrchestratorParentRunId(response.parent_run.id);
         setDelegatedRunEvents({});
         setLiveToolEvents([]);
         setThinkingRounds([]);
@@ -2126,9 +2864,23 @@ export function BookStudioWorkspace() {
         // central artifact/output surface reserved for specialist child runs.
         setStreamingRun(null);
         setLastAgentRun(null);
+        watchOrchestratorRun(response.parent_run.id);
       }
       setInstruction("");
+      return response;
     });
+    return result != null;
+  }
+
+  function submitAssistantPrompt() {
+    const revisionOptions = chapterFlow?.state === "needs_revision" && chapterFlow.reviewArtifact
+      ? { sourceArtifactId: chapterFlow.reviewArtifact.id, stage: "revision" as const }
+      : {};
+    void submitAssistantMessage(instruction, revisionOptions);
+  }
+
+  function openCandidatePanel() {
+    document.querySelector(".chapter-candidate-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   function useAssistantPrompt(prompt: string) {
@@ -2137,50 +2889,87 @@ export function BookStudioWorkspace() {
 
   async function runAgent(
     stage: Stage = selectedStage,
-    mode: AgentRunMode = "smart",
+    sourceArtifactIdOverride?: number | null,
   ) {
     if (!detail) return;
-    if (streamingRun) {
-      setNotice("Agent 运行中");
-      return;
-    }
     if (stage === "setting" || stage === "outline" || stage === "characters") {
-      return runStoryArchitect(architectModeByStage[stage], mode);
+      return runStoryArchitect(architectModeByStage[stage]);
     }
-    if (detail.project.id !== selectedProjectId) {
-      setError("项目切换中，请稍候。");
-      return;
-    }
-    if (redirectToStoryBibleIfDraftBlocked(stage)) return;
     switchContentSurface("workbench");
-    const meta = stages.find((item) => item.id === stage);
-    await runTask("运行 Agent", async () => {
-      const sourceArtifactId = stage === "review" ? agentSourceArtifactId(stage) : null;
-      const result: AgentRunSummary = await api.startAgentRun({
-        project_id: detail.project.id,
-        stage,
-        chapter_id: meta?.scope === "chapter" ? selectedChapterId : null,
-        user_instruction: instruction.trim() || null,
-        source_artifact_id: null,
-        reference_selection: activeReferenceSelection,
-        prepared_context_id: contextPreview?.id ?? null,
-      });
-      showStartedAgentRun(result);
-      setContextPreview(null);
-      setInstruction("");
-      setNotice(`${meta?.label ?? "Agent"}已开始运行`);
-    });
+    const chapterTitle = selectedChapter
+      ? `第 ${selectedChapter.chapter_no} 章《${selectedChapter.title}》`
+      : "当前章节";
+    const prompt = buildChapterAgentPrompt(detail.project.title, chapterTitle, stage, instruction);
+    const sourceArtifactId = sourceArtifactIdOverride !== undefined
+      ? sourceArtifactIdOverride
+      : stage === "review"
+        ? agentSourceArtifactId(stage)
+        : stage === "revision" && selectedArtifact && selectedArtifact.chapter_id === selectedChapterId
+          && ["draft", "revision", "review"].includes(selectedArtifact.stage)
+          ? selectedArtifact.id
+          : null;
+    return submitAssistantMessage(prompt, { sourceArtifactId, stage });
   }
 
-  async function runStoryArchitect(
-    architectMode: StoryArchitectMode,
-    runMode: AgentRunMode = "smart",
-  ) {
+  function appendManualInstruction(prompt: string, extraInstruction = instruction) {
+    const hint = extraInstruction.trim();
+    return hint ? `${prompt}\n\n补充要求：${hint}` : prompt;
+  }
+
+  function focusPlanDiscussion() {
+    setInstruction(
+      "请和我一起讨论并完善当前创作计划。请先理解我的意图，再决定需要初始化、补充世界观、细化当前阶段、扩展下一阶段、整理角色或修复一致性问题；不要预设固定故事架构模式。",
+    );
+    assistantInputRef.current?.focus();
+  }
+
+  async function confirmCurrentPlan() {
     if (!detail) return;
-    if (streamingRun) {
-      setNotice("Agent 运行中");
+    const result = await runTask(adoptionActionLabel, async () => {
+      const confirmation = await api.confirmCurrentPlan({
+        project_id: detail.project.id,
+        note: "",
+      });
+      await refreshDetailBestEffort(detail.project.id, "当前计划确认采用");
+      return confirmation;
+    });
+    if (!result) return;
+
+    if (result.status === "confirmed") {
+      setNotice(
+        result.approved_card_count > 0
+          ? `当前计划已${adoptionActionLabel}，并纳入 ${result.approved_card_count} 张资料卡`
+          : `当前计划已${adoptionActionLabel}`,
+      );
       return;
     }
+    if (result.status === "awaiting_review_confirmation") {
+      setNotice(
+        result.approved_card_count > 0
+          ? `已纳入 ${result.approved_card_count} 张资料卡，审校结论已生成，请查看后再次${adoptionActionLabel}`
+          : `审校结论已生成，请查看后再次${adoptionActionLabel}`,
+      );
+      return;
+    }
+
+    const majorIssues = result.review?.issues.filter((issue) => issue.severity === "major") ?? [];
+    if (majorIssues.length > 0) {
+      const repairPrompt = [
+        "请和我一起修复当前创作计划中的一致性问题。请先理解问题，再由主 Agent 自行判断需要委托的故事架构内部模式；不要预设固定模式。",
+        ...majorIssues.map((issue, index) => `${index + 1}. 问题：${issue.title}\n影响：${issue.impact}\n修复要求：${issue.rework_instruction}\n冲突：${issue.conflict}`),
+      ].join("\n\n");
+      setInstruction(repairPrompt);
+      assistantInputRef.current?.focus();
+    }
+    setError(
+      result.blockers.length > 0
+        ? `当前计划暂不能${adoptionActionLabel}：${result.blockers.join("；")}`
+        : `当前计划暂不能${adoptionActionLabel}，请先处理审校中的 major 问题`,
+    );
+  }
+
+  function runStoryArchitect(architectMode: StoryArchitectMode) {
+    if (!detail) return;
     const stage = artifactStageForArchitectMode(architectMode);
     setLibraryMode("workbench");
     setLibraryOriginSurface("workbench");
@@ -2188,57 +2977,28 @@ export function BookStudioWorkspace() {
     setLibraryFocus(stage);
     setSelectedStage(stage);
     setSelectedArtifactId(null);
+    setExplicitArchitectSourceId(null);
     setMainSurface("library");
-    await runTask("运行故事架构 Agent", async () => {
-      const result = await api.startStoryArchitectRun({
-        project_id: detail.project.id,
-        mode: architectMode,
-        arc_id: activeStoryArc?.id ?? null,
-        user_instruction: instruction.trim() || null,
-        source_artifact_id: null,
-        reference_selection: activeReferenceSelection,
-      });
-      showStartedAgentRun(result);
-      setExplicitArchitectSourceId(null);
-      setInstruction("");
-      setNotice(`${architectModeLabel[architectMode]}已开始运行`);
-    });
-  }
-
-  async function createTargetedRework(issue: CanonIssue) {
-    if (!detail) return;
-    const architectMode = resolveArchitectMode(issue.owner_mode);
-    const stage = artifactStageForArchitectMode(architectMode);
-    setLibraryMode("workbench");
-    setLibraryOriginSurface("workbench");
-    setMainSurface("library");
-    await runTask("定向返工故事资料", async () => {
-      const result = await api.startStoryArchitectRun({
-        project_id: detail.project.id,
-        mode: architectMode,
-        arc_id: activeStoryArc?.id ?? null,
-        user_instruction: issue.rework_instruction,
-        source_artifact_id: null,
-        reference_selection: activeReferenceSelection,
-      });
-      if (!result.artifact) {
-        throw new Error("定向返工已结束，但没有返回候选产物");
-      }
-      setLastAgentRun(result);
-      mergeActionProposals(result.proposals);
-      setSelectedStage(stage);
-      setSelectedArtifactId(result.artifact.id);
-      await refreshDetailBestEffort(detail.project.id, "定向返工");
-      setNotice(`已生成针对“${issue.title}”的候选资料版本`);
-    });
+    const prompt = appendManualInstruction(
+      architectMode === "initialize"
+        ? `请为《${detail.project.title}》开始建立创作基准，生成这本书可持续创作所需的世界观。请把稳定的世界规则、势力、地点、物件和边界沉淀为待确认的结构化资料卡，不要直接写正文。`
+        : architectMode === "refine_canon"
+          ? `请为《${detail.project.title}》补充并整理当前世界观，只增加对后续创作有用且能长期成立的规则、势力、地点、物件或边界，并沉淀为待确认的结构化资料卡。`
+          : architectMode === "plan_current_arc"
+            ? `请为《${detail.project.title}》细化当前故事阶段，形成可执行的阶段目标、冲突、角色变化和近期章节任务，并沉淀为待确认的大纲资料。`
+            : architectMode === "extend_next_arc"
+              ? `请为《${detail.project.title}》基于当前故事进展提出下一阶段的候选方向，保留未兑现项并说明新条件，沉淀为待确认的大纲资料。`
+              : `请为《${detail.project.title}》补充和整理主要角色卡，明确身份、目标、限制、已知信息、关系和长期变化条件。`,
+    );
+    void submitAssistantMessage(prompt, { storyArchitectMode: architectMode });
   }
 
   async function confirmStoryBible() {
     if (!detail) return;
-    await runTask("确认创作基准", async () => {
+    await runTask(adoptionActionLabel, async () => {
       await api.confirmStoryBible({ project_id: detail.project.id, note: "" });
       await refreshDetailBestEffort(detail.project.id, "创作基准确认");
-      setNotice("创作基准与当前故事阶段已确认");
+      setNotice(`创作基准与当前故事阶段已${adoptionActionLabel}`);
     });
   }
 
@@ -2247,21 +3007,21 @@ export function BookStudioWorkspace() {
     await runTask("审校创作基准", async () => {
       await api.reviewStoryBible({ project_id: detail.project.id });
       await refreshDetailBestEffort(detail.project.id, "创作基准审校");
-      setNotice("创作基准一致性审校已生成，等待人工确认");
+      setNotice("创作基准一致性审校已生成，等待确认采用");
     });
   }
 
   async function confirmStoryBibleReview() {
     if (!detail?.story_bible_review) return;
     const reviewId = detail.story_bible_review.id;
-    await runTask("确认一致性审校", async () => {
+    await runTask(adoptionActionLabel, async () => {
       await api.confirmStoryBibleReview({
         project_id: detail.project.id,
         review_id: reviewId,
         note: "",
       });
-      await refreshDetailBestEffort(detail.project.id, "一致性审校确认");
-      setNotice("一致性审校已确认");
+      await refreshDetailBestEffort(detail.project.id, "一致性审校确认采用");
+      setNotice(`一致性审校已${adoptionActionLabel}`);
     });
   }
 
@@ -2313,15 +3073,15 @@ export function BookStudioWorkspace() {
 
   async function applyAgentProposal(proposal: ActionProposal) {
     if (!detail || proposal.project_id !== detail.project.id) return;
-    if (!window.confirm(`确认应用这条 Agent 提案？\n\n${proposal.summary}`)) return;
-    await runTask("应用 Agent 提案", async () => {
+    if (!window.confirm(`${adoptionActionLabel}这条 Agent 提案？\n\n${proposal.summary}`)) return;
+    await runTask(adoptionActionLabel, async () => {
       await api.applyActionProposal({
         project_id: detail.project.id,
         proposal_id: proposal.id,
-        note: "由用户在 Agent 运行明细中确认",
+        note: `由用户${adoptionActionLabel}`,
       });
       await Promise.all([
-        refreshDetailBestEffort(detail.project.id, "Agent 提案应用"),
+        refreshDetailBestEffort(detail.project.id, "Agent 提案确认采用"),
         invalidateActionProposals(),
       ]);
       setLastAgentRun((current) => current
@@ -2332,7 +3092,7 @@ export function BookStudioWorkspace() {
           ),
         }
         : current);
-      setNotice("Agent 提案已人工确认并应用");
+      setNotice(`Agent 提案已${adoptionActionLabel}`);
     });
   }
 
@@ -2358,112 +3118,51 @@ export function BookStudioWorkspace() {
     });
   }
 
-  async function approveArtifact() {
-    if (!detail || !selectedArtifact) return;
-    if (selectedArtifactApproved) {
-      setNotice("当前产物已经通过");
-      return;
-    }
-    await runTask("审核通过", async () => {
-      const approvedArtifact = selectedArtifact;
-      await api.approveStage(detail.project.id, approvedArtifact.stage, approvedArtifact.id, approvalNote);
-      setApprovalNote("");
-      await refreshDetailBestEffort(detail.project.id, "产物通过");
-      await refreshStorySearchStatusBestEffort(detail.project.id, "产物通过");
-      if (approvedArtifact.stage === "draft" || approvedArtifact.stage === "revision") {
-        setSelectedStage(approvedArtifact.stage);
-        setSelectedArtifactId(approvedArtifact.id);
-        setNotice("已通过并应用为当前正文");
-      } else {
-        setNotice("已记录人工确认");
-      }
-    });
-  }
-
-  async function approveBodyArtifact(artifact: Artifact) {
+  async function approveBodyArtifact(
+    artifact: Pick<Artifact, "id" | "project_id" | "chapter_id" | "stage" | "title" | "version" | "status" | "parent_artifact_id" | "created_at">,
+  ) {
     if (!detail || !selectedChapter) return;
     const artifactApproved =
       artifact.status === "approved" ||
       detail.approvals.some((approval) => approval.artifact_id === artifact.id);
     if (artifactApproved && selectedChapter.current_artifact_id === artifact.id) return;
-    await runTask("通过并应用正文", async () => {
-      await api.approveStage(detail.project.id, artifact.stage, artifact.id, approvalNote);
-      setApprovalNote("");
-      await refreshDetailBestEffort(detail.project.id, "正文应用");
-      await refreshStorySearchStatusBestEffort(detail.project.id, "正文应用");
+    await runTask(adoptionActionLabel, async () => {
+      await api.approveStage(detail.project.id, artifact.stage, artifact.id, "");
+      await refreshDetailBestEffort(detail.project.id, "正文确认采用");
+      await refreshStorySearchStatusBestEffort(detail.project.id, "正文确认采用");
       setSelectedChapterId(selectedChapter.id);
-      setSelectedStage(artifact.stage);
+      setSelectedStage(artifactStageOr(artifact.stage, "draft"));
       setSelectedArtifactId(artifact.id);
-      setNotice(`已将 ${artifact.stage === "revision" ? "修订稿" : "草稿"} v${artifact.version} 应用为当前正文`);
+      setNotice(`已${adoptionActionLabel}${artifact.stage === "revision" ? "修订稿" : "草稿"} v${artifact.version} 作为当前正文`);
     });
   }
 
-  async function prepareArtifactAdoptions() {
-    if (!detail || !selectedArtifact || !selectedArtifactSupportsAdoption) return;
-    setShowAdoptionDrawer(true);
-    await runTask("整理资料变更", async () => {
-      const proposals = await api.prepareArtifactAdoptions({
-        project_id: detail.project.id,
-        artifact_id: selectedArtifact.id,
-      });
-      await refreshDetailBestEffort(detail.project.id, "资料整理");
-      setNotice(proposals.length > 0 ? `已整理出 ${proposals.length} 条待确认资料` : "未发现可靠的资料变更");
-    });
-  }
+  async function runChapterPrimaryAction() {
+    if (!chapterFlow) return;
 
-  async function saveAdoptionProposal(proposalId: number, data: Record<string, unknown>) {
-    if (!detail) return;
-    await runTask("保存资料候选", async () => {
-      await api.updateAdoptionProposal({ project_id: detail.project.id, proposal_id: proposalId, data });
-      await refreshDetailBestEffort(detail.project.id, "候选保存");
-      setNotice("候选已保存并重新校验");
-    });
-  }
-
-  async function applyAdoptionProposals(proposalIds: number[], note: string) {
-    if (!detail || proposalIds.length === 0) return;
-    await runTask("采纳资料变更", async () => {
-      await api.applyAdoptionProposals({
-        project_id: detail.project.id,
-        proposal_ids: proposalIds,
-        note,
-      });
-      await refreshDetailBestEffort(detail.project.id, "资料变更采纳");
-      setNotice(`已采纳 ${proposalIds.length} 条资料变更`);
-    });
-  }
-
-  async function rejectAdoptionProposals(proposalIds: number[], note: string) {
-    if (!detail || proposalIds.length === 0) return;
-    await runTask("拒绝资料变更", async () => {
-      await api.rejectAdoptionProposals({
-        project_id: detail.project.id,
-        proposal_ids: proposalIds,
-        note,
-      });
-      await refreshDetailBestEffort(detail.project.id, "资料变更拒绝");
-      setNotice(`已拒绝 ${proposalIds.length} 条资料变更`);
-    });
-  }
-
-  async function requestRevision() {
-    if (!detail || !selectedArtifact) return;
-    if (streamingRun) {
-      setNotice("Agent 运行中");
-      return;
+    switch (chapterFlow.state) {
+      case "empty":
+        await runAgent("draft");
+        return;
+      case "awaiting_review":
+        if (!chapterFlow.bodyArtifact) {
+          setNotice("当前没有可试读的候选稿");
+          return;
+        }
+        setSelectedArtifactId(chapterFlow.bodyArtifact.id);
+        await runAgent("review", chapterFlow.bodyArtifact.id);
+        return;
+      case "ready_to_adopt":
+        if (!chapterFlow.bodyArtifact) {
+          setNotice("试读原稿仍在加载，请稍后再试");
+          return;
+        }
+        await approveBodyArtifact(chapterFlow.bodyArtifact);
+        return;
+      case "adopted":
+        await runAgent("draft");
+        return;
     }
-    await runTask("请求修订", async () => {
-      const result = await api.startRevisionRun({
-        project_id: detail.project.id,
-        artifact_id: selectedArtifact.id,
-        feedback: revisionFeedback,
-        reference_selection: activeReferenceSelection,
-      });
-      showStartedAgentRun(result);
-      setRevisionFeedback("");
-      setReviewIssues([]);
-      setNotice("修订 Agent 已开始运行");
-    });
   }
 
   async function cancelStreamingAgentRun() {
@@ -2478,51 +3177,12 @@ export function BookStudioWorkspace() {
     });
   }
 
-  async function replaceSelectedArtifactSpan() {
-    if (!detail || !selectedArtifact) return;
-    if (!selectedArtifactSupportsLocalPatch) {
-      setNotice("当前产物暂不支持局部替换");
-      return;
-    }
-    await runTask("局部替换修订", async () => {
-      const result = await api.replaceArtifactSpan({
-        project_id: detail.project.id,
-        artifact_id: selectedArtifact.id,
-        find_text: patchFindText,
-        replace_text: patchReplaceText,
-        note: revisionFeedback.trim() || null,
-      });
-      const patchStage = asStage(result.artifact.stage);
-      if (patchStage) setSelectedStage(patchStage);
-      setSelectedArtifactId(result.artifact.id);
-      setPatchFindText("");
-      setPatchReplaceText("");
-      await refreshDetailBestEffort(detail.project.id, "局部替换");
-      setNotice(`局部替换已生成 ${result.artifact.title} v${result.artifact.version}`);
-    });
-  }
-
-  async function reviseSelectedArtifactSpanWithAi() {
-    if (!detail || !selectedArtifact) return;
-    if (!selectedArtifactSupportsLocalPatch) {
-      setNotice("当前产物暂不支持 AI 局部改写");
-      return;
-    }
-    await runTask("AI 局部修订", async () => {
-      const result = await api.reviseArtifactSpanWithAi({
-        project_id: detail.project.id,
-        artifact_id: selectedArtifact.id,
-        find_text: patchFindText,
-        instruction: aiPatchInstruction,
-      });
-      const aiPatchStage = asStage(result.artifact.stage);
-      if (aiPatchStage) setSelectedStage(aiPatchStage);
-      setSelectedArtifactId(result.artifact.id);
-      setPatchFindText("");
-      setPatchReplaceText("");
-      setAiPatchInstruction("");
-      await refreshDetailBestEffort(detail.project.id, "AI 局部改写");
-      setNotice(`AI 局部改写已生成 ${result.artifact.title} v${result.artifact.version}`);
+  async function cancelOrchestratorRun() {
+    if (orchestratorParentRunId == null || orchestratorCancellationRequested) return;
+    await runTask("停止 Agent", async () => {
+      await api.cancelAgentRun(orchestratorParentRunId);
+      setOrchestratorCancellationRequested(true);
+      setNotice("正在停止 Agent");
     });
   }
 
@@ -2547,63 +3207,6 @@ export function BookStudioWorkspace() {
     });
   }
 
-  async function deleteLibrarySourceArtifact() {
-    if (!detail || librarySection !== "setting") return;
-    const worldArtifactVersions = detail.artifacts
-      .filter((artifact) =>
-        artifact.stage === "setting" &&
-        artifact.chapter_id == null &&
-        artifact.project_id === detail.project.id
-      )
-      .sort((a, b) => b.version - a.version);
-    const worldKnowledgeCards = (detail.knowledge_cards ?? []).filter((card) =>
-      ["world", "cultivation", "map", "faction", "taboo", "item", "rule"].includes(card.category)
-    );
-    const confirmed = window.confirm(
-      `确定清空当前世界观的全部内容吗？\n将删除 ${worldArtifactVersions.length} 个草稿/正式版本和 ${worldKnowledgeCards.length} 张设定卡，且不可恢复。`
-    );
-    if (!confirmed) return;
-    await runTask("清空世界观", async () => {
-      for (const artifact of worldArtifactVersions) {
-        await api.deleteArtifact({
-          project_id: detail.project.id,
-          artifact_id: artifact.id,
-        });
-      }
-      for (const card of worldKnowledgeCards) {
-        await api.deleteKnowledgeCard({
-          project_id: detail.project.id,
-          card_id: card.id,
-        });
-      }
-      await refreshDetailBestEffort(detail.project.id, "候选原稿删除");
-      setNotice("世界观的草稿、正式版本和设定卡已清空");
-    });
-  }
-
-  async function deleteLibrarySourceSection(section: { title: string }) {
-    if (!detail || !libraryArtifactSummary || !libraryArtifact) return;
-    const heading = section.title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const match = libraryArtifact.content.match(new RegExp(`^##+\\s+${heading}\\s*$[\\s\\S]*?(?=^##+\\s+|\\s*$)`, "m"));
-    if (!match?.[0]) {
-      setError("无法定位这张候选卡片的原文");
-      return;
-    }
-    const confirmed = window.confirm(`确定删除候选卡片“${section.title}”吗？`);
-    if (!confirmed) return;
-    await runTask("删除候选卡片", async () => {
-      await api.replaceArtifactSpan({
-        project_id: detail.project.id,
-        artifact_id: libraryArtifactSummary.id,
-        find_text: match[0],
-        replace_text: "",
-        note: `删除候选卡片：${section.title}`,
-      });
-      await refreshDetailBestEffort(detail.project.id, "候选卡片删除");
-      setNotice(`已删除候选卡片“${section.title}”`);
-    });
-  }
-
   async function clearSelectedChapterHistory() {
     if (!detail || !selectedChapter) return;
     const confirmed = window.confirm(
@@ -2618,15 +3221,6 @@ export function BookStudioWorkspace() {
       });
       await refreshDetailBestEffort(detail.project.id, "历史清理");
       setNotice(`已清理 ${result.deleted_artifact_ids.length} 个历史版本`);
-    });
-  }
-
-  async function analyzeQuality() {
-    if (!detail || !selectedArtifact) return;
-    await runTask("质量检查", async () => {
-      const report = await api.analyzeArtifactQuality(detail.project.id, selectedArtifact.id);
-      setQualityReport(report);
-      setNotice(`质量检查完成：${qualityVerdictLabel(report.verdict)} · ${report.score}`);
     });
   }
 
@@ -2645,7 +3239,7 @@ export function BookStudioWorkspace() {
       setNotice("通过前检查只能检查当前章节的草稿或修订稿");
       return;
     }
-    setSelectedStage(artifact.stage);
+    setSelectedStage(artifactStageOr(artifact.stage, "draft"));
     setSelectedArtifactId(artifact.id);
     await runTask("通过前检查", async () => {
       const report = await api.analyzeChapterGate({
@@ -2665,13 +3259,6 @@ export function BookStudioWorkspace() {
     });
   }
 
-  function viewBodyArtifact(artifact: Artifact) {
-    switchContentSurface("workbench");
-    setSelectedStage(artifact.stage);
-    setSelectedArtifactId(artifact.id);
-    setNotice(`已切到 ${artifact.stage === "revision" ? "修订稿" : "草稿"} v${artifact.version}`);
-  }
-
   async function generateSplitPlan() {
     if (!detail || !selectedChapter || !selectedArtifact) return;
     await runTask("章节重规划", async () => {
@@ -2687,7 +3274,8 @@ export function BookStudioWorkspace() {
 
   function useSplitPlanForRevision() {
     if (!chapterSplitPlan) return;
-    setRevisionFeedback(chapterSplitPlan.revision_prompt_current);
+    setInstruction(chapterSplitPlan.revision_prompt_current);
+    assistantInputRef.current?.focus();
     setSelectedStage("revision");
     setNotice("已把重规划方案写入修订要求");
   }
@@ -2763,21 +3351,6 @@ export function BookStudioWorkspace() {
     });
   }
 
-  async function checkLedgerContinuity() {
-    if (!detail || !selectedArtifact || (selectedArtifact.stage !== "draft" && selectedArtifact.stage !== "revision")) {
-      setNotice("请选择一份章节草稿或修订稿进行连续性核对");
-      return;
-    }
-    await runTask("连续性核对", async () => {
-      const report = await api.checkArtifactLedgerContinuity({
-        project_id: detail.project.id,
-        artifact_id: selectedArtifact.id,
-      });
-      setLedgerContinuityReport(report);
-      setNotice(report.issues.length > 0 ? `状态账本发现 ${report.issues.length} 条直接冲突` : "状态账本未发现直接冲突");
-    });
-  }
-
   async function searchContext() {
     if (!detail || !contextQuery.trim()) return;
     await runTask("历史检索", async () => {
@@ -2819,7 +3392,6 @@ export function BookStudioWorkspace() {
     if (!detail) return;
     await runTask("导出", async () => {
       const markdown = await api.exportProject(detail.project.id);
-      setExportText(markdown);
       try {
         await navigator.clipboard?.writeText(markdown);
       } catch {
@@ -2829,46 +3401,9 @@ export function BookStudioWorkspace() {
     });
   }
 
-  function downloadExportedMarkdown() {
-    if (!detail || !exportText) return;
-    downloadMarkdownFile(exportText, detail.project.title);
-    setNotice("Markdown 文件已下载");
-  }
-
-  function stageStatus(stage: Stage) {
-    if (!detail) return "待生成";
-    const meta = stages.find((item) => item.id === stage);
-    const artifacts = detail.artifacts.filter((artifact) => {
-      if (artifact.stage !== stage) return false;
-      return meta?.scope === "chapter" ? artifact.chapter_id === selectedChapterId : artifact.chapter_id == null;
-    });
-    if (artifacts.some((artifact) => detail.approvals.some((approval) => approval.artifact_id === artifact.id))) {
-      return "已通过";
-    }
-    if (artifacts.length > 0) return "待确认";
-    return "待生成";
-  }
-
   function stageLabel(stage: string) {
     if (stage === "context_search_plan") return "上下文检索";
     return stages.find((item) => item.id === stage)?.label ?? stage;
-  }
-
-  function roleLabel(role: string) {
-    switch (role) {
-      case "human_instruction":
-        return "人工指令";
-      case "revision_feedback":
-        return "修订要求";
-      case "approval_note":
-        return "人工确认";
-      case "agent_result":
-        return "Agent 结果";
-      case "reference_overlap_warning":
-        return "参考相似度提醒";
-      default:
-        return role;
-    }
   }
 
   function qualityVerdictLabel(verdict: string) {
@@ -2907,10 +3442,14 @@ export function BookStudioWorkspace() {
   }
 
   useEffect(() => {
-    if (selectedArtifact?.stage === "review") {
-      setReviewIssues(selectedReviewIssues);
-    }
-  }, [selectedArtifact, selectedReviewIssues]);
+    if (!selectedArtifact || selectedArtifact.stage !== "review" || selectedReviewIssues.length === 0) return;
+    const reviewKey = `${selectedProjectId ?? "project"}:${selectedArtifact.id}`;
+    if (autoFilledReviewArtifactRef.current === reviewKey) return;
+
+    autoFilledReviewArtifactRef.current = reviewKey;
+    setInstruction(formatReviewInstructions(selectedReviewIssues));
+    assistantInputRef.current?.focus();
+  }, [selectedArtifact, selectedProjectId, selectedReviewIssues]);
 
   useEffect(() => {
     if (!detail) {
@@ -2952,6 +3491,10 @@ export function BookStudioWorkspace() {
     setChapterSplitPlan(null);
   }, [selectedChapterId]);
 
+  function transitionToView(nextView: ViewMode) {
+    startViewTransition(() => setViewMode(nextView));
+  }
+
   if (viewMode === "settings") {
     return (
       <SettingsView
@@ -2962,7 +3505,7 @@ export function BookStudioWorkspace() {
         apiKey={apiKey}
         settingsCategory={settingsCategory}
         onSettingsCategoryChange={setSettingsCategory}
-        onBack={() => setViewMode("main")}
+        onBack={() => transitionToView("main")}
         onSaveSettings={handleSaveSettings}
         onSaveProvider={handleSaveProvider}
         onDeleteProvider={handleDeleteProvider}
@@ -3081,7 +3624,7 @@ export function BookStudioWorkspace() {
               </div>
 
               <footer className="sidebar-footer">
-                <button className="settings-btn" onClick={() => setViewMode("settings")}>
+                <button className="settings-btn" onClick={() => transitionToView("settings")}>
                   <Settings size={16} />
                   设置
                 </button>
@@ -3169,39 +3712,70 @@ export function BookStudioWorkspace() {
             <div className="lane-header">
               <div className="library-shortcuts">
                 <div className="section-head">
-                  <h2>书籍资料</h2>
+                  <h2>资料库</h2>
                   {currentContentSurface() === "official" && <span className="read-only-note">只读</span>}
                 </div>
                 {currentContentSurface() === "workbench" ? (
                   <>
-                    {foundationStages.map((stage) => (
+                    <div className="library-nav-group">
+                      <span className="library-nav-group-label">创作计划</span>
+                      {foundationStages.map((stage) => (
+                        <button
+                          key={stage.id}
+                          className={mainSurface === "library" && libraryFocus === stage.id ? "active" : ""}
+                          onClick={() => openLibrary(stage.id as LibrarySection, "workbench")}
+                        >
+                          <span>{stage.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="library-nav-group">
+                      <span className="library-nav-group-label">主动维护</span>
                       <button
-                        key={stage.id}
-                        className={mainSurface === "library" && libraryFocus === stage.id ? "active" : ""}
-                        onClick={() => openLibrary(stage.id as LibrarySection, "workbench")}
+                        className={mainSurface === "library" && libraryFocus === "foreshadowing" ? "active" : ""}
+                        onClick={() => openLibrary("foreshadowing", "workbench")}
                       >
-                        <span>{stage.label}</span>
+                        <span>伏笔账本</span>
+                        <small>{visibleForeshadowings.length}</small>
                       </button>
-                    ))}
+                    </div>
                   </>
                 ) : (
                   <>
-                    <button className={mainSurface === "library" && libraryFocus === "setting" ? "active" : ""} onClick={() => openLibrary("setting", "official")}>
-                      <span>世界观</span>
-                    </button>
-                    <button className={mainSurface === "library" && libraryFocus === "outline" ? "active" : ""} onClick={() => openLibrary("outline", "official")}>
-                      <span>大纲</span>
-                    </button>
-                    <button className={mainSurface === "library" && libraryFocus === "characters" ? "active" : ""} onClick={() => openLibrary("characters", "official")}>
-                      <span>角色</span>
-                    </button>
-                    <button className={mainSurface === "library" && libraryFocus === "items" ? "active" : ""} onClick={() => openLibrary("items", "official")}>
-                      <span>物品与事件</span>
-                      <small>{(detail?.story_entities?.filter((entity) => entity.kind === "item" || entity.kind === "resource").length ?? 0) + (detail?.story_events?.length ?? 0)}</small>
-                    </button>
-                    <button className={mainSurface === "library" && libraryFocus === "foreshadowing" ? "active" : ""} onClick={() => openLibrary("foreshadowing", "official")}>
-                      <span>伏笔账本</span>
-                    </button>
+                    <div className="library-nav-group">
+                      <span className="library-nav-group-label">创作计划</span>
+                      <button className={mainSurface === "library" && libraryFocus === "setting" ? "active" : ""} onClick={() => openLibrary("setting", "official")}>
+                        <span>世界观</span>
+                      </button>
+                      <button className={mainSurface === "library" && libraryFocus === "outline" ? "active" : ""} onClick={() => openLibrary("outline", "official")}>
+                        <span>大纲</span>
+                      </button>
+                      <button className={mainSurface === "library" && libraryFocus === "characters" ? "active" : ""} onClick={() => openLibrary("characters", "official")}>
+                        <span>角色</span>
+                      </button>
+                    </div>
+                    <div className="library-nav-group">
+                      <span className="library-nav-group-label">正文衍生资料</span>
+                      <button className={mainSurface === "library" && libraryFocus === "events" ? "active" : ""} onClick={() => openLibrary("events", "official")}>
+                        <span>事件时间线</span>
+                        <small>{detail?.story_events?.length ?? 0}</small>
+                      </button>
+                      <button className={mainSurface === "library" && libraryFocus === "character-timeline" ? "active" : ""} onClick={() => openLibrary("character-timeline", "official")}>
+                        <span>角色时间线</span>
+                        <small>{detail?.story_entities?.filter((entity) => entity.kind === "character").length ?? 0}</small>
+                      </button>
+                      <button className={mainSurface === "library" && libraryFocus === "items" ? "active" : ""} onClick={() => openLibrary("items", "official")}>
+                        <span>物品状态</span>
+                        <small>{detail?.story_entities?.filter((entity) => entity.kind === "item" || entity.kind === "resource").length ?? 0}</small>
+                      </button>
+                    </div>
+                    <div className="library-nav-group">
+                      <span className="library-nav-group-label">主动维护</span>
+                      <button className={mainSurface === "library" && libraryFocus === "foreshadowing" ? "active" : ""} onClick={() => openLibrary("foreshadowing", "official")}>
+                        <span>伏笔账本</span>
+                        <small>{visibleForeshadowings.length}</small>
+                      </button>
+                    </div>
                   </>
                 )}
               </div>
@@ -3255,7 +3829,7 @@ export function BookStudioWorkspace() {
                     onClick={() => selectChapter(chapter)}
                   >
                     <span>{chapter.title}</span>
-                    {currentContentSurface() === "workbench" && <small>{chapter.current_artifact_id ? "正式正文" : "待创作"}</small>}
+                    {currentContentSurface() === "workbench" && <small>{chapter.current_artifact_id ? adoptedStatusLabel : "待创作"}</small>}
                   </button>
                 ))}
                 {detail && detail.chapters.length === 0 && (
@@ -3272,7 +3846,7 @@ export function BookStudioWorkspace() {
                 <div>
                   <div className="editor-title-line">
                     <h2>正式正文</h2>
-                    <span className="workspace-mode-badge official">已审核 · 只读</span>
+                  <span className="workspace-mode-badge official">{adoptedStatusLabel} · 只读</span>
                   </div>
                   <p>{selectedChapter ? selectedChapter.title : "选择章节"}</p>
                 </div>
@@ -3313,9 +3887,9 @@ export function BookStudioWorkspace() {
                 )}
               </article>
             </section>
-          ) : mainSurface === "library" && ["characters", "items", "events"].includes(libraryFocus) ? (
+          ) : mainSurface === "library" && libraryMode === "official" && ["character-timeline", "items", "events"].includes(libraryFocus) ? (
             <ContinuityLibraryPanel
-              focus={libraryFocus as "characters" | "items" | "events"}
+              focus={libraryFocus as "character-timeline" | "items" | "events"}
               readOnly={libraryMode === "official"}
               detail={detail}
               busy={Boolean(busy)}
@@ -3328,7 +3902,7 @@ export function BookStudioWorkspace() {
               onRebuild={rebuildLibraryIndex}
               onSelectEntity={setSelectedLibraryEntityId}
               onOpenEntity={(entityId, kind) => {
-                openLibrary(kind === "character" ? "characters" : "items");
+                openLibrary(kind === "character" ? "character-timeline" : "items");
                 setSelectedLibraryEntityId(entityId);
               }}
               onOpenChapter={openTimelineChapter}
@@ -3338,91 +3912,213 @@ export function BookStudioWorkspace() {
               <header className="library-header">
                 <div className="library-header-title">
                   <div>
-                    <h2>{libraryFocus === "foreshadowing" ? "伏笔账本" : librarySection === "setting" ? "世界观" : librarySection === "outline" ? "大纲" : "角色"}</h2>
+                    <span className="library-context-label">{libraryFocusMeta[libraryFocus].group}</span>
+                    <h2>{libraryFocusMeta[libraryFocus].title}</h2>
+                    <p>{libraryFocusMeta[libraryFocus].description}</p>
                   </div>
                 </div>
-                {libraryMode === "workbench" && (
-                  <button onClick={() => (showKnowledgeComposer ? resetKnowledgeComposer() : setShowKnowledgeComposer(true))} disabled={!detail || Boolean(busy)}>
-                    <Plus size={14} /> 补充资料
-                  </button>
+                {libraryMode === "workbench" && libraryFocus !== "setting" && (
+                  <>
+                    {libraryFocus === "foreshadowing" && (
+                      <button onClick={() => (showForeshadowingComposer ? resetForeshadowingComposer() : setShowForeshadowingComposer(true))} disabled={!detail || Boolean(busy)}>
+                        <Plus size={14} /> 登记伏笔
+                      </button>
+                    )}
+                    {libraryFocus === "characters" && (
+                      <button onClick={() => runStoryArchitect("design_characters")} disabled={!detail || Boolean(busy)}>
+                        <Sparkles size={14} /> 补充角色
+                      </button>
+                    )}
+                    {libraryFocus === "outline" ? (
+                      <>
+                        <button onClick={() => runStoryArchitect("plan_current_arc")} disabled={!detail || Boolean(busy)}>
+                          <Sparkles size={14} /> 生成章节计划
+                        </button>
+                        <button onClick={() => (showChapterPlanComposer ? resetChapterPlanComposer() : openChapterPlanEditor())} disabled={!detail || Boolean(busy)}>
+                          <Plus size={14} /> 手动添加
+                        </button>
+                      </>
+                    ) : libraryFocus !== "foreshadowing" ? (
+                      <button onClick={() => (showKnowledgeComposer ? resetKnowledgeComposer() : setShowKnowledgeComposer(true))} disabled={!detail || Boolean(busy)}>
+                        <Plus size={14} /> 补充资料
+                      </button>
+                    ) : null}
+                  </>
                 )}
               </header>
               {libraryMode === "workbench" && libraryFocus === "setting" && <section className="story-bible-overview">
-                <div className="story-bible-summary">
-                  <div className="story-bible-actions">
-                    {libraryMode === "workbench" ? (
-                      <>
-                        <button
-                          className="icon-btn btn-primary tooltip-button"
-                          onClick={() => runStoryArchitect(libraryCards.length > 0 ? "refine_canon" : "initialize")}
-                          disabled={!detail || Boolean(busy)}
-                          data-tooltip={libraryCards.length > 0 ? "补充世界观" : "整理世界观"}
-                          aria-label={libraryCards.length > 0 ? "补充世界观" : "整理世界观"}
-                        >
-                          <Sparkles size={14} />
-                        </button>
-                        <button
-                          className="icon-btn tooltip-button"
-                          onClick={() => runStoryArchitect("plan_current_arc")}
-                          disabled={!detail || Boolean(busy)}
-                          data-tooltip="细化当前阶段"
-                          aria-label="细化当前阶段"
-                        >
-                          <Rows3 size={14} />
-                        </button>
-                        <button
-                          className="icon-btn tooltip-button"
-                          onClick={() => runStoryArchitect("extend_next_arc")}
-                          disabled={!detail || Boolean(busy)}
-                          data-tooltip="扩展下一阶段"
-                          aria-label="扩展下一阶段"
-                        >
-                          <CalendarPlus size={14} />
-                        </button>
-                      </>
-                    ) : null}
+                <div className="story-bible-plan">
+                  <div className="story-bible-plan-copy">
+                    <div className="story-bible-plan-title">
+                      <strong>当前创作计划</strong>
+                      <span className={`story-bible-plan-status ${currentPlanStatus(detail).tone}`}>
+                        {currentPlanStatus(detail).label}
+                      </span>
+                    </div>
+                    <div className="story-bible-status-row">
+                      <span>世界观、大纲、角色统一维护</span>
+                      {detail?.story_bible && <span>Canon v{detail.story_bible.canon_version}</span>}
+                      {pendingFoundationCardCount(detail) > 0 && <span>待确认资料卡 {pendingFoundationCardCount(detail)} 张</span>}
+                      {pendingChapterPlanCount(detail) > 0 && <span>待确认章节计划 {pendingChapterPlanCount(detail)} 个</span>}
+                      {detail?.story_bible_review && <span>审校 {detail.story_bible_review.status === "confirmed" ? adoptedStatusLabel : "待处理"}</span>}
+                    </div>
+                  </div>
+                  <div className="story-bible-plan-actions">
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={focusPlanDiscussion}
+                      disabled={!detail || Boolean(busy)}
+                    >
+                      <MessageSquare size={14} /> 和主 Agent 讨论并完善创作计划
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      onClick={confirmCurrentPlan}
+                      disabled={!detail || Boolean(busy)}
+                    >
+                      <Check size={14} /> {adoptionActionLabel}
+                    </button>
                   </div>
                 </div>
-                {detail?.story_arcs?.length ? (
-                  <div className="story-arc-list">
-                    {detail.story_arcs.map((arc) => (
-                      <article key={arc.id} className={arc.status === "active" ? "story-arc active" : "story-arc"}>
-                        <span>阶段 {arc.arc_no}</span><strong>{arc.title}</strong><p>{arc.objective || "等待细化阶段目标"}</p>
-                      </article>
-                    ))}
-                  </div>
-                ) : null}
-                {libraryMode === "workbench" ? (
-                  <div className="story-bible-review-row">
-                    {!detail?.story_bible || detail.story_bible.status !== "confirmed" ? (
-                      <button onClick={confirmStoryBible} disabled={!detail || Boolean(busy)}><Check size={14} /> 确认世界观</button>
-                    ) : detail.story_bible_review?.status === "pending_human_confirmation" ? (
-                      <button onClick={confirmStoryBibleReview} disabled={Boolean(busy)}><Check size={14} /> 确认审校结论</button>
-                    ) : (
-                      <button onClick={reviewStoryBible} disabled={Boolean(busy)}><Eye size={14} /> 审校一致性</button>
-                    )}
-                  </div>
-                ) : null}
                 {detail?.story_bible_review && (
-                  <details className="story-bible-review" open={detail.story_bible_review.status === "pending_human_confirmation"}>
-                    <summary>一致性审校 · {detail.story_bible_review.verdict} · {detail.story_bible_review.issues.length} 项</summary>
+                  <details className="story-bible-review">
+                    <summary>
+                      一致性审校 · {detail.story_bible_review.issues.length > 0 ? `${detail.story_bible_review.issues.length} 项` : "未发现问题"}
+                    </summary>
                     <p>{detail.story_bible_review.summary}</p>
                     {detail.story_bible_review.issues.map((issue, index) => (
                       <article key={`${issue.title}-${index}`} className={`canon-issue ${issue.severity}`}>
                         <strong>{issue.title}</strong><span>{issue.domain} · {issue.severity}</span>
                         <p>{issue.conflict}</p><p>{issue.impact}</p>
-                        {libraryMode === "workbench" ? (
-                          <button onClick={() => createTargetedRework(issue)} disabled={Boolean(busy)}><RefreshCcw size={14} /> 交给故事架构 Agent 修复</button>
-                        ) : null}
+                        <p>修复要求：{issue.rework_instruction}</p>
                       </article>
                     ))}
                   </details>
                 )}
               </section>}
 
+              {libraryFocus === "outline" && (
+                <section className="outline-board" aria-label="章节大纲">
+                  <header className="outline-board-head">
+                    <div>
+                      <strong>章节大纲</strong>
+                      <span>{outlinePlans.length > 0 ? `${outlinePlans.length} 个计划` : "暂无章节计划"}</span>
+                    </div>
+                    {detail?.story_arcs?.[0] && <small>当前阶段：{detail.story_arcs.find((arc) => arc.status === "active")?.title ?? detail.story_arcs[0].title}</small>}
+                  </header>
+                  {libraryMode === "workbench" && showChapterPlanComposer && (
+                    <section className="library-composer chapter-plan-composer">
+                      <div className="library-composer-head">
+                        <strong>{editingChapterPlanId ? "编辑章节计划" : "新增章节计划"}</strong>
+                        <button className="icon-btn" onClick={resetChapterPlanComposer} title="关闭"><ChevronLeft size={15} /></button>
+                      </div>
+                      <div className="chapter-plan-fields">
+                        <label>
+                          <span>章节序号</span>
+                          <input
+                            type="number"
+                            min={1}
+                            value={chapterPlanNo}
+                            onChange={(event) => setChapterPlanNo(Math.max(1, Number(event.target.value) || 1))}
+                          />
+                        </label>
+                        <label>
+                          <span>计划标题</span>
+                          <input value={chapterPlanTitle} onChange={(event) => setChapterPlanTitle(event.target.value)} placeholder="例如：雨夜入城" />
+                        </label>
+                      </div>
+                      <textarea rows={7} value={chapterPlanContent} onChange={(event) => setChapterPlanContent(event.target.value)} placeholder="写清本章目标、阻力、关键行动和离开状态" />
+                      <div className="button-row">
+                        <button onClick={() => saveChapterPlan("pending_human_approval")} disabled={!chapterPlanTitle.trim() || !chapterPlanContent.trim() || Boolean(busy)}>
+                          <Save size={14} /> 保存待确认
+                        </button>
+                        <button className="btn-primary" onClick={() => saveChapterPlan("approved")} disabled={!chapterPlanTitle.trim() || !chapterPlanContent.trim() || Boolean(busy)}>
+                          <Check size={14} /> {adoptionActionLabel}
+                        </button>
+                      </div>
+                    </section>
+                  )}
+                  {outlinePlans.length > 0 ? (
+                    <div className="outline-chapter-list">
+                      {outlinePlans.map((plan) => {
+                        const chapter = detail?.chapters.find((item) => item.id === plan.chapter_id)
+                          ?? detail?.chapters.find((item) => item.chapter_no === plan.chapter_no);
+                        const hasBody = Boolean(chapter?.current_artifact_id);
+                        return (
+                          <article className="outline-chapter-row" key={plan.id}>
+                            <span className="outline-chapter-number">{plan.chapter_no}</span>
+                            <span className="outline-chapter-copy">
+                              <strong>{plan.title || `第 ${plan.chapter_no} 章`}</strong>
+                              <small>{outlineTextSummary(plan.content, "暂无章节任务")}</small>
+                            </span>
+                            <span className={`outline-chapter-status ${plan.status}`}>
+                              {plan.status === "approved" ? (hasBody ? "已有正文" : adoptedStatusLabel) : "待确认"}
+                            </span>
+                            <span className="outline-plan-actions">
+                              {libraryMode === "workbench" && plan.status === "pending_human_approval" && (
+                                <button className="icon-btn" onClick={() => void updateChapterPlanStatus(plan, "approved")} disabled={Boolean(busy)} title={`${adoptionActionLabel}章节计划`}><Check size={14} /></button>
+                              )}
+                              {libraryMode === "workbench" && (
+                                <button className="icon-btn" onClick={() => editChapterPlan(plan)} disabled={Boolean(busy)} title="编辑章节计划"><Edit3 size={14} /></button>
+                              )}
+                              {plan.status === "approved" && (
+                                plan.chapter_id ? (
+                                  <button className="icon-btn" onClick={() => {
+                                    if (chapter) {
+                                      selectChapter(chapter, "draft");
+                                      switchContentSurface("workbench");
+                                    }
+                                  }} disabled={!chapter || Boolean(busy)} title="打开正文"><ChevronRight size={15} /></button>
+                                ) : (
+                                  <button className="outline-plan-create" onClick={() => void createChapterFromPlan(plan)} disabled={Boolean(busy)} title="创建正文">
+                                    <Plus size={14} /> 创建正文
+                                  </button>
+                                )
+                              )}
+                              {libraryMode === "workbench" && (
+                                <>
+                                  {plan.status === "approved" && <button className="icon-btn" onClick={() => void updateChapterPlanStatus(plan, "archived")} disabled={Boolean(busy)} title="归档章节计划"><Archive size={14} /></button>}
+                                  <button className="icon-btn danger" onClick={() => void deleteChapterPlan(plan)} disabled={Boolean(busy)} title="删除章节计划"><Trash2 size={14} /></button>
+                                </>
+                              )}
+                            </span>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="empty-state">
+                      <strong>暂无章节计划</strong>
+                      <span>先生成一组章节计划，或手动添加第一章。</span>
+                      {libraryMode === "workbench" && (
+                        <div className="button-row">
+                          <button onClick={() => runStoryArchitect("plan_current_arc")} disabled={!detail || Boolean(busy)}><Sparkles size={14} /> 生成章节计划</button>
+                          <button className="secondary-action" onClick={() => openChapterPlanEditor(1)} disabled={!detail || Boolean(busy)}><Plus size={14} /> 手动添加</button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {outlineCards.length > 0 && (
+                    <details className="outline-source-notes">
+                      <summary>兼容的大纲资料 · {outlineCards.length} 条</summary>
+                      <div>
+                        {outlineCards.map((card) => (
+                          <article key={card.id}>
+                            <strong>{card.title}</strong>
+                            <p>{outlineTextSummary(card.content, "暂无摘要")}</p>
+                          </article>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                </section>
+              )}
+
               <div className="library-layout">
                 <section className="library-canvas">
-                  {libraryMode === "workbench" && showKnowledgeComposer && (
+                  {libraryMode === "workbench" && libraryFocus !== "outline" && libraryFocus !== "foreshadowing" && showKnowledgeComposer && (
                     <section className="library-composer">
                       <div className="library-composer-head">
                         <strong>{editingKnowledgeCardId ? "编辑资料卡" : `补充${librarySection === "setting" ? "设定" : librarySection === "outline" ? "大纲任务" : "角色"}`}</strong>
@@ -3442,65 +4138,30 @@ export function BookStudioWorkspace() {
                       <textarea rows={5} value={knowledgeContent} onChange={(event) => setKnowledgeContent(event.target.value)} placeholder="资料内容" />
                       <div className="button-row">
                         <button onClick={() => saveKnowledgeCard("pending_human_approval")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>保存待确认</button>
-                        <button className="btn-primary" onClick={() => saveKnowledgeCard("approved")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>确认并启用</button>
+                        <button className="btn-primary" onClick={() => saveKnowledgeCard("approved")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>
+                          <Check size={14} /> {adoptionActionLabel}
+                        </button>
                       </div>
                     </section>
                   )}
 
-                  <div className="knowledge-grid">
-                    {libraryFocus === "foreshadowing" && visibleForeshadowings.map((item) => (
-                      <article className="managed-knowledge-card" key={`foreshadowing-${item.id}`}>
-                        <div className="managed-card-head managed-card-head-simple">
-                          <strong className="managed-card-title">{item.title}</strong>
+                  {libraryFocus === "foreshadowing" && (
+                    <section className="foreshadowing-ledger">
+                      <div className="foreshadowing-ledger-head">
+                        <div>
+                          <strong>伏笔清单</strong>
+                          <span>{visibleForeshadowings.length} 条 · 只记录创作者主动维护的线索</span>
                         </div>
-                        <KnowledgeSectionCard section={{ title: item.title, content: item.content.split("\n") }} />
-                      </article>
-                    ))}
-                    {libraryFocus !== "foreshadowing" && libraryCards.map((card) => (
-                      <article className="managed-knowledge-card" key={card.id}>
-                        <div className="managed-card-head">
-                          <span className={`library-status ${card.status}`}>{card.status === "approved" ? "已确认" : card.status === "pending_human_approval" ? "待确认" : "已归档"}</span>
-                          <strong className="managed-card-title">{card.title}</strong>
-                          <div className="managed-card-actions">
-                              {libraryMode === "workbench" && (
-                              <button className="icon-btn" onClick={() => editKnowledgeCard(card)} title="编辑资料卡"><Edit3 size={14} /></button>
-                              )}
-                              {libraryMode === "workbench" && card.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "approved")} title="确认并启用"><Check size={14} /></button>}
-                              {libraryMode === "workbench" && card.status !== "archived" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "archived")} title="归档资料卡"><Trash2 size={14} /></button>}
-                              <button className="icon-btn danger" onClick={() => deleteKnowledgeCard(card)} title="彻底删除资料卡"><Trash2 size={14} /></button>
-                            </div>
-                        </div>
-                        <KnowledgeSectionCard section={{ title: card.title, content: card.content.split("\n") }} />
-                      </article>
-                    ))}
-                    {libraryFocus === "foreshadowing" && visibleForeshadowings.length === 0 && <div className="empty-state">暂无伏笔</div>}
-                    {libraryFocus !== "foreshadowing" && libraryCards.length === 0 && (
-                      <div className="empty-state">
-                        {libraryArtifactSummary
-                          ? "当前没有结构化资料卡。旧版 Markdown 资料不会自动作为卡片显示，请重新运行故事架构 Agent。"
-                          : "暂无资料"}
+                        {libraryMode === "official" && <span className="read-only-note">只读</span>}
                       </div>
-                    )}
-                  </div>
-                </section>
-
-                {libraryMode === "workbench" && libraryFocus !== "setting" && <aside className="library-side">
-                  <details className="library-side-panel foreshadowing-panel library-side-disclosure">
-                    <summary className="library-side-summary">
-                      <span><Sparkles size={14} /> 伏笔账本</span>
-                      <small>{visibleForeshadowings.length} 条</small>
-                    </summary>
-                    <div className="foreshadowing-panel-body">
-                      {libraryMode === "workbench" ? (
-                        <button onClick={() => (showForeshadowingComposer ? resetForeshadowingComposer() : setShowForeshadowingComposer(true))} disabled={!detail || Boolean(busy)}><Plus size={14} /> 登记伏笔</button>
-                      ) : (
-                        <span className="read-only-note">只读</span>
-                      )}
                       {libraryMode === "workbench" && showForeshadowingComposer && (
-                        <div className="foreshadowing-composer">
-                          <strong>{editingForeshadowingId ? "编辑伏笔" : "登记伏笔"}</strong>
+                        <section className="library-composer foreshadowing-composer">
+                          <div className="library-composer-head">
+                            <strong>{editingForeshadowingId ? "编辑伏笔" : "登记伏笔"}</strong>
+                            <button className="icon-btn" onClick={resetForeshadowingComposer} title="关闭"><ChevronLeft size={15} /></button>
+                          </div>
                           <input value={foreshadowingTitle} onChange={(event) => setForeshadowingTitle(event.target.value)} placeholder="伏笔标题" />
-                          <textarea rows={3} value={foreshadowingContent} onChange={(event) => setForeshadowingContent(event.target.value)} placeholder="伏笔内容" />
+                          <textarea rows={4} value={foreshadowingContent} onChange={(event) => setForeshadowingContent(event.target.value)} placeholder="伏笔内容" />
                           <Select
                             value={String(foreshadowingPayoffChapterId ?? "")}
                             onChange={(value) => setForeshadowingPayoffChapterId(Number(value) || null)}
@@ -3511,10 +4172,12 @@ export function BookStudioWorkspace() {
                           />
                           <input value={foreshadowingPayoffNote} onChange={(event) => setForeshadowingPayoffNote(event.target.value)} placeholder="回收里程碑" />
                           <div className="button-row">
-                            <button onClick={() => saveForeshadowing("pending_human_approval")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>保存</button>
-                            <button className="btn-primary" onClick={() => saveForeshadowing("active")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>确认追踪</button>
+                            <button onClick={() => saveForeshadowing("pending_human_approval")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>保存待确认</button>
+                            <button className="btn-primary" onClick={() => saveForeshadowing("active")} disabled={!foreshadowingTitle.trim() || !foreshadowingContent.trim() || Boolean(busy)}>
+                              <Check size={14} /> {adoptionActionLabel}
+                            </button>
                           </div>
-                        </div>
+                        </section>
                       )}
                       <div className="foreshadowing-list">
                         {visibleForeshadowings.map((item: Foreshadowing) => {
@@ -3522,21 +4185,54 @@ export function BookStudioWorkspace() {
                           const statusLabel = item.status === "active" ? "追踪中" : item.status === "ready_for_payoff" ? "可回收" : item.status === "resolved" ? "已回收" : "待确认";
                           return (
                             <article key={item.id} className="foreshadowing-item">
-                              <div className="managed-card-head"><span className={`library-status ${item.status}`}>{statusLabel}</span>{libraryMode === "workbench" && <div className="managed-card-actions">
-                                <button className="icon-btn" onClick={() => editForeshadowing(item)} title="编辑伏笔"><Edit3 size={14} /></button>
-                                {item.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "active")} title="确认追踪"><Check size={14} /></button>}
-                                {item.status === "active" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "ready_for_payoff")} title="标记可回收"><Sparkles size={14} /></button>}
-                                {item.status === "ready_for_payoff" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "resolved")} title="标记已回收"><Check size={14} /></button>}
-                              </div>}</div>
-                              <strong>{item.title}</strong><p>{item.content}</p><span>{payoffChapter?.title ?? (item.planned_payoff_note || "尚未安排回收")}</span>
+                              <div className="managed-card-head">
+                                <span className={`library-status ${item.status}`}>{statusLabel}</span>
+                                {libraryMode === "workbench" && <div className="managed-card-actions">
+                                  <button className="icon-btn" onClick={() => editForeshadowing(item)} title="编辑伏笔"><Edit3 size={14} /></button>
+                                  {item.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "active")} title={`${adoptionActionLabel}伏笔`}><Check size={14} /></button>}
+                                  {item.status === "active" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "ready_for_payoff")} title="标记可回收"><Sparkles size={14} /></button>}
+                                  {item.status === "ready_for_payoff" && <button className="icon-btn" onClick={() => updateForeshadowingStatus(item, "resolved")} title="标记已回收"><Check size={14} /></button>}
+                                </div>}
+                              </div>
+                              <strong>{item.title}</strong>
+                              <p>{item.content}</p>
+                              <span>{payoffChapter?.title ?? (item.planned_payoff_note || "尚未安排回收")}</span>
                             </article>
                           );
                         })}
-                        {visibleForeshadowings.length === 0 && <div className="empty-inline">还没有登记伏笔</div>}
+                        {visibleForeshadowings.length === 0 && <div className="empty-state">还没有登记伏笔</div>}
                       </div>
-                    </div>
-                  </details>
-                </aside>}
+                    </section>
+                  )}
+
+                  {libraryFocus !== "foreshadowing" && <div className="knowledge-grid">
+                    {libraryFocus !== "outline" && libraryCards.map((card) => (
+                      <article className="managed-knowledge-card" key={card.id}>
+                        <div className="managed-card-head">
+                          <span className={`library-status ${card.status}`}>{card.status === "approved" ? adoptedStatusLabel : card.status === "pending_human_approval" ? "待确认" : "已归档"}</span>
+                          <strong className="managed-card-title">{card.title}</strong>
+                          <div className="managed-card-actions">
+                              {libraryMode === "workbench" && (
+                              <button className="icon-btn" onClick={() => editKnowledgeCard(card)} title="编辑资料卡"><Edit3 size={14} /></button>
+                              )}
+                              {libraryMode === "workbench" && card.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "approved")} title={`${adoptionActionLabel}资料卡`}><Check size={14} /></button>}
+                              {libraryMode === "workbench" && card.status !== "archived" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "archived")} title="归档资料卡"><Trash2 size={14} /></button>}
+                              <button className="icon-btn danger" onClick={() => deleteKnowledgeCard(card)} title="彻底删除资料卡"><Trash2 size={14} /></button>
+                            </div>
+                        </div>
+                        <KnowledgeSectionCard section={{ title: card.title, content: card.content.split("\n") }} />
+                      </article>
+                    ))}
+                    {libraryFocus !== "outline" && libraryCards.length === 0 && (
+                      <div className="empty-state">
+                        {libraryArtifactSummary
+                          ? "当前没有结构化资料卡。旧版 Markdown 资料不会自动作为卡片显示，请重新运行故事架构 Agent。"
+                          : "暂无资料"}
+                      </div>
+                    )}
+                  </div>}
+                </section>
+
               </div>
             </section>) : null}
           <>
@@ -3545,35 +4241,56 @@ export function BookStudioWorkspace() {
             <div className="editor-toolbar">
               <div>
                 <div className="editor-title-line">
-                  <h2>{stages.find((stage) => stage.id === selectedStage)?.label}</h2>
-                  <span className="workspace-mode-badge draft">草稿 / 候选</span>
+                  <h2>{isChapterWorkbench ? "章节工作台" : stages.find((stage) => stage.id === selectedStage)?.label}</h2>
+                  <span className="workspace-mode-badge draft">
+                    {isChapterWorkbench ? chapterFlow?.label ?? "章节候选" : "草稿 / 候选"}
+                  </span>
                 </div>
-                <p>{selectedChapter ? selectedChapter.title : "整书资料"}</p>
+                <p>{selectedChapter && !foundationStages.some((stage) => stage.id === selectedStage) ? selectedChapter.title : "整书资料"}</p>
               </div>
-              <div className="button-row">
-                <button onClick={() => runAgent(selectedStage)} disabled={!detail || Boolean(busy)}>
-                  <Play size={14} /> {selectedBookArtifactCanIterate ? "基于当前版本迭代" : selectedStage === "revision" ? "生成修订" : selectedStage === "draft" ? "生成草稿" : "生成"}
+              <div className="button-row chapter-toolbar-actions">
+                {isChapterWorkbench && chapterFlow ? (
+                  <>
+                    {chapterFlow.state === "needs_revision" ? (
+                      <div className="chapter-agent-handoff" role="status">
+                        <MessageSquare size={14} /> 修订建议已填入 Agent
+                      </div>
+                    ) : (
+                      <button
+                        className="btn-primary chapter-primary-action"
+                        onClick={() => void runChapterPrimaryAction()}
+                        disabled={!detail || Boolean(busy) || (chapterFlow.state === "ready_to_adopt" && !chapterFlow.bodyArtifact)}
+                      >
+                        {chapterFlow.state === "ready_to_adopt" ? <Check size={14} /> : chapterFlow.state === "adopted" ? <Sparkles size={14} /> : <Play size={14} />}
+                        {chapterFlow.actionLabel}
+                      </button>
+                    )}
+                    {chapterFlow.state === "needs_revision" && chapterFlow.bodyArtifact && (
+                      <button
+                        className="secondary-action"
+                        onClick={() => void approveBodyArtifact(chapterFlow.bodyArtifact!)}
+                        disabled={Boolean(busy)}
+                        title="跳过本轮修订，确认采用当前候选稿"
+                      >
+                        <Check size={14} /> {adoptionActionLabel}
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <button onClick={() => runAgent(selectedStage)} disabled={!detail || Boolean(busy)}>
+                    <Play size={14} /> {selectedBookArtifactCanIterate ? "基于当前版本迭代" : selectedStage === "revision" ? "生成修订" : "生成"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="toolbar-icon-btn"
+                  onClick={() => setVersionDrawerOpen((open) => !open)}
+                  aria-expanded={versionDrawerOpen}
+                  title={versionDrawerOpen ? "收起历史版本" : `历史版本${visibleArtifacts.length > 0 ? ` (${visibleArtifacts.length})` : ""}`}
+                >
+                  <History size={15} />
+                  {visibleArtifacts.length > 0 && <span className="toolbar-icon-badge">{visibleArtifacts.length}</span>}
                 </button>
-                {selectedArtifact?.stage !== "review" && (
-                  <button
-                    className="btn-primary"
-                    onClick={approveArtifact}
-                    disabled={!selectedArtifact || selectedArtifactApproved || Boolean(busy)}
-                  >
-                    <Check size={14} /> {selectedArtifactApproved ? "已通过" : "审核通过"}
-                  </button>
-                )}
-                {selectedArtifactSupportsAdoption && (
-                  <button
-                    onClick={() => selectedArtifactProposals.length > 0 ? setShowAdoptionDrawer(true) : prepareArtifactAdoptions()}
-                    disabled={Boolean(busy)}
-                  >
-                    <Rows3 size={14} /> 整理资料
-                    {selectedArtifactProposals.filter((proposal) => proposal.status === "pending").length > 0
-                      ? ` (${selectedArtifactProposals.filter((proposal) => proposal.status === "pending").length})`
-                      : ""}
-                  </button>
-                )}
                 <DropdownMenu
                   label="更多"
                   className="toolbar-more"
@@ -3582,25 +4299,19 @@ export function BookStudioWorkspace() {
                   menuWidth={168}
                   align="end"
                 >
-                    <button
-                      onClick={() => runAgent(selectedStage, "fresh")}
-                      disabled={!detail || Boolean(busy)}
-                    >
-                      <RefreshCcw size={14} /> {selectedBookArtifactCanIterate ? "整版重写" : selectedStage === "revision" ? "整版重写" : "重新生成"}
-                    </button>
-                    <button
-                      onClick={deleteSelectedArtifact}
-                      disabled={!selectedArtifact || Boolean(busy) || Boolean(selectedArtifactDeleteBlockReason)}
-                      title={selectedArtifactDeleteBlockReason ?? "删除当前版本"}
-                    >
-                      <Trash2 size={14} />
-                      {selectedArtifactDeleteBlockReason ?? "删除当前版本"}
-                    </button>
+                  <button
+                    onClick={deleteSelectedArtifact}
+                    disabled={!selectedArtifact || Boolean(busy) || Boolean(selectedArtifactDeleteBlockReason)}
+                    title={selectedArtifactDeleteBlockReason ?? "删除当前版本"}
+                  >
+                    <Trash2 size={14} />
+                    {selectedArtifactDeleteBlockReason ?? "删除当前版本"}
+                  </button>
                 </DropdownMenu>
               </div>
             </div>
 
-            <div className="workflow-strip" aria-label="章节创作流程">
+            {!isChapterWorkbench && productionStages.some((stage) => stage.id === selectedStage) && <div className="workflow-strip" aria-label="章节创作流程">
               <div className="workflow-steps">
                 {productionStages.map((stage, index) => (
                   <div className="workflow-step-group" key={stage.id}>
@@ -3619,10 +4330,10 @@ export function BookStudioWorkspace() {
                   </div>
                 ))}
               </div>
-            </div>
+            </div>}
 
-            <details className="version-drawer">
-              <summary>版本与对比 {visibleArtifacts.length > 0 ? `(${visibleArtifacts.length})` : ""}</summary>
+            {versionDrawerOpen && (
+              <div className="version-drawer">
               <div className="artifact-tabs">
                 {visibleArtifacts.map((artifact) => (
                   <button
@@ -3659,14 +4370,14 @@ export function BookStudioWorkspace() {
                   />
                 </div>
               )}
-            </details>
+              </div>
+            )}
 
             <article className={streamingRun ? "artifact-view streaming-artifact" : "artifact-view"}>
               {streamingRun ? (
                 <>
                   <div className="artifact-meta">
-                    <strong>{stageLabel(streamingRun.stage)}正在生成</strong>
-                    <span>实时输出 · 待确认</span>
+                    <strong>生成中</strong>
                     <button
                       type="button"
                       className="secondary-action"
@@ -3677,7 +4388,7 @@ export function BookStudioWorkspace() {
                       {streamingRun.status === "cancellation_requested" ? "正在停止…" : "停止生成"}
                     </button>
                   </div>
-                  <pre>{streamingRun.output || "正在等待模型返回内容..."}</pre>
+                  {streamingRun.output ? <pre>{streamingRun.output}</pre> : <div className="streaming-placeholder" aria-label="等待输出"><Loader2 size={18} className="spin" /></div>}
                 </>
               ) : selectedArtifact ? (
                 <>
@@ -3757,61 +4468,121 @@ export function BookStudioWorkspace() {
 
           {/* Right: Agent chat belongs only to the workbench, never to read-only official content. */}
           {currentContentSurface() === "workbench" && (
-          <aside className="assistant-panel assistant-panel-v2">
+          <>
+          <div
+            className={assistantPanelResizing ? "assistant-resize-handle dragging" : "assistant-resize-handle"}
+            role="separator"
+            aria-label="调整 Agent 侧栏宽度"
+            aria-orientation="vertical"
+            aria-valuemin={ASSISTANT_PANEL_MIN_WIDTH}
+            aria-valuemax={ASSISTANT_PANEL_MAX_WIDTH}
+            aria-valuenow={assistantPanelWidth}
+            tabIndex={0}
+            title="拖动调整 Agent 侧栏宽度"
+            onPointerDown={beginAssistantPanelResize}
+            onPointerMove={resizeAssistantPanel}
+            onPointerUp={endAssistantPanelResize}
+            onPointerCancel={endAssistantPanelResize}
+            onKeyDown={resizeAssistantPanelWithKeyboard}
+          />
+          <aside
+            ref={assistantPanelRef}
+            className="assistant-panel assistant-panel-v2"
+            style={{ width: assistantPanelWidth, minWidth: assistantPanelWidth }}
+          >
             <header className="assistant-workspace-header">
               <div className="assistant-workspace-identity">
                 <div className="assistant-workspace-avatar"><Sparkles size={15} /></div>
                 <div>
                   <strong>Agent 工作区</strong>
-                  <span className="assistant-agent-role">主 Agent · 项目对话与任务编排</span>
+                  <span className="assistant-agent-role">主 Agent · 对话与任务编排</span>
                 </div>
               </div>
-              <button
-                type="button"
-                className="assistant-new-chat"
-                onClick={() => {
-                  setAssistantMessages([]);
-                  setInstruction("");
-                  setLiveToolEvents([]);
-                  setAssistantTimelineEvents([]);
-                  setSelectedSubagentRunId(null);
-                  setLastAgentRun(null);
-                }}
-                title="新建会话"
-                aria-label="新建会话"
-              >
-                <Plus size={14} />
-              </button>
+              <div className="assistant-workspace-actions">
+                {orchestratorRunIsActive && (
+                  <button
+                    type="button"
+                    className="assistant-stop-run"
+                    onClick={() => void cancelOrchestratorRun()}
+                    disabled={orchestratorCancellationRequested || busy === "停止 Agent"}
+                    title={orchestratorCancellationRequested ? "正在停止 Agent" : "停止 Agent"}
+                    aria-label={orchestratorCancellationRequested ? "正在停止 Agent" : "停止 Agent"}
+                  >
+                    {orchestratorCancellationRequested ? <Loader2 size={14} className="spin" /> : <X size={14} />}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="assistant-new-chat"
+                  onClick={() => {
+                    assistantStickToBottomRef.current = true;
+                    mainFeedScrollTopRef.current = null;
+                    loadedHistoryRunIdsRef.current = new Set();
+                    setAssistantMessages([]);
+                    setAssistantHistoryCutoff(Date.now());
+                    setInstruction("");
+                    setLiveToolEvents([]);
+                    setAssistantTimelineEvents([]);
+                    setSelectedSubagentRunId(null);
+                    setLastAgentRun(null);
+                    setAssistantAdvancedOpen(false);
+                    setOrchestratorParentRunId(null);
+                    setOrchestratorCancellationRequested(false);
+                    setDelegatedRunEvents({});
+                    setDelegatedRunSummaries({});
+                    setThinkingRounds([]);
+                  }}
+                  title="新建会话"
+                  aria-label="新建会话"
+                >
+                  <Plus size={14} />
+                </button>
+              </div>
             </header>
 
             <div className="assistant-context-strip">
-              <span className={busy ? "assistant-status busy" : "assistant-status"}>
+              <span role="status" className={busy || orchestratorRunIsActive ? "assistant-status busy" : "assistant-status"}>
                 <span className="assistant-status-dot" />
-                {busy ? "Agent 执行中" : "已就绪"}
+                {orchestratorCancellationRequested ? "正在停止" : busy || orchestratorRunIsActive ? "Agent 执行中" : "已就绪"}
               </span>
               {selectedChapter && <span className="assistant-context-chip">章节 · {selectedChapter.title}</span>}
-              <span className="assistant-context-chip">当前阶段 · {stageLabel(selectedStage)}</span>
-              <span className="assistant-context-chip">上下文自动选择</span>
+              <span className="assistant-context-chip">{isChapterWorkbench ? `章节状态 · ${chapterFlow?.label ?? "候选稿"}` : `当前阶段 · ${stageLabel(selectedStage)}`}</span>
             </div>
 
-            <div className={`assistant-chat-feed${selectedSubagentRunId != null ? " assistant-chat-feed-subagent" : ""}`}>
-              <article className="assistant-message assistant-message-agent">
-                <div className="assistant-message-body">
-                  <div className="assistant-message-meta"><strong>Book Agent</strong><span>刚刚</span></div>
-                  <p>我会先理解你的意图，回答问题；需要创作、修改或检查时，再委托合适的专业 Agent 执行。</p>
-                  <div className="assistant-suggestion-list">
-                    <button type="button" onClick={() => useAssistantPrompt("基于当前设定，给出下一步最值得推进的创作建议")}>下一步建议 <ChevronRight size={12} /></button>
-                    <button type="button" onClick={() => useAssistantPrompt("检查当前内容是否存在角色或时间线矛盾")}>检查连续性 <ChevronRight size={12} /></button>
+            <div
+              ref={assistantFeedRef}
+              className={`assistant-chat-feed${selectedSubagentRunId != null ? " assistant-chat-feed-subagent" : ""}`}
+            >
+              {assistantFeedItems.length === 0 && selectedSubagentRunId == null && (
+                <article className="assistant-message assistant-message-agent assistant-empty-state">
+                  <div className="assistant-message-body">
+                    <div className="assistant-message-meta"><strong>Book Agent</strong><span>准备好了</span></div>
+                    <div className="assistant-suggestion-list">
+                      <button type="button" onClick={() => useAssistantPrompt("基于当前设定，给出下一步最值得推进的创作建议")}>下一步建议 <ChevronRight size={12} /></button>
+                      <button type="button" onClick={() => useAssistantPrompt("检查当前内容是否存在角色或时间线矛盾")}>检查连续性 <ChevronRight size={12} /></button>
+                    </div>
                   </div>
-                </div>
-              </article>
+                </article>
+              )}
 
-              {assistantFeedItems.map((item) => {
+              {selectedSubagentRunId == null && assistantFeedItems.map((item) => {
                 if (item.kind === "user") {
                   return <article className="assistant-message assistant-message-user" key={item.id}><div className="assistant-message-body"><p>{item.content}</p></div></article>;
                 }
+                if (item.kind === "memory_warning") {
+                  return (
+                    <article className="assistant-memory-warning" key={item.id}>
+                      <AlertCircle size={14} />
+                      <div>
+                        <strong>章节交接记忆生成失败</strong>
+                        <p>{item.content}</p>
+                        <small>写下一章时会自动重试；也可让子 Agent 重新生成。</small>
+                      </div>
+                    </article>
+                  );
+                }
                 if (item.kind === "thinking") {
-                  return <details key={item.id} className={`assistant-thinking-panel${item.active ? " assistant-thinking-panel-current" : ""}`} open={item.active}><summary><span><Sparkles size={12} /> {thinkingSummaryTitle(item.content, item.active)}</span><small>{item.active ? "实时更新" : "已完成"}</small></summary>{item.content && <p>{item.content}</p>}</details>;
+                  return <AssistantThinkingPanel key={item.id} content={item.content} active={item.active} />;
                 }
                 if (item.kind === "tool") {
                   return <article className="assistant-tool-message" key={item.id}><div className="assistant-tool-message-mark">{item.status === "success" ? "✓" : item.status === "running" ? "•" : "!"}</div><div className="assistant-tool-message-body"><div className="assistant-message-meta"><strong>{assistantToolLabel(item.toolKey)}</strong><span>{item.status === "running" ? "执行中" : item.status === "success" ? "已完成" : "失败"}</span></div><p>{item.summary || (item.status === "running" ? "正在调用工具……" : "工具已返回结果")}</p></div></article>;
@@ -3819,44 +4590,93 @@ export function BookStudioWorkspace() {
                 if (item.kind === "subagent") {
                   const childEvents = delegatedRunEvents[item.runId] ?? [];
                   const latest = childEvents[childEvents.length - 1];
-                  return <button type="button" className="assistant-subagent-timeline-item" key={item.id} onClick={() => setSelectedSubagentRunId(item.runId)}><span className="assistant-tool-message-mark">→</span><span><strong>委托子 Agent：{item.title}</strong><small>{latest?.status === "success" ? "已完成" : latest?.status === "failed" ? "失败" : "执行中"}</small></span><ChevronRight size={14} /></button>;
+                  return <button type="button" className="assistant-subagent-timeline-item" key={item.id} onClick={() => { const feed = assistantFeedRef.current; if (feed) mainFeedScrollTopRef.current = feed.scrollTop; assistantStickToBottomRef.current = true; setSelectedSubagentRunId(item.runId); }}><span className="assistant-subagent-mark"><Bot size={13} /></span><span className="assistant-subagent-timeline-copy"><strong>{item.title}</strong><small className="assistant-subagent-status">{latest?.status === "success" ? "已完成" : latest?.status === "failed" ? "失败" : "执行中"}</small></span><ChevronRight size={14} /></button>;
                 }
-                return <article className="assistant-message assistant-message-agent assistant-streaming-output" key={item.id}><div className="assistant-message-body"><p>{item.content}</p></div></article>;
+                const outputText = compactAssistantOutput(item.content);
+                const isLiveOutput = item.id === liveOutputItemId;
+                return (
+                  <article
+                    className={`assistant-message assistant-message-agent${isLiveOutput ? " assistant-output-live" : ""}`}
+                    key={item.id}
+                  >
+                    <div className="assistant-message-body">
+                      {outputText.length > 240
+                        ? <details className="assistant-output-details"><summary>查看全文（{outputText.length} 字）</summary><p>{outputText}</p></details>
+                        : <p>{outputText}</p>}
+                      {!isLiveOutput && item.id === lastOutputItemId && chapterFlow?.bodyArtifact && (
+                        <button type="button" className="assistant-output-link" onClick={openCandidatePanel}>
+                          {chapterFlow?.state === "adopted" ? "查看正文" : "打开候选稿"}
+                          <ChevronRight size={12} />
+                        </button>
+                      )}
+                    </div>
+                  </article>
+                );
               })}
 
               {selectedSubagentRunId != null && (
-                <section className="assistant-subagent-session">
-                  <button type="button" className="assistant-back-to-orchestrator" onClick={() => setSelectedSubagentRunId(null)}><ChevronLeft size={14} /> 回到主 Agent</button>
-                  <div className="assistant-subagent-session-title"><strong>{(delegatedRunEvents[selectedSubagentRunId] ?? [])[0]?.task_title || "子 Agent 会话"}</strong></div>
-                  {buildAssistantTimeline(delegatedRunEvents[selectedSubagentRunId] ?? []).map((item) => item.kind === "output"
-                    ? <p className="assistant-subagent-output" key={item.id}>{item.content}</p>
-                    : item.kind === "thinking"
-                      ? <details key={item.id} className={`assistant-thinking-panel${item.active ? " assistant-thinking-panel-current" : ""}`} open={item.active}><summary><span><Sparkles size={12} /> {thinkingSummaryTitle(item.content, item.active)}</span><small>{item.active ? "实时更新" : "已完成"}</small></summary>{item.content && <p>{item.content}</p>}</details>
-                      : item.kind === "tool"
-                        ? <article className="assistant-tool-message" key={item.id}><div className="assistant-tool-message-mark">{item.status === "success" ? "✓" : item.status === "running" ? "•" : "!"}</div><div className="assistant-tool-message-body"><div className="assistant-message-meta"><strong>{assistantToolLabel(item.toolKey)}</strong><span>{item.status === "running" ? "执行中" : item.status === "success" ? "已完成" : "失败"}</span></div><p>{item.summary || "工具已返回结果"}</p></div></article>
-                        : null)}
-                </section>
+                <>
+                  <nav className="assistant-breadcrumb" aria-label="子 Agent 会话位置">
+                    <button type="button" className="assistant-breadcrumb-root" onClick={() => setSelectedSubagentRunId(null)}>
+                      <ChevronLeft size={13} /> 主 Agent
+                    </button>
+                    <span className="assistant-breadcrumb-sep">/</span>
+                    <strong className="assistant-breadcrumb-title">
+                      {selectedSubagentEvents[0]?.task_title || selectedSubagentSummary?.run.task_title || "子 Agent 会话"}
+                    </strong>
+                  </nav>
+                  {selectedSubagentSummary && (
+                    <p className="assistant-subagent-meta">
+                      运行 #{selectedSubagentSummary.run.id} · {runStatusLabel(selectedSubagentSummary.run.status)}
+                      {selectedSubagentSummary.run.elapsed_ms > 0 ? ` · ${selectedSubagentSummary.run.elapsed_ms.toLocaleString()} ms` : ""}
+                      {` · ${selectedSubagentSummary.tool_invocations.length} 次工具调用`}
+                    </p>
+                  )}
+                  {selectedSubagentProcess.map((item) => {
+                    if (item.kind === "thinking") {
+                      return <AssistantThinkingPanel key={item.id} content={item.content} active={item.active} />;
+                    }
+                    if (item.kind === "tool") {
+                      const invocation = item.invocationId != null
+                        ? selectedSubagentSummary?.tool_invocations.find((candidate) => candidate.id === item.invocationId)
+                        : undefined;
+                      const statusLabel = item.status === "running" ? "执行中" : item.status === "success" ? "已完成" : item.status === "rejected" ? "已拒绝" : "失败";
+                      return (
+                        <article className="assistant-tool-message" key={item.id}>
+                          <div className="assistant-tool-message-mark">{item.status === "success" ? "✓" : item.status === "running" ? "•" : "!"}</div>
+                          {invocation ? (
+                            <details className="assistant-tool-message-body assistant-tool-entry">
+                              <summary className="assistant-message-meta">
+                                <strong>{assistantToolLabel(item.toolKey)}</strong>
+                                <span>{statusLabel}{invocation.elapsed_ms > 0 ? ` · ${invocation.elapsed_ms.toLocaleString()} ms` : ""}</span>
+                              </summary>
+                              <label>参数</label>
+                              <pre>{JSON.stringify(invocation.arguments, null, 2)}</pre>
+                              <label>{invocation.error ? "错误" : "结果"}</label>
+                              <pre>{invocation.error ?? JSON.stringify(invocation.result, null, 2)}</pre>
+                            </details>
+                          ) : (
+                            <div className="assistant-tool-message-body">
+                              <div className="assistant-message-meta">
+                                <strong>{assistantToolLabel(item.toolKey)}</strong>
+                                <span>{statusLabel}</span>
+                              </div>
+                              <p>{item.summary || (item.status === "running" ? "正在调用工具……" : "工具已返回结果")}</p>
+                            </div>
+                          )}
+                        </article>
+                      );
+                    }
+                    if (item.kind !== "output") return null;
+                    const output = item.content;
+                    return output.trim().length > 240 || /[\[{]/.test(output.trim())
+                      ? <details className="assistant-subagent-output-panel" key={item.id}><summary><span>查看输出</span><small>{output.trim().length} 字</small></summary><pre>{output}</pre></details>
+                      : <p className="assistant-subagent-output" key={item.id}>{output}</p>;
+                  })}
+                </>
               )}
 
             </div>
-
-            {orchestratorParentRunId && Object.keys(delegatedRunEvents).length > 0 && (
-              <details className="assistant-workflow-panel assistant-orchestrator-todo" open={!workflowStepsCollapsed} onToggle={(event) => setWorkflowStepsCollapsed(!event.currentTarget.open)}>
-                <summary><span><Check size={13} /> 本次任务 · {Object.keys(delegatedRunEvents).length} 个子任务</span><small>可展开查看</small></summary>
-                <div className="assistant-workflow-todo">
-                  {Object.entries(delegatedRunEvents).map(([runId, events]) => {
-                    const latest = events[events.length - 1];
-                    const active = !["success", "failed", "cancelled"].includes(latest?.status ?? "");
-                    const title = latest?.task_title || latest?.agent_role || latest?.agent_key || "子 Agent";
-                    const details = events.filter((item) => ["thinking_start", "thinking_delta", "tool_started", "tool_completed", "output_delta"].includes(item.kind));
-                    return <details key={runId} className={`assistant-subagent-card${active ? " active" : ""}`} open={active}>
-                      <summary><span>{active ? "•" : latest?.status === "success" ? "✓" : "!"}</span><strong>{title}</strong><small>{active ? "进行中" : latest?.status === "success" ? "已完成" : "失败"}</small></summary>
-                      {details.map((item) => <p key={`${item.run_id}-${item.sequence}`}>{item.kind.startsWith("tool_") ? `工具：${item.tool_key || "调用"}` : item.delta || "正在处理…"}</p>)}
-                    </details>;
-                  })}
-                </div>
-              </details>
-            )}
 
             {(streamingRun || lastAgentRun) && !orchestratorParentRunId && (
               <details
@@ -3865,81 +4685,96 @@ export function BookStudioWorkspace() {
                 onToggle={(event) => setWorkflowStepsCollapsed(!event.currentTarget.open)}
               >
                 <summary>
-                  <span><Check size={13} /> 执行步骤</span>
-                  <small>{streamingRun ? "实时更新" : "已完成"}</small>
+                  <span><Check size={13} /> 执行状态</span>
                 </summary>
                 <div className="assistant-workflow-todo">
                   <div className="assistant-workflow-todo-item done">
-                    <span>✓</span><strong>接收任务并准备上下文</strong><small>已完成</small>
+                    <span>✓</span><strong>准备</strong>
                   </div>
-                  <div className={`assistant-workflow-todo-item${streamingRun && liveToolEvents.some((event) => event.kind === "tool_started" && event.status === "running") ? " active" : liveToolEvents.length > 0 ? " done" : " pending"}`}>
-                    <span>{liveToolEvents.length > 0 ? "✓" : "•"}</span><strong>调用工具</strong><small>{liveToolEvents.length > 0 ? `${assistantToolTimeline(liveToolEvents).length} 次` : "等待"}</small>
+                  <div className={`assistant-workflow-todo-item${activeLiveTool ? " active" : completedLiveTool ? " done" : " pending"}`}>
+                    <span>{completedLiveTool ? "✓" : activeLiveTool ? "•" : "·"}</span><strong>工具</strong>
                   </div>
-                  <div className={`assistant-workflow-todo-item${streamingRun ? " active" : " done"}`}>
-                    <span>{streamingRun ? "•" : "✓"}</span><strong>整理结果</strong><small>{streamingRun ? "进行中" : "已完成"}</small>
+                  <div className={`assistant-workflow-todo-item${waitingForModelOutput ? " active" : streamingRun ? " pending" : " done"}`}>
+                    <span>{streamingRun ? "•" : "✓"}</span><strong>生成结果</strong>
                   </div>
-                  <div className="assistant-workflow-todo-item pending">
-                    <span>{streamingRun ? "" : "✓"}</span><strong>完成本轮任务</strong><small>{streamingRun ? "等待" : "已完成"}</small>
+                  <div className={`assistant-workflow-todo-item${streamingRun ? " pending" : " done"}`}>
+                    <span>{streamingRun ? "·" : "✓"}</span><strong>完成</strong>
                   </div>
                 </div>
               </details>
             )}
 
+            <div className="assistant-composer-dock">
             <div className="assistant-composer">
-              <div className="assistant-composer-hint">
-                <span>Enter 发送 · ⌘ Enter 换行</span>
-                {referenceMaterials.length > 0 && <span>{selectedReferenceIds.size} 份参考已启用</span>}
-              </div>
               <textarea
+                ref={assistantInputRef}
                 className="assistant-chat-input"
                 rows={3}
                 value={instruction}
-                placeholder={selectedBookArtifactCanIterate ? "告诉 Agent 只改哪里，其他内容保持不变…" : "描述你想继续创作、修改或检查的内容…"}
+                placeholder={selectedBookArtifactCanIterate ? "告诉 Agent 只改哪里，其他内容保持不变…" : "今天帮你推进什么？"}
                 onChange={(event) => setInstruction(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key !== "Enter") return;
-                  if (event.metaKey || event.ctrlKey) return;
+                  // Shift/Alt+Enter 交给 textarea 插入换行；Enter 与 Ctrl/Cmd+Enter 发送。
+                  if (event.shiftKey || event.altKey) return;
                   event.preventDefault();
                   submitAssistantPrompt();
                 }}
               />
               <div className="assistant-composer-actions">
                 <div className="assistant-composer-tools">
-                  <button type="button" onClick={() => setInstruction("继续推进当前阶段，给出一个可直接采用的版本")}>继续生成</button>
-                  <button type="button" onClick={previewAgentContext} disabled={!detail || Boolean(busy)}><Eye size={12} /> 上下文</button>
+                  <button
+                    type="button"
+                    className="assistant-composer-tool-button"
+                    onClick={() => setAssistantAdvancedOpen((open) => !open)}
+                    aria-expanded={assistantAdvancedOpen}
+                    aria-label={assistantAdvancedOpen ? "收起工作区工具" : "打开工作区工具"}
+                    title={assistantAdvancedOpen ? "收起工作区工具" : "打开工作区工具"}
+                  >
+                    {assistantAdvancedOpen ? <X size={17} /> : <Plus size={17} />}
+                    {pendingActionProposalCount > 0 && <span className="assistant-composer-tool-badge">{pendingActionProposalCount}</span>}
+                  </button>
+                  <span className="assistant-composer-context-label">
+                    <Sparkles size={12} />
+                    <span className="assistant-ellipsis-text">{agentCatalog.find((agent) => agent.stage === selectedStage)?.name ?? "主 Agent"}</span>
+                  </span>
+                  <span className="assistant-composer-model" title={settings.model || "默认模型"}>
+                    {compactAssistantModelName(settings.model || "默认模型")}
+                  </span>
                 </div>
-                <button type="button" className="assistant-send-button" onClick={submitAssistantPrompt} disabled={!detail || !instruction.trim() || Boolean(busy)}>
-                  {busy ? <Loader2 size={14} className="spin" /> : <Send size={14} />}
-                  {busy ? "执行中" : "发送"}
+                <button
+                  type="button"
+                  className={`assistant-send-button${busy || orchestratorRunIsActive ? " is-busy" : ""}`}
+                  onClick={submitAssistantPrompt}
+                  disabled={!detail || !instruction.trim() || Boolean(busy) || orchestratorRunIsActive}
+                  title={busy || orchestratorRunIsActive ? "执行中" : "发送"}
+                  aria-label={busy || orchestratorRunIsActive ? "执行中" : "发送"}
+                >
+                  {busy || orchestratorRunIsActive
+                    ? <Loader2 size={14} className="spin" />
+                    : <><Send size={14} /> <span>发送</span></>}
                 </button>
               </div>
             </div>
 
-            <details className="assistant-advanced-controls">
-              <summary><SlidersHorizontal size={14} /> 高级控制 <span>参考资料、提案与局部修订</span></summary>
+            <details
+              className="assistant-advanced-controls"
+              open={assistantAdvancedOpen}
+              onToggle={(event) => setAssistantAdvancedOpen(event.currentTarget.open)}
+            >
+              <summary>
+                <SlidersHorizontal size={14} />
+                <strong>工作区工具</strong>
+                <span>参考资料与质量检查{pendingActionProposalCount > 0 ? ` · ${pendingActionProposalCount} 条待确认` : ""}</span>
+              </summary>
               <div className="assistant-advanced-content">
             <section className="panel next-action-panel">
-              <div className="panel-title">
-                <PenLine size={14} />
-                创作指令
-              </div>
-              <div className="stage-hint">当前阶段：{stageLabel(selectedStage)}</div>
               <input
                 ref={referenceFileInputRef}
                 className="visually-hidden"
                 type="file"
                 accept=".txt,text/plain"
                 onChange={importReferenceFile}
-              />
-              <textarea
-                rows={4}
-                value={instruction}
-                placeholder={
-                  selectedBookArtifactCanIterate
-                    ? "例如：只调整第 3 节"
-                    : "人工指令"
-                }
-                onChange={(event) => setInstruction(event.target.value)}
               />
               <section className={`reference-selection-panel${referenceMaterials.length === 0 ? " empty" : ""}`}>
                 <div className="reference-selection-head">
@@ -4024,13 +4859,6 @@ export function BookStudioWorkspace() {
                 )}
               </section>
               <button
-                className="btn-primary"
-                onClick={() => runAgent(selectedStage)}
-                disabled={!detail || Boolean(busy)}
-              >
-                <Sparkles size={14} /> {selectedBookArtifactCanIterate ? "生成修订" : selectedStage === "revision" ? "生成修订" : selectedStage === "draft" ? "生成草稿" : "生成候选"}
-              </button>
-              <button
                 className="secondary-action"
                 onClick={previewAgentContext}
                 disabled={!detail || Boolean(busy)}
@@ -4072,99 +4900,31 @@ export function BookStudioWorkspace() {
               onRejectProposal={(proposal) => void rejectAgentProposal(proposal)}
             />
 
-            <section className="panel next-action-panel confirm-panel">
-              <div className="panel-title">
-                <Check size={14} />
-                确认与修订
-              </div>
-              {selectedArtifact?.stage === "review" && (
-                <>
-                  <textarea
-                    rows={4}
-                    value={revisionFeedback}
-                    placeholder="修订要求"
-                    onChange={(event) => setRevisionFeedback(event.target.value)}
-                  />
-                  <button
-                    className="secondary-action"
-                    onClick={requestRevision}
-                    disabled={!canRequestRevision || Boolean(busy)}
-                  >
-                    <RefreshCcw size={14} /> 请求修订
-                  </button>
-                </>
-              )}
-              {canRunReview && selectedArtifact?.stage !== "review" && (
-                <button
-                  className="secondary-action"
-                  onClick={() => runAgent("review")}
-                  disabled={!detail || Boolean(busy)}
-                >
-                  <Play size={14} /> 提交试读
-                </button>
-              )}
-              <div className="local-patch-tool">
-                <div className="tool-subtitle">局部改写</div>
-                <textarea
-                  rows={4}
-                  value={patchFindText}
-                  placeholder="原文片段"
-                  onChange={(event) => setPatchFindText(event.target.value)}
-                />
-                <textarea
-                  rows={4}
-                  value={aiPatchInstruction}
-                  placeholder="局部改写要求"
-                  onChange={(event) => setAiPatchInstruction(event.target.value)}
-                />
-                <button
-                  onClick={reviseSelectedArtifactSpanWithAi}
-                  disabled={
-                    !selectedArtifactSupportsLocalPatch ||
-                    !patchFindText.trim() ||
-                    !aiPatchInstruction.trim() ||
-                    Boolean(busy)
-                  }
-                >
-                  <Sparkles size={14} /> AI 局部改写
-                </button>
-                <textarea
-                  rows={4}
-                  value={patchReplaceText}
-                  placeholder="替换文本（留空删除）"
-                  onChange={(event) => setPatchReplaceText(event.target.value)}
-                />
-                <button
-                  onClick={replaceSelectedArtifactSpan}
-                  disabled={
-                    !selectedArtifactSupportsLocalPatch ||
-                    !patchFindText.trim() ||
-                    Boolean(busy)
-                  }
-                >
-                  <Edit3 size={14} /> 局部替换
-                </button>
-              </div>
-              {selectedArtifact && !selectedArtifactApproved && (
-                <>
-                  <textarea
-                    rows={2}
-                    value={approvalNote}
-                    placeholder="确认备注，可为空"
-                    onChange={(event) => setApprovalNote(event.target.value)}
-                  />
-                  <button
-                    className="approve-action"
-                    onClick={approveArtifact}
-                    disabled={Boolean(busy)}
-                  >
-                    <Check size={14} /> 通过当前产物
-                  </button>
-                </>
-              )}
-            </section>
+            {isChapterWorkbench && chapterFlow && (
+              <section className="panel next-action-panel chapter-candidate-panel">
+                <div className="panel-title">
+                  <Sparkles size={14} />
+                  候选稿
+                </div>
+                <div className="chapter-candidate-card">
+                  <div className="chapter-candidate-card-head">
+                    <strong>
+                      {chapterFlow.bodyArtifact
+                        ? `${chapterFlow.bodyArtifact.stage === "revision" ? "修订稿" : "正文"} v${chapterFlow.bodyArtifact.version}`
+                        : "尚无候选稿"}
+                    </strong>
+                    <span>{chapterFlow.label}</span>
+                  </div>
+                  {chapterFlow.reviewArtifact && (
+                    <p>
+                      试读报告：{chapterFlow.reviewIssueCount > 0 ? `发现 ${chapterFlow.reviewIssueCount} 个问题` : "未发现结构化问题"}
+                    </p>
+                  )}
+                </div>
+              </section>
+            )}
 
-            <details className="tools-group" open>
+            <details className="tools-group">
               <summary>质量与连续性</summary>
               <div className="tools-group-content">
 
@@ -4173,9 +4933,6 @@ export function BookStudioWorkspace() {
                 <BarChart3 size={14} />
                 质量检查
               </div>
-              <button onClick={analyzeQuality} disabled={!selectedArtifact || Boolean(busy)}>
-                <BarChart3 size={14} /> 检查当前产物
-              </button>
               <button
                 onClick={analyzeChapterGate}
                 disabled={
@@ -4332,12 +5089,6 @@ export function BookStudioWorkspace() {
                 连续性审校
               </div>
               <button
-                onClick={checkLedgerContinuity}
-                disabled={!selectedArtifact || (selectedArtifact.stage !== "draft" && selectedArtifact.stage !== "revision") || Boolean(busy)}
-              >
-                <Rows3 size={14} /> 状态账本核对
-              </button>
-              <button
                 onClick={reviewContinuity}
                 disabled={!detail || detail.chapters.length < 2 || Boolean(busy)}
               >
@@ -4443,70 +5194,11 @@ export function BookStudioWorkspace() {
             </div>
             </details>
 
-            <details className="tools-group">
-              <summary>协作记录</summary>
-              <div className="tools-group-content">
-            <section className="panel">
-              <div className="panel-title">
-                <MessageSquare size={14} />
-                最近协作
-              </div>
-              <div className="activity-list">
-                {visibleMessages.map((message) => (
-                  <article className="activity-item" key={message.id}>
-                    <div className="activity-item-head">
-                      <strong>{roleLabel(message.role)}</strong>
-                      <span>{new Date(message.created_at).toLocaleString()}</span>
-                    </div>
-                    <p>{message.content}</p>
-                  </article>
-                ))}
-                {visibleMessages.length === 0 && <div className="empty-inline">还没有协作记录</div>}
-              </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-title">
-                <Sparkles size={14} />
-                最近运行
-              </div>
-              <div className="activity-list">
-                {visibleRuns.map((run) => (
-                  <article className="activity-item" key={run.id}>
-                    <div className="activity-item-head">
-                      <strong>{stageLabel(run.stage)}</strong>
-                      <span>{run.elapsed_ms} ms</span>
-                    </div>
-                    <p>
-                      {run.status === "success"
-                        ? "执行成功"
-                        : run.status === "streaming"
-                          ? `正在接收输出${run.output_chars ? ` · ${run.output_chars} 字符` : ""}`
-                          : run.error ?? "执行失败"}
-                    </p>
-                  </article>
-                ))}
-                {visibleRuns.length === 0 && <div className="empty-inline">还没有运行记录</div>}
-              </div>
-            </section>
-
-            {exportText && (
-              <section className="panel">
-                <div className="panel-title">
-                  <Download size={14} />
-                  导出
-                </div>
-                <textarea readOnly rows={6} value={exportText} />
-                <button className="secondary-action" onClick={downloadExportedMarkdown}>
-                  <Download size={14} /> 下载 Markdown 文件
-                </button>
-              </section>
-            )}
               </div>
             </details>
-              </div>
-            </details>
+            </div>
           </aside>
+          </>
           )}
           </>
         </div>
@@ -4567,19 +5259,6 @@ export function BookStudioWorkspace() {
         </div>
       )}
 
-      <AdoptionDrawer
-        open={showAdoptionDrawer}
-        proposals={selectedArtifactProposals as AdoptionProposal[]}
-        chapters={detail?.chapters ?? []}
-        knowledgeCards={detail?.knowledge_cards ?? []}
-        foreshadowings={detail?.foreshadowings ?? []}
-        busy={Boolean(busy)}
-        onClose={() => setShowAdoptionDrawer(false)}
-        onExtract={prepareArtifactAdoptions}
-        onSave={saveAdoptionProposal}
-        onApply={applyAdoptionProposals}
-        onReject={rejectAdoptionProposals}
-      />
     </main>
   );
 }
