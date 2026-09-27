@@ -24,6 +24,12 @@ approve_stage（正文转正）
 - 该章节无 status != archived 的 canon_entries（`source_chapter_id` 关联）
 - 该章正文哈希与上次对齐时一致（对齐标记存 `workflow_runs`：查最近一条 stage=`canon_align` 成功运行的时间与当时的正文哈希——首版可省略哈希比对，每次转正都跑一次小调用）
 
+## 配套修复（评审后新增的三项）
+
+1. **生成端防重（问题 1 的根因）**：原 `save_human_canon_entry` 是裸 INSERT——同项目同类别同标题会建重复行（实例：林默×2）。改为**同身份 upsert**（project_id + category + lower(title) 查到即 UPDATE），并在迁移 v10 中清理历史重复行 + 建唯一索引 `idx_canon_entries_identity` 兜底。
+2. **上下文分区（问题 3）**：`append_approved_context` 拆成两段——`# 已确认资料（已写进正文的事实）`（source_chapter_id 非空）与 `# 预埋设定（尚未写入正文）`（source_chapter_id 为空），并明确告知模型"预埋设定不得当作已发生事实引用"。
+3. **写作笔记提取（问题 4）**：对齐产出新增 `writing_notes`（角色说话方式、重复母题、编号规律），落为 category=rule 的资料条目（title 加"写作笔记："前缀），进资料库与续章上下文。
+
 ## 对齐流程（新模块 `canon_alignment.rs`，模板 = continuity_ledger.rs 的 ensure 模式）
 
 1. `insert_workflow_run(stage = "canon_align", status = "running")`——后台运行留痕，失败可见（借鉴章节记忆的教训：不再静默 eprintln）。

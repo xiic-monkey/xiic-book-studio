@@ -1,6 +1,6 @@
 use super::ApplicationGateway;
 use crate::{
-    adoption, ai, chapter_memory, context_search, continuity_ledger,
+    adoption, ai, canon_alignment, chapter_memory, context_search, continuity_ledger,
     error::{AppError, AppResult},
     gate, index_jobs,
     models::*,
@@ -335,6 +335,12 @@ impl ApplicationGateway {
                         .await
                         {
                             eprintln!("chapter memory generation unavailable: {error}");
+                        }
+                        if let Err(error) =
+                            canon_alignment::align_chapter_after_approval(&state, project_id, chapter_id)
+                                .await
+                        {
+                            eprintln!("canon alignment unavailable: {error}");
                         }
                     });
                 }

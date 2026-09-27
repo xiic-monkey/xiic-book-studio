@@ -2385,13 +2385,33 @@ fn append_approved_context(
         .into_iter()
         .filter(|card| card.status == "approved")
         .collect::<Vec<_>>();
-    if !cards.is_empty() {
-        prompt.push_str("\n\n# 已确认动态资料卡");
+    if cards.is_empty() {
+        return Ok(());
+    }
+    // 已写进正文的事实与预埋设定分区标注：防止模型把创作计划当作已发生事实引用。
+    let (established, planned): (Vec<_>, Vec<_>) = cards
+        .into_iter()
+        .partition(|card| card.source_chapter_id.is_some());
+    if !established.is_empty() {
+        prompt.push_str("\n\n# 已确认资料（已写进正文的事实）");
         prompt.push_str(&format!(
-            "\n{}\n以下卡片与已批准设定同等有效。没有出现在这里的待确认资料不得当作事实使用。",
+            "\n{}\n以下资料与已批准设定同等有效。没有出现在这里的待确认资料不得当作事实使用。",
             DATA_BLOCK_BOUNDARY
         ));
-        for card in cards {
+        for card in established {
+            prompt.push_str(&format!(
+                "\n\n## [{}] {}\n{}",
+                card.category, card.title, card.content
+            ));
+        }
+    }
+    if !planned.is_empty() {
+        prompt.push_str("\n\n# 预埋设定（尚未写入正文）");
+        prompt.push_str(&format!(
+            "\n{}\n以下只是创作计划，不是已发生的事实：不得在正文中直接引用为已有事件，只能在后续章节中兑现或改写。",
+            DATA_BLOCK_BOUNDARY
+        ));
+        for card in planned {
             prompt.push_str(&format!(
                 "\n\n## [{}] {}\n{}",
                 card.category, card.title, card.content

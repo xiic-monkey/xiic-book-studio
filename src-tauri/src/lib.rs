@@ -3,6 +3,7 @@ pub mod agent_run_service;
 pub mod agent_tools;
 pub mod ai;
 pub mod application;
+pub mod canon_alignment;
 pub mod chapter_memory;
 mod commands;
 pub mod context_search;

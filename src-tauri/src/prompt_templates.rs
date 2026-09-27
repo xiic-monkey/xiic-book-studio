@@ -13,6 +13,7 @@ pub const BUILTIN_AGENT_KEYS: &[&str] = &[
     "revision",
     "adoption",
     "story_index",
+    "canon_align",
     "chapter_memory",
     "continuity_ledger",
     "continuity_check",
@@ -33,6 +34,7 @@ pub fn default_prompt(agent_key: &str) -> Option<&'static str> {
             "revision" => include_str!("../prompts/v2/revision.md"),
             "adoption" => include_str!("../prompts/v2/adoption.md"),
             "story_index" => include_str!("../prompts/v2/story_index.md"),
+            "canon_align" => include_str!("../prompts/v2/canon_align.md"),
             "chapter_memory" => include_str!("../prompts/v2/chapter_memory.md"),
             "continuity_ledger" => include_str!("../prompts/v2/continuity_ledger.md"),
             "continuity_check" => include_str!("../prompts/v2/continuity_check.md"),
@@ -75,7 +77,7 @@ mod tests {
         let keys = BUILTIN_AGENT_KEYS
             .iter()
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(BUILTIN_AGENT_KEYS.len(), 15);
+        assert_eq!(BUILTIN_AGENT_KEYS.len(), 16);
         assert_eq!(keys.len(), BUILTIN_AGENT_KEYS.len());
     }
 

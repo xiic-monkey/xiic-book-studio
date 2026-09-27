@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-const V2_SCHEMA_VERSION: i64 = 9;
+const V2_SCHEMA_VERSION: i64 = 10;
 
 pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
@@ -62,6 +62,10 @@ pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
         if current < 9 {
             apply_migration(conn, 9, migrate_v9)?;
             current = 9;
+        }
+        if current < 10 {
+            apply_migration(conn, 10, migrate_v10)?;
+            current = 10;
         }
         debug_assert!(V2_SCHEMA_VERSION >= current);
         Ok(())
@@ -113,6 +117,30 @@ fn migrate_v8(conn: &Connection) -> AppResult<()> {
     conn.execute(
         "INSERT INTO agents (stage, name, role, system_prompt, temperature)
          VALUES ('orchestrator', '主 Agent', '负责对话理解、只读检索和子任务编排；不直接修改项目数据', ?1, 0.2)
+         ON CONFLICT(stage) DO NOTHING",
+        params![prompt],
+    )?;
+    Ok(())
+}
+
+fn migrate_v10(conn: &Connection) -> AppResult<()> {
+    // 写入端已改为同身份 upsert；历史重复行只保留最新一条，再上唯一索引兜底。
+    conn.execute(
+        "DELETE FROM canon_entries
+         WHERE id NOT IN (
+             SELECT MAX(id) FROM canon_entries GROUP BY project_id, category, lower(title)
+         )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_canon_entries_identity
+         ON canon_entries(project_id, category, lower(title))",
+        [],
+    )?;
+    let prompt = crate::prompt_templates::require_default_prompt("canon_align")?;
+    conn.execute(
+        "INSERT INTO agents (stage, name, role, system_prompt, temperature)
+         VALUES ('canon_align', '资料对齐 Agent', '章节转正后对照定稿正文修订、归档、补充资料条目，并提炼写作约束', ?1, 0.0)
          ON CONFLICT(stage) DO NOTHING",
         params![prompt],
     )?;

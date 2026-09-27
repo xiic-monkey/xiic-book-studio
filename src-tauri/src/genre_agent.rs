@@ -18,6 +18,7 @@ pub const COMPOSED_AGENT_KEYS: &[&str] = &[
 ];
 
 pub const RAW_AGENT_KEYS: &[&str] = &[
+    "canon_align",
     "chapter_memory",
     "continuity_ledger",
     "continuity_check",
@@ -226,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn route_registry_covers_fifteen_agents_without_overlap() {
+    fn route_registry_covers_sixteen_agents_without_overlap() {
         let composed = COMPOSED_AGENT_KEYS
             .iter()
             .copied()
@@ -236,7 +237,7 @@ mod tests {
             .copied()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(COMPOSED_AGENT_KEYS.len(), 5);
-        assert_eq!(RAW_AGENT_KEYS.len(), 10);
+        assert_eq!(RAW_AGENT_KEYS.len(), 11);
         assert_eq!(composed.len(), COMPOSED_AGENT_KEYS.len());
         assert_eq!(raw.len(), RAW_AGENT_KEYS.len());
         assert!(composed.is_disjoint(&raw));

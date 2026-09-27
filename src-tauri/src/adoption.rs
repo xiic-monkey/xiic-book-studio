@@ -339,6 +339,23 @@ pub fn save_human_canon_entry(
                 return Err(AppError::Validation("资料卡不存在".to_string()));
             }
             id
+        } else if let Some(existing_id) = tx
+            .query_row(
+                "SELECT id FROM canon_entries
+                 WHERE project_id = ?1 AND category = ?2 AND lower(title) = lower(?3)",
+                params![input.project_id, category, title],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            // 同项目、同类别、同标题的资料一律更新：写入端不产生重复条目。
+            tx.execute(
+                "UPDATE canon_entries SET content = ?1, status = ?2,
+                    source_artifact_id = ?3, source_chapter_id = ?4, updated_at = ?5
+                 WHERE id = ?6 AND project_id = ?7",
+                params![content, status, input.source_artifact_id, source_chapter_id, now, existing_id, input.project_id],
+            )?;
+            existing_id
         } else {
             tx.execute(
                 "INSERT INTO canon_entries

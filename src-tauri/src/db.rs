@@ -3076,6 +3076,103 @@ impl AppState {
         })
     }
 
+    /// 某章节来源、且未归档的资料条目（对齐机制的输入）。
+    pub fn list_canon_entries_for_chapter(
+        &self,
+        project_id: i64,
+        chapter_id: i64,
+    ) -> AppResult<Vec<CanonEntry>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, category, title, content, status, source_artifact_id, source_chapter_id, created_at, updated_at
+                 FROM canon_entries
+                 WHERE project_id = ?1 AND source_chapter_id = ?2 AND status != 'archived'
+                 ORDER BY updated_at DESC, id DESC",
+            )?;
+            let rows = stmt.query_map(params![project_id, chapter_id], map_canon_entry)?;
+            let items = rows.collect::<Result<Vec<_>, _>>()?;
+            Ok(items)
+        })
+    }
+
+    /// 应用资料对齐结果（单事务）：updates 重置待确认并指向新正文，
+    /// archive_ids 置 archived（保留可恢复），additions 新建待确认。
+    /// 返回 (更新数, 归档数, 新增数)。
+    pub fn apply_canon_alignment(
+        &self,
+        project_id: i64,
+        chapter_id: i64,
+        source_artifact_id: i64,
+        updates: &[(i64, String)],
+        archive_ids: &[i64],
+        additions: &[(String, String, String)],
+    ) -> AppResult<(usize, usize, usize)> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let timestamp = now();
+                let mut updated = 0usize;
+                for (entry_id, new_content) in updates {
+                    let old_status: String = conn
+                        .query_row(
+                            "SELECT status FROM canon_entries WHERE id = ?1 AND project_id = ?2",
+                            params![entry_id, project_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .ok_or_else(|| {
+                            AppError::Validation(format!("资料 #{entry_id} 不存在或不属于当前项目"))
+                        })?;
+                    conn.execute(
+                        "UPDATE canon_entries
+                         SET content = ?1, status = 'pending_human_approval',
+                             source_artifact_id = ?2, source_chapter_id = ?3, updated_at = ?4
+                         WHERE id = ?1 AND project_id = ?2",
+                        params![new_content, source_artifact_id, chapter_id, timestamp, entry_id, project_id],
+                    )?;
+                    if old_status == "approved" {
+                        mark_story_bible_changed_tx(conn, project_id, &timestamp)?;
+                    }
+                    updated += 1;
+                }
+                let mut archived = 0usize;
+                for entry_id in archive_ids {
+                    archived += conn.execute(
+                        "UPDATE canon_entries
+                         SET status = 'archived', source_artifact_id = ?2, updated_at = ?3
+                         WHERE id = ?1 AND project_id = ?2 AND status != 'archived'",
+                        params![entry_id, source_artifact_id, timestamp],
+                    )?;
+                }
+                let mut added = 0usize;
+                for (category, title, content) in additions {
+                    conn.execute(
+                        "INSERT INTO canon_entries
+                            (project_id, category, title, content, status, source_chapter_id, source_artifact_id, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 'pending_human_approval', ?5, ?6, ?7, ?7)",
+                        params![project_id, category, title, content, chapter_id, source_artifact_id, timestamp],
+                    )?;
+                    added += 1;
+                }
+                conn.execute(
+                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                    params![timestamp, project_id],
+                )?;
+                Ok((updated, archived, added))
+            })();
+            match result {
+                Ok(counts) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(counts)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
     pub fn list_foreshadowings(&self, project_id: i64) -> AppResult<Vec<Foreshadowing>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(

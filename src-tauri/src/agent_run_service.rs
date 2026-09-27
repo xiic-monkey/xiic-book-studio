@@ -394,7 +394,7 @@ fn direct_story_architect_prompt(
         None,
         agent,
     )?;
-    prompt.push_str("\n\n# 结构化资料写入方式\n你必须直接操作当前项目的结构化数据，不生成设定/大纲/角色 Markdown，不把整篇资料作为最终答复。世界长期规则和角色稳定信息逐条调用“写入资料”（save_canon_entry）或“更新资料”（update_canon_entry）工具；大纲阶段的第 N 章计划必须逐条调用“创建章节计划”或“更新章节计划”，不要把章节计划混入资料条目。所有新写入都会先保存为待人工确认。当前 setting 阶段只允许 world、cultivation、map、faction、taboo、item、rule：只写世界长期如何运行，不写主角第一章、压迫链、资源循环、首次收益或章节任务。当前 outline 阶段的章节计划必须包含 chapter_no、标题和可执行内容；当前 characters 阶段只允许 character。单条资料只表达一个稳定概念，避免把一个概念拆成大量碎片。完成所有必要写入后停止工具调用。\n\n# 当前已有资料\n");
+    prompt.push_str("\n\n# 结构化资料写入方式\n你必须直接操作当前项目的结构化数据，不生成设定/大纲/角色 Markdown，不把整篇资料作为最终答复。世界长期规则和角色稳定信息逐条调用“写入资料”（save_canon_entry）或“更新资料”（update_canon_entry）工具；大纲阶段的第 N 章计划必须逐条调用“创建章节计划”或“更新章节计划”，不要把章节计划混入资料条目。所有新写入都会先保存为待人工确认。资料库中已有相近概念的条目时必须调用更新资料工具修改，禁止新建同义条目。当前 setting 阶段只允许 world、cultivation、map、faction、taboo、item、rule：只写世界长期如何运行，不写主角第一章、压迫链、资源循环、首次收益或章节任务。当前 outline 阶段的章节计划必须包含 chapter_no、标题和可执行内容；当前 characters 阶段只允许 character。单条资料只表达一个稳定概念，避免把一个概念拆成大量碎片。完成所有必要写入后停止工具调用。\n\n# 当前已有资料\n");
     let cards = state.list_canon_entries(request.project_id)?;
     if cards.is_empty() {
         prompt.push_str("（暂无已有资料）");
