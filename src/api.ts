@@ -25,13 +25,13 @@ import type {
   ChapterUpdate,
   ClearChapterHistoryInput,
   DeleteArtifactInput,
-  DeleteKnowledgeCardInput,
+  DeleteCanonEntryInput,
   LedgerContinuityReport,
   ContinuityReport,
   DerivedIndexJob,
   Foreshadowing,
   HistoryCleanupResult,
-  KnowledgeCard,
+  CanonEntry,
   NewProject,
   NewChapter,
   ModelInfo,
@@ -52,7 +52,7 @@ import type {
   SaveWritingSkill,
   SaveAiProvider,
   SaveForeshadowingInput,
-  SaveKnowledgeCardInput,
+  SaveCanonEntryInput,
   Stage,
   StoryContextSnippet,
   StoryFactSearchResult,
@@ -191,8 +191,8 @@ export const api = {
   listWritingSkills: () => invokeCommand<WritingSkill[]>("list_writing_skills"),
   saveWritingSkill: (input: SaveWritingSkill) =>
     invokeCommand<WritingSkill>("save_writing_skill", { input }),
-  saveKnowledgeCard: (input: SaveKnowledgeCardInput) =>
-    invokeCommand<KnowledgeCard>("save_knowledge_card", { input }),
+  saveCanonEntry: (input: SaveCanonEntryInput) =>
+    invokeCommand<CanonEntry>("save_canon_entry", { input }),
   saveForeshadowing: (input: SaveForeshadowingInput) =>
     invokeCommand<Foreshadowing>("save_foreshadowing", { input }),
   prepareArtifactAdoptions: (input: { project_id: number; artifact_id: number }) =>
@@ -334,8 +334,8 @@ export const api = {
     invokeCommand<AgentStepResult>("revise_artifact_span_with_ai", { input }),
   deleteArtifact: (input: DeleteArtifactInput) =>
     invokeCommand<void>("delete_artifact", { input }),
-  deleteKnowledgeCard: (input: DeleteKnowledgeCardInput) =>
-    invokeCommand<void>("delete_knowledge_card", { input }),
+  deleteCanonEntry: (input: DeleteCanonEntryInput) =>
+    invokeCommand<void>("delete_canon_entry", { input }),
   clearChapterHistory: (input: ClearChapterHistoryInput) =>
     invokeCommand<HistoryCleanupResult>("clear_chapter_history", { input }),
   exportProject: (projectId: number) =>

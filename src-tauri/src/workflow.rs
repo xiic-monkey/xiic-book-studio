@@ -1777,7 +1777,7 @@ fn require_approved_foundation(state: &AppState, project_id: i64, stage: &str) -
         return Ok(());
     }
     let has_card = state
-        .list_knowledge_cards(project_id)?
+        .list_canon_entries(project_id)?
         .into_iter()
         .any(|card| {
             card.status == "approved"
@@ -2064,7 +2064,7 @@ fn build_prompt_internal(
     match stage {
         Stage::Setting => prompt.push_str("\n\n# 任务\n生成或重写本书的核心设定。必须包含：一句话卖点、核心规则、主要禁忌、风格标尺、可持续冲突来源。按设定复杂度写足，不用为了压缩字数省掉必要边界；也不要写百科式世界史。"),
         Stage::Outline => prompt.push_str(&outline_task_for_prompt(state, project_id)?),
-        Stage::Characters => prompt.push_str("\n\n# 任务\n基于已批准设定和大纲生成角色卡；每个主要角色必须包含：欲望、恐惧、底线、说话方式、首次登场功能、与主角的冲突/互补。按角色复杂度写足，减少履历堆砌。"),
+        Stage::Characters => prompt.push_str("\n\n# 任务\n基于已批准设定和大纲整理角色信息；每个主要角色必须包含：欲望、恐惧、底线、说话方式、首次登场功能、与主角的冲突/互补。按角色复杂度写足，减少履历堆砌。"),
         Stage::Draft => prompt.push_str("\n\n# 任务\n为当前章节写完整正文。只输出正文，不要写标题、分析或说明。优先场景、动作、对白和细节推进；少解释设定，少抽象总结，避免连续使用“像……一样”的模板化比喻。开篇应让读者逐渐或立即看清本章正在处理什么，以及人物为何选择现在行动；章末完成本章功能并形成自然延续，可以落在结果、决定、信息改写、行动启动、关系新平衡或情绪余韵，不强制危险和反转。严禁把当前章节写成资料汇总、线索清单或设定说明会。若你发现前文有很多待回收线索，本章最多处理其中 1-2 条，其余保留到后续章节。章节可按场景、对白、情绪承接和冲突解决的实际需要写长；只有在重复解释、重复确认或多个独立章节功能互相争抢篇幅时，才应删减或拆章。\n\n把这一章理解成一次主要推进，不是一次世界观清仓：优先完成 1 个明确章节功能，例如修炼小成、炼药试错、开门、核验、跟踪、谈判、藏证据、确认身份或布局下一场。新名词、新地点和新人物功能只在完成本章任务确有必要时引入，不按固定数量机械限制。若故事自然冒出更多谜底或设定，只保留最能改变主角下一步选择的一条，其余只写成物证、异常、疑点或未确认线索。不要用“第一/第二/第三”总结真相，不要连续写“不是……而是……”解释机制。\n\n若本章动用了旧能力、旧物件、旧血脉、旧令牌或旧资源做比前文更强的新动作，必须同时满足两件事：1）明确这仍然基于前文已出现的功能，或来自同源外物/一次性触发，不是主角无铺垫永久升级；2）当章立刻兑现更重代价、暴露或失控风险。若做不到，就降回感知、开门、试探、逼退、换取片段信息等较窄用途。"),
         Stage::Review => {
             let chapter_id = chapter_id.ok_or_else(|| {
@@ -2381,7 +2381,7 @@ fn append_approved_context(
         }
     }
     let cards = state
-        .list_knowledge_cards(project_id)?
+        .list_canon_entries(project_id)?
         .into_iter()
         .filter(|card| card.status == "approved")
         .collect::<Vec<_>>();
@@ -3517,7 +3517,7 @@ fn normalize_thread_key(term: &str) -> String {
 
 fn registered_story_thread_labels(state: &AppState, project_id: i64) -> AppResult<HashSet<String>> {
     let mut labels = HashSet::new();
-    for card in state.list_knowledge_cards(project_id)? {
+    for card in state.list_canon_entries(project_id)? {
         if card.status == "approved" && is_valid_story_thread_term(&card.title) {
             labels.insert(card.title.trim().to_string());
         }
@@ -3935,7 +3935,7 @@ fn approved_outline_section_for_chapter(
             outline.content
         } else {
             let content = state
-                .list_knowledge_cards(project_id)?
+                .list_canon_entries(project_id)?
                 .into_iter()
                 .filter(|card| {
                     card.status == "approved"

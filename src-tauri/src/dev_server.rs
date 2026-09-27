@@ -24,12 +24,12 @@ use crate::{
         ClearChapterHistoryRequest, ConfirmCurrentPlanRequest, ConfirmStoryBibleRequest,
         ConfirmStoryBibleReviewRequest, ContinuityReviewRequest, CreateChapterFromPlanRequest,
         DecideActionProposalRequest, DecideAdoptionProposalsRequest, DeleteArtifactRequest,
-        DeleteChapterPlanRequest, DeleteKnowledgeCardRequest, ImportReferenceTextRequest,
+        DeleteChapterPlanRequest, DeleteCanonEntryRequest, ImportReferenceTextRequest,
         LedgerContinuityCheckRequest, ListActionProposalsRequest, ListAdoptionProposalsRequest,
         ListModelsInput, OrchestratorTurnRequest, PrepareArtifactAdoptionsRequest,
         RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, RetryIndexJobsRequest,
         RevisionRequest, RunStoryArchitectRequest, SaveAgentSettings, SaveAiProvider,
-        SaveAiSettings, SaveChapterPlan, SaveForeshadowing, SaveKnowledgeCard, SaveWritingSkill,
+        SaveAiSettings, SaveChapterPlan, SaveForeshadowing, SaveCanonEntry, SaveWritingSkill,
         SpanReplacementRequest, StoryBibleReviewRequest, StoryContextRerankRequest,
         StoryContextSearchInput, TestAiConnectionInput, UpdateAdoptionProposalRequest,
         UpdateReferenceMaterialRequest,
@@ -266,13 +266,13 @@ async fn dispatch_command(
             let input: SaveWritingSkill = read_required(&payload, "input")?;
             Ok(serde_json::to_value(gateway.save_writing_skill(input)?)?)
         }
-        "save_knowledge_card" => {
-            let input: SaveKnowledgeCard = read_required(&payload, "input")?;
-            Ok(serde_json::to_value(gateway.save_knowledge_card(input)?)?)
+        "save_canon_entry" => {
+            let input: SaveCanonEntry = read_required(&payload, "input")?;
+            Ok(serde_json::to_value(gateway.save_canon_entry(input)?)?)
         }
-        "delete_knowledge_card" => {
-            let input: DeleteKnowledgeCardRequest = read_required(&payload, "input")?;
-            gateway.delete_knowledge_card(input)?;
+        "delete_canon_entry" => {
+            let input: DeleteCanonEntryRequest = read_required(&payload, "input")?;
+            gateway.delete_canon_entry(input)?;
             Ok(serde_json::to_value(())?)
         }
         "save_foreshadowing" => {

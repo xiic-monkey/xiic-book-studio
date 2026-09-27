@@ -60,7 +60,7 @@ function proposalTypeLabel(proposalType: string) {
     create_chapter: "创建章节",
     rename_chapter: "重命名章节",
     artifact_candidate: "资料候选版本",
-    knowledge_card: "知识卡候选",
+    canon_entry: "资料候选",
     foreshadowing: "伏笔候选",
   };
   return labels[proposalType] ?? proposalType;

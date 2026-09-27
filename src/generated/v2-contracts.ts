@@ -27,7 +27,7 @@ export type Message = { id: number, project_id: number, chapter_id: number | nul
 
 export type StoryThread = { id: number, project_id: number, thread_key: string, label: string, kind: string, status: string, current_cost: string | null, last_seen_chapter_no: number | null, last_artifact_id: number | null, notes: string, created_at: string, updated_at: string, };
 
-export type KnowledgeCard = { id: number, project_id: number, category: string, title: string, content: string, status: string, source_artifact_id: number | null, source_chapter_id: number | null, created_at: string, updated_at: string, };
+export type CanonEntry = { id: number, project_id: number, category: string, title: string, content: string, status: string, source_artifact_id: number | null, source_chapter_id: number | null, created_at: string, updated_at: string, };
 
 export type Foreshadowing = { id: number, project_id: number, title: string, content: string, status: string, planted_chapter_id: number | null, planned_payoff_chapter_id: number | null, planned_payoff_note: string, source_artifact_id: number | null, created_at: string, updated_at: string, };
 
@@ -105,7 +105,7 @@ export type ActiveAgentRun = { id: number, project_id: number, chapter_id: numbe
 
 export type ArtifactSummary = { id: number, project_id: number, chapter_id: number | null, stage: string, title: string, version: number, status: string, parent_artifact_id: number | null, created_at: string, char_count: number, };
 
-export type ProjectWorkspace = { project: Project, genre_agent: GenreAgentProfile, chapters: Array<Chapter>, chapter_plans: Array<ChapterPlan>, formal_char_count: number, artifacts: Array<ArtifactSummary>, approvals: Array<Approval>, messages: Array<Message>, workflow_runs: Array<WorkflowRunSummary>, story_threads: Array<StoryThread>, knowledge_cards: Array<KnowledgeCard>, foreshadowings: Array<Foreshadowing>, story_entities: Array<StoryEntity>, story_events: Array<StoryEvent>, story_event_participants: Array<StoryEventParticipant>, story_facts: Array<StoryFact>, story_index_sources: Array<StoryIndexSource>, story_search_sources: Array<StorySearchSource>, index_jobs: Array<DerivedIndexJob>, adoption_proposals: Array<AdoptionProposal>, story_bible: StoryBible | null, story_arcs: Array<StoryArc>, story_bible_review: StoryBibleReview | null, canonical_fingerprint: string, settings: AiSettings, };
+export type ProjectWorkspace = { project: Project, genre_agent: GenreAgentProfile, chapters: Array<Chapter>, chapter_plans: Array<ChapterPlan>, formal_char_count: number, artifacts: Array<ArtifactSummary>, approvals: Array<Approval>, messages: Array<Message>, workflow_runs: Array<WorkflowRunSummary>, story_threads: Array<StoryThread>, canon_entries: Array<CanonEntry>, foreshadowings: Array<Foreshadowing>, story_entities: Array<StoryEntity>, story_events: Array<StoryEvent>, story_event_participants: Array<StoryEventParticipant>, story_facts: Array<StoryFact>, story_index_sources: Array<StoryIndexSource>, story_search_sources: Array<StorySearchSource>, index_jobs: Array<DerivedIndexJob>, adoption_proposals: Array<AdoptionProposal>, story_bible: StoryBible | null, story_arcs: Array<StoryArc>, story_bible_review: StoryBibleReview | null, canonical_fingerprint: string, settings: AiSettings, };
 
 export const V2_COMMANDS = {
   previewAgentRun: "preview_agent_run",

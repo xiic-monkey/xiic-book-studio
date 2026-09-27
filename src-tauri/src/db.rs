@@ -24,10 +24,10 @@ use crate::{
     models::{
         Agent, AiProvider, AiSettings, Approval, Artifact, ArtifactFilters, Chapter,
         ChapterMemoryRecord, ChapterPlan, ChapterUpdate, ContinuityLedgerEntry, DerivedIndexJob,
-        Foreshadowing, GenreAgentProfile, ImportReferenceTextRequest, KnowledgeCard, Message,
+        Foreshadowing, GenreAgentProfile, ImportReferenceTextRequest, CanonEntry, Message,
         NewChapter, NewProject, Project, ProjectDetail, ProjectUpdate, ReferenceMaterial, RunEvent,
         SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveChapterPlan, SaveForeshadowing,
-        SaveKnowledgeCard, SaveWritingSkill, StoryArc, StoryBible, StoryBibleReview, StoryEntity,
+        SaveCanonEntry, SaveWritingSkill, StoryArc, StoryBible, StoryBibleReview, StoryEntity,
         StoryEvent, StoryEventParticipant, StoryFact, StoryIndexSource, StorySearchSource,
         StoryThread, UpdateReferenceMaterialRequest, WorkflowRun, WritingSkill,
     },
@@ -385,7 +385,7 @@ impl AppState {
                     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
                 );
 
-                CREATE TABLE IF NOT EXISTS knowledge_cards (
+                CREATE TABLE IF NOT EXISTS canon_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id INTEGER NOT NULL,
                     category TEXT NOT NULL,
@@ -1011,7 +1011,7 @@ impl AppState {
             messages: self.list_messages(project_id)?,
             workflow_runs: self.list_workflow_runs(project_id)?,
             story_threads: self.list_story_threads(project_id)?,
-            knowledge_cards: self.list_knowledge_cards(project_id)?,
+            canon_entries: self.list_canon_entries(project_id)?,
             foreshadowings: self.list_foreshadowings(project_id)?,
             story_entities: self.list_story_entities(project_id)?,
             story_events: self.list_story_events(project_id)?,
@@ -2998,59 +2998,59 @@ impl AppState {
         })
     }
 
-    pub fn list_knowledge_cards(&self, project_id: i64) -> AppResult<Vec<KnowledgeCard>> {
+    pub fn list_canon_entries(&self, project_id: i64) -> AppResult<Vec<CanonEntry>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, project_id, category, title, content, status, source_artifact_id, source_chapter_id, created_at, updated_at
-                 FROM knowledge_cards WHERE project_id = ?1
+                 FROM canon_entries WHERE project_id = ?1
                  ORDER BY CASE status WHEN 'approved' THEN 0 WHEN 'pending_human_approval' THEN 1 ELSE 2 END, category, updated_at DESC, id DESC",
             )?;
-            let rows = stmt.query_map(params![project_id], map_knowledge_card)?;
+            let rows = stmt.query_map(params![project_id], map_canon_entry)?;
             collect_rows(rows)
         })
     }
 
-    pub fn get_knowledge_card(&self, project_id: i64, card_id: i64) -> AppResult<KnowledgeCard> {
+    pub fn get_canon_entry(&self, project_id: i64, card_id: i64) -> AppResult<CanonEntry> {
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT id, project_id, category, title, content, status, source_artifact_id,
                         source_chapter_id, created_at, updated_at
-                 FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                 FROM canon_entries WHERE id = ?1 AND project_id = ?2",
                 params![card_id, project_id],
-                map_knowledge_card,
+                map_canon_entry,
             )
             .optional()?
-            .ok_or_else(|| AppError::Validation("知识卡不存在或不属于当前项目".to_string()))
+            .ok_or_else(|| AppError::Validation("资料不存在或不属于当前项目".to_string()))
         })
     }
 
-    pub fn save_knowledge_card(&self, input: SaveKnowledgeCard) -> AppResult<KnowledgeCard> {
-        crate::adoption::save_human_knowledge_card(self, input)
+    pub fn save_canon_entry(&self, input: SaveCanonEntry) -> AppResult<CanonEntry> {
+        crate::adoption::save_human_canon_entry(self, input)
     }
 
-    pub fn delete_knowledge_card(&self, project_id: i64, card_id: i64) -> AppResult<()> {
+    pub fn delete_canon_entry(&self, project_id: i64, card_id: i64) -> AppResult<()> {
         self.with_conn(|conn| {
             crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, conn)?;
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| {
                 let status = conn
                     .query_row(
-                        "SELECT status FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                        "SELECT status FROM canon_entries WHERE id = ?1 AND project_id = ?2",
                         params![card_id, project_id],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?
                     .ok_or_else(|| {
-                        AppError::Validation("知识卡不存在或不属于当前项目".to_string())
+                        AppError::Validation("资料不存在或不属于当前项目".to_string())
                     })?;
-                crate::story_search::delete_source(conn, project_id, "knowledge_card", card_id)?;
+                crate::story_search::delete_source(conn, project_id, "canon_entry", card_id)?;
                 let deleted = conn.execute(
-                    "DELETE FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                    "DELETE FROM canon_entries WHERE id = ?1 AND project_id = ?2",
                     params![card_id, project_id],
                 )?;
                 if deleted == 0 {
                     return Err(AppError::Validation(
-                        "知识卡不存在或不属于当前项目".to_string(),
+                        "资料不存在或不属于当前项目".to_string(),
                     ));
                 }
                 let timestamp = now();
@@ -3170,7 +3170,7 @@ impl AppState {
                         source_artifact_id, source_text_hash, normalization_version, status, error, indexed_at
                  FROM story_search_sources
                  WHERE project_id = ?1
-                 ORDER BY CASE source_kind WHEN 'chapter' THEN 0 WHEN 'artifact' THEN 1 WHEN 'knowledge_card' THEN 2 ELSE 3 END,
+                 ORDER BY CASE source_kind WHEN 'chapter' THEN 0 WHEN 'artifact' THEN 1 WHEN 'canon_entry' THEN 2 ELSE 3 END,
                           COALESCE(chapter_no_sort, 0), source_id",
             )?;
             let rows = stmt.query_map(params![project_id], map_story_search_source)?;
@@ -3778,7 +3778,7 @@ impl AppState {
                     };
                     let sql = format!(
                         "SELECT COALESCE(group_concat(title || ': ' || content, char(10) || char(10)), '')
-                         FROM knowledge_cards WHERE project_id = ?1 AND status = 'approved' AND category IN {category_filter}"
+                         FROM canon_entries WHERE project_id = ?1 AND status = 'approved' AND category IN {category_filter}"
                     );
                     conn.query_row(&sql, params![project_id], |row| row.get(0)).map_err(AppError::from)
                 };
@@ -3912,7 +3912,7 @@ impl AppState {
                 }
 
                 let approved_card_count = conn.execute(
-                    "UPDATE knowledge_cards
+                    "UPDATE canon_entries
                      SET status = 'approved', updated_at = ?1
                      WHERE project_id = ?2
                        AND status = 'pending_human_approval'
@@ -4442,7 +4442,7 @@ fn default_background_agents(
         (
             "adoption",
             "资料整理 Agent",
-            "从已批准产物提取知识卡与伏笔候选",
+            "从已批准产物提取资料与伏笔候选",
             require_default_prompt("adoption")?,
             0.1,
         ),
@@ -4854,7 +4854,7 @@ fn has_foundation_material_tx(conn: &Connection, project_id: i64, stage: &str) -
     let categories = foundation_categories_sql(stage);
     let sql = format!(
         "SELECT EXISTS(
-            SELECT 1 FROM knowledge_cards
+            SELECT 1 FROM canon_entries
             WHERE project_id = ?1
               AND status IN ('pending_human_approval', 'approved')
               AND source_chapter_id IS NULL
@@ -4893,7 +4893,7 @@ fn approved_foundation_card_content_tx(
     let categories = foundation_categories_sql(stage);
     let sql = format!(
         "SELECT COALESCE(group_concat(title || ': ' || content, char(10) || char(10)), '')
-         FROM knowledge_cards
+         FROM canon_entries
          WHERE project_id = ?1 AND status = 'approved' AND source_chapter_id IS NULL
            AND category IN ({categories})"
     );
@@ -4992,7 +4992,7 @@ fn detach_artifact_references_tx(conn: &Connection, artifact_id: i64) -> AppResu
         "UPDATE chapters SET current_artifact_id = NULL WHERE current_artifact_id = ?1",
         "UPDATE artifacts SET parent_artifact_id = NULL WHERE parent_artifact_id = ?1",
         "UPDATE story_threads SET last_artifact_id = NULL WHERE last_artifact_id = ?1",
-        "UPDATE knowledge_cards SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
+        "UPDATE canon_entries SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
         "UPDATE foreshadowings SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
         "UPDATE story_entities SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
         "UPDATE story_bibles SET source_artifact_id = NULL WHERE source_artifact_id = ?1",
@@ -5426,8 +5426,8 @@ fn map_derived_index_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DerivedInd
     })
 }
 
-fn map_knowledge_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeCard> {
-    Ok(KnowledgeCard {
+fn map_canon_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CanonEntry> {
+    Ok(CanonEntry {
         id: row.get(0)?,
         project_id: row.get(1)?,
         category: row.get(2)?,
@@ -5533,7 +5533,7 @@ fn dedupe_approvals(conn: &Connection) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NewProject, SaveKnowledgeCard, ToolProtocol};
+    use crate::models::{NewProject, SaveCanonEntry, ToolProtocol};
 
     #[test]
     fn initializes_database_and_defaults() {
@@ -6129,7 +6129,7 @@ mod tests {
             .upsert_story_bible_from_artifact(project.id, &foundation, "confirmed")
             .unwrap();
         let card = state
-            .save_knowledge_card(SaveKnowledgeCard {
+            .save_canon_entry(SaveCanonEntry {
                 id: None,
                 project_id: project.id,
                 category: "world".to_string(),
@@ -6163,9 +6163,9 @@ mod tests {
             state.get_story_bible(project.id).unwrap().unwrap().status,
             "needs_review"
         );
-        assert_eq!(detail.knowledge_cards.len(), 1);
-        assert_eq!(detail.knowledge_cards[0].id, card.id);
-        assert_eq!(detail.knowledge_cards[0].status, "approved");
+        assert_eq!(detail.canon_entries.len(), 1);
+        assert_eq!(detail.canon_entries[0].id, card.id);
+        assert_eq!(detail.canon_entries[0].status, "approved");
         assert_eq!(detail.foreshadowings.len(), 1);
         assert_eq!(detail.foreshadowings[0].id, thread.id);
         assert_eq!(
@@ -7332,7 +7332,7 @@ mod tests {
             ("character", "主角"),
         ] {
             state
-                .save_knowledge_card(SaveKnowledgeCard {
+                .save_canon_entry(SaveCanonEntry {
                     id: None,
                     project_id: project.id,
                     category: category.to_string(),
@@ -7345,7 +7345,7 @@ mod tests {
                 .unwrap();
         }
         let archived = state
-            .save_knowledge_card(SaveKnowledgeCard {
+            .save_canon_entry(SaveCanonEntry {
                 id: None,
                 project_id: project.id,
                 category: "world".to_string(),
@@ -7366,7 +7366,7 @@ mod tests {
         assert!(state.active_story_arc(project.id).unwrap().is_some());
         assert_eq!(
             state
-                .get_knowledge_card(project.id, archived.id)
+                .get_canon_entry(project.id, archived.id)
                 .unwrap()
                 .status,
             "archived"
@@ -7397,7 +7397,7 @@ mod tests {
             .unwrap();
         for (category, title) in [("world", "世界规则"), ("outline", "阶段大纲")] {
             state
-                .save_knowledge_card(SaveKnowledgeCard {
+                .save_canon_entry(SaveCanonEntry {
                     id: None,
                     project_id: project.id,
                     category: category.to_string(),
@@ -7418,7 +7418,7 @@ mod tests {
         assert!(state.get_story_bible(project.id).unwrap().is_none());
         assert!(state.active_story_arc(project.id).unwrap().is_none());
         assert!(state
-            .list_knowledge_cards(project.id)
+            .list_canon_entries(project.id)
             .unwrap()
             .iter()
             .all(|card| card.status == "pending_human_approval"));
@@ -7439,7 +7439,7 @@ mod tests {
             .unwrap();
         for category in ["world", "outline", "character"] {
             state
-                .save_knowledge_card(SaveKnowledgeCard {
+                .save_canon_entry(SaveCanonEntry {
                     id: None,
                     project_id: project.id,
                     category: category.to_string(),
@@ -7468,7 +7468,7 @@ mod tests {
         assert!(state.get_story_bible(project.id).unwrap().is_none());
         assert!(state.active_story_arc(project.id).unwrap().is_none());
         assert!(state
-            .list_knowledge_cards(project.id)
+            .list_canon_entries(project.id)
             .unwrap()
             .iter()
             .all(|card| card.status == "pending_human_approval"));
@@ -7488,7 +7488,7 @@ mod tests {
             .unwrap();
         for (category, title) in [("world", "世界规则"), ("character", "主角")] {
             state
-                .save_knowledge_card(SaveKnowledgeCard {
+                .save_canon_entry(SaveCanonEntry {
                     id: None,
                     project_id: project.id,
                     category: category.to_string(),

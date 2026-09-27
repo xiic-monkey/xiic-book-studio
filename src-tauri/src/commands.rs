@@ -12,9 +12,9 @@ use crate::{
         ConfirmCurrentPlanRequest, ConfirmStoryBibleRequest, ConfirmStoryBibleReviewRequest,
         ContinuityReport, ContinuityReviewRequest, CreateChapterFromPlanRequest,
         CurrentPlanConfirmationResult, DecideActionProposalRequest, DecideAdoptionProposalsRequest,
-        DeleteArtifactRequest, DeleteChapterPlanRequest, DeleteKnowledgeCardRequest,
+        DeleteArtifactRequest, DeleteChapterPlanRequest, DeleteCanonEntryRequest,
         DerivedIndexJob, Foreshadowing, HistoryCleanupResult, ImportReferenceTextRequest,
-        KnowledgeCard, LedgerContinuityCheckRequest, LedgerContinuityReport,
+        CanonEntry, LedgerContinuityCheckRequest, LedgerContinuityReport,
         ListActionProposalsRequest, ListAdoptionProposalsRequest, ListModelsInput, NewChapter,
         NewProject, OrchestratorTurnRequest, OrchestratorTurnResponse,
         PrepareArtifactAdoptionsRequest, PreparedContext, Project, ProjectDetail, ProjectUpdate,
@@ -22,7 +22,7 @@ use crate::{
         RebuildStoryIndexRequest, RebuildStorySearchIndexRequest, ReferenceMaterial,
         RetryIndexJobsRequest, RevisionRequest, RunEvent, RunStoryArchitectRequest,
         SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveChapterPlan, SaveForeshadowing,
-        SaveKnowledgeCard, SaveWritingSkill, SpanReplacementRequest, StoryBible, StoryBibleReview,
+        SaveCanonEntry, SaveWritingSkill, SpanReplacementRequest, StoryBible, StoryBibleReview,
         StoryBibleReviewRequest, StoryContextRerankRequest, StoryContextRerankResult,
         StoryContextSearchInput, StoryContextSnippet, StoryFactSearchResult, StoryIndexSummary,
         TestAiConnectionInput, UpdateAdoptionProposalRequest, UpdateReferenceMaterialRequest,
@@ -220,19 +220,19 @@ pub fn save_writing_skill(
 }
 
 #[tauri::command]
-pub fn save_knowledge_card(
+pub fn save_canon_entry(
     gateway: State<'_, ApplicationGateway>,
-    input: SaveKnowledgeCard,
-) -> AppResult<KnowledgeCard> {
-    gateway.save_knowledge_card(input)
+    input: SaveCanonEntry,
+) -> AppResult<CanonEntry> {
+    gateway.save_canon_entry(input)
 }
 
 #[tauri::command]
-pub fn delete_knowledge_card(
+pub fn delete_canon_entry(
     gateway: State<'_, ApplicationGateway>,
-    input: DeleteKnowledgeCardRequest,
+    input: DeleteCanonEntryRequest,
 ) -> AppResult<()> {
-    gateway.delete_knowledge_card(input)
+    gateway.delete_canon_entry(input)
 }
 
 #[tauri::command]

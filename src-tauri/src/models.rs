@@ -379,7 +379,7 @@ pub struct StoryThread {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-pub struct KnowledgeCard {
+pub struct CanonEntry {
     pub id: i64,
     pub project_id: i64,
     pub category: String,
@@ -393,7 +393,7 @@ pub struct KnowledgeCard {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SaveKnowledgeCard {
+pub struct SaveCanonEntry {
     pub id: Option<i64>,
     pub project_id: i64,
     pub category: String,
@@ -844,7 +844,7 @@ pub struct ProjectDetail {
     pub messages: Vec<Message>,
     pub workflow_runs: Vec<WorkflowRun>,
     pub story_threads: Vec<StoryThread>,
-    pub knowledge_cards: Vec<KnowledgeCard>,
+    pub canon_entries: Vec<CanonEntry>,
     pub foreshadowings: Vec<Foreshadowing>,
     pub story_entities: Vec<StoryEntity>,
     pub story_events: Vec<StoryEvent>,
@@ -875,7 +875,7 @@ pub struct ProjectWorkspace {
     pub messages: Vec<Message>,
     pub workflow_runs: Vec<WorkflowRunSummary>,
     pub story_threads: Vec<StoryThread>,
-    pub knowledge_cards: Vec<KnowledgeCard>,
+    pub canon_entries: Vec<CanonEntry>,
     pub foreshadowings: Vec<Foreshadowing>,
     pub story_entities: Vec<StoryEntity>,
     pub story_events: Vec<StoryEvent>,
@@ -1362,7 +1362,7 @@ pub struct DeleteArtifactRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteKnowledgeCardRequest {
+pub struct DeleteCanonEntryRequest {
     pub project_id: i64,
     pub card_id: i64,
 }

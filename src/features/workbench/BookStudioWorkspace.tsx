@@ -52,7 +52,7 @@ import type {
   Chapter,
   ChapterPlan,
   Foreshadowing,
-  KnowledgeCard,
+  CanonEntry,
   LedgerContinuityReport,
   NewProject,
   Project,
@@ -68,7 +68,7 @@ import type {
   SaveWritingSkill,
   SaveAiProvider,
   SaveForeshadowingInput,
-  SaveKnowledgeCardInput,
+  SaveCanonEntryInput,
   Stage,
   StoryContextSnippet,
   StoryContextRerankResult,
@@ -211,12 +211,12 @@ const foundationKnowledgeCategories = [
   "character",
 ];
 
-function isFoundationKnowledgeCard(card: Pick<KnowledgeCard, "category" | "source_chapter_id">) {
+function isFoundationCanonEntry(card: Pick<CanonEntry, "category" | "source_chapter_id">) {
   return card.source_chapter_id == null && foundationKnowledgeCategories.includes(card.category);
 }
 
 export function currentPlanStatus(
-  workspace: (Pick<ProjectWorkspace, "story_bible" | "story_bible_review" | "canonical_fingerprint" | "knowledge_cards"> &
+  workspace: (Pick<ProjectWorkspace, "story_bible" | "story_bible_review" | "canonical_fingerprint" | "canon_entries"> &
     Partial<Pick<ProjectWorkspace, "chapter_plans">>) | null,
 ) {
   if (!workspace) return { label: "待打开项目", tone: "idle" };
@@ -238,9 +238,9 @@ export function currentPlanStatus(
   if (workspace.story_bible?.status === "confirmed" || workspace.story_bible?.status === "needs_review" || review) {
     return { label: "待审校", tone: "review" };
   }
-  const hasFoundationCards = workspace.knowledge_cards.some((card) =>
+  const hasFoundationCards = workspace.canon_entries.some((card) =>
     card.status !== "archived"
-    && isFoundationKnowledgeCard(card),
+    && isFoundationCanonEntry(card),
   );
   const hasChapterPlans = (workspace.chapter_plans ?? []).some((plan) => plan.status !== "archived");
   return { label: hasFoundationCards || hasChapterPlans ? "待确认资料" : "待完善计划", tone: "draft" };
@@ -248,9 +248,9 @@ export function currentPlanStatus(
 
 function pendingFoundationCardCount(workspace: ProjectWorkspace | null) {
   if (!workspace) return 0;
-  return workspace.knowledge_cards.filter((card) =>
+  return workspace.canon_entries.filter((card) =>
     card.status === "pending_human_approval"
-    && isFoundationKnowledgeCard(card),
+    && isFoundationCanonEntry(card),
   ).length;
 }
 
@@ -385,8 +385,8 @@ const assistantToolLabels: Record<string, string> = {
   get_chapter_context: "读取当前章节",
   search_story: "检索故事内容",
   search_story_facts: "检索故事事实",
-  create_knowledge_card: "创建知识卡",
-  update_knowledge_card: "更新知识卡",
+  create_canon_entry: "写入资料",
+  update_canon_entry: "更新资料",
   reference_materials: "读取参考资料",
   chapter_memory: "读取章节记忆",
   continuity_check: "检查连续性",
@@ -751,7 +751,7 @@ export function BookStudioWorkspace() {
   const [knowledgeTitle, setKnowledgeTitle] = useState("");
   const [knowledgeContent, setKnowledgeContent] = useState("");
   const [knowledgeCategory, setKnowledgeCategory] = useState("world");
-  const [editingKnowledgeCardId, setEditingKnowledgeCardId] = useState<number | null>(null);
+  const [editingCanonEntryId, setEditingCanonEntryId] = useState<number | null>(null);
   const [showChapterPlanComposer, setShowChapterPlanComposer] = useState(false);
   const [editingChapterPlanId, setEditingChapterPlanId] = useState<number | null>(null);
   const [chapterPlanNo, setChapterPlanNo] = useState(1);
@@ -1239,18 +1239,18 @@ export function BookStudioWorkspace() {
 
   const libraryCards = useMemo(() => {
     if (!detail) return [];
-    const categoryMatch = (card: KnowledgeCard) => {
+    const categoryMatch = (card: CanonEntry) => {
       if (librarySection === "characters") return card.category === "character";
       if (librarySection === "outline") return card.category === "outline";
       return ["world", "cultivation", "map", "faction", "taboo", "item", "rule"].includes(card.category);
     };
-    const modeMatch = (card: KnowledgeCard) =>
+    const modeMatch = (card: CanonEntry) =>
       libraryMode === "official" ? card.status === "approved" : card.status !== "archived";
-    return (detail.knowledge_cards ?? []).filter((card) => categoryMatch(card) && modeMatch(card));
+    return (detail.canon_entries ?? []).filter((card) => categoryMatch(card) && modeMatch(card));
   }, [detail, librarySection, libraryMode]);
 
   const outlineCards = useMemo(() => {
-    const unique = new Map<string, KnowledgeCard>();
+    const unique = new Map<string, CanonEntry>();
     for (const card of libraryCards) {
       const key = card.title.replace(/[\s:：，。]+/g, "").toLowerCase();
       const current = unique.get(key);
@@ -2055,7 +2055,7 @@ export function BookStudioWorkspace() {
       }
 
       const isFoundationRun = ["setting", "outline", "characters"].includes(summary.run.stage);
-      // Foundation runs now persist knowledge_cards directly. If an older backend
+      // Foundation runs now persist canon_entries directly. If an older backend
       // returns a Markdown artifact, never surface it as the current result: that
       // would make the UI look as if the card-first flow had silently regressed.
       if (summary.artifact && isFoundationRun) {
@@ -2530,22 +2530,22 @@ export function BookStudioWorkspace() {
     setKnowledgeTitle("");
     setKnowledgeContent("");
     setKnowledgeCategory(librarySection === "characters" ? "character" : librarySection === "outline" ? "outline" : "world");
-    setEditingKnowledgeCardId(null);
+    setEditingCanonEntryId(null);
     setShowKnowledgeComposer(false);
   }
 
-  function editKnowledgeCard(card: KnowledgeCard) {
+  function editCanonEntry(card: CanonEntry) {
     setKnowledgeTitle(card.title);
     setKnowledgeContent(card.content);
     setKnowledgeCategory(card.category);
-    setEditingKnowledgeCardId(card.id);
+    setEditingCanonEntryId(card.id);
     setShowKnowledgeComposer(true);
   }
 
   function openKnowledgeEditor() {
     const firstCard = libraryCards[0];
     if (firstCard) {
-      editKnowledgeCard(firstCard);
+      editCanonEntry(firstCard);
       return;
     }
     resetKnowledgeComposer();
@@ -2627,11 +2627,11 @@ export function BookStudioWorkspace() {
     setShowForeshadowingComposer(true);
   }
 
-  async function saveKnowledgeCard(status: "pending_human_approval" | "approved") {
+  async function saveCanonEntry(status: "pending_human_approval" | "approved") {
     if (!detail || !knowledgeTitle.trim() || !knowledgeContent.trim()) return;
     await runTask(status === "approved" ? adoptionActionLabel : "保存资料卡", async () => {
-      const input: SaveKnowledgeCardInput = {
-        id: editingKnowledgeCardId,
+      const input: SaveCanonEntryInput = {
+        id: editingCanonEntryId,
         project_id: detail.project.id,
         category: librarySection === "characters" ? "character" : librarySection === "outline" ? "outline" : knowledgeCategory,
         title: knowledgeTitle.trim(),
@@ -2640,7 +2640,7 @@ export function BookStudioWorkspace() {
         source_artifact_id: null,
         source_chapter_id: null,
       };
-      await api.saveKnowledgeCard(input);
+      await api.saveCanonEntry(input);
       resetKnowledgeComposer();
       await refreshDetailBestEffort(detail.project.id, "资料卡保存");
       setNotice(status === "approved" ? `资料卡已${adoptionActionLabel}并加入写作依据` : "资料卡已保存，等待人工确认");
@@ -2668,24 +2668,24 @@ export function BookStudioWorkspace() {
     });
   }
 
-  async function updateKnowledgeCardStatus(card: KnowledgeCard, status: "approved" | "archived") {
+  async function updateCanonEntryStatus(card: CanonEntry, status: "approved" | "archived") {
     if (!detail) return;
     await runTask(status === "approved" ? adoptionActionLabel : "归档资料卡", async () => {
-      await api.saveKnowledgeCard({ ...card, status });
+      await api.saveCanonEntry({ ...card, status });
       await refreshDetailBestEffort(detail.project.id, "资料卡更新");
       setNotice(status === "approved" ? `资料卡已${adoptionActionLabel}并加入写作依据` : "资料卡已归档，不再作为写作依据");
     });
   }
 
-  async function deleteKnowledgeCard(card: KnowledgeCard) {
+  async function deleteCanonEntry(card: CanonEntry) {
     if (!detail) return;
     const confirmed = window.confirm(
       `确定删除资料卡“${card.title}”吗？\n该资料卡会从项目资料中彻底移除，且不可恢复。`
     );
     if (!confirmed) return;
     await runTask("删除资料卡", async () => {
-      await api.deleteKnowledgeCard({ project_id: detail.project.id, card_id: card.id });
-      if (editingKnowledgeCardId === card.id) resetKnowledgeComposer();
+      await api.deleteCanonEntry({ project_id: detail.project.id, card_id: card.id });
+      if (editingCanonEntryId === card.id) resetKnowledgeComposer();
       await refreshDetailBestEffort(detail.project.id, "资料卡删除");
       setNotice(`已删除资料卡 ${card.title}`);
     });
@@ -2988,7 +2988,7 @@ export function BookStudioWorkspace() {
             ? `请为《${detail.project.title}》细化当前故事阶段，形成可执行的阶段目标、冲突、角色变化和近期章节任务，并沉淀为待确认的大纲资料。`
             : architectMode === "extend_next_arc"
               ? `请为《${detail.project.title}》基于当前故事进展提出下一阶段的候选方向，保留未兑现项并说明新条件，沉淀为待确认的大纲资料。`
-              : `请为《${detail.project.title}》补充和整理主要角色卡，明确身份、目标、限制、已知信息、关系和长期变化条件。`,
+              : `请为《${detail.project.title}》补充和整理主要角色信息，明确身份、目标、限制、已知信息、关系和长期变化条件。`,
     );
     void submitAssistantMessage(prompt, { storyArchitectMode: architectMode });
   }
@@ -4121,7 +4121,7 @@ export function BookStudioWorkspace() {
                   {libraryMode === "workbench" && libraryFocus !== "outline" && libraryFocus !== "foreshadowing" && showKnowledgeComposer && (
                     <section className="library-composer">
                       <div className="library-composer-head">
-                        <strong>{editingKnowledgeCardId ? "编辑资料卡" : `补充${librarySection === "setting" ? "设定" : librarySection === "outline" ? "大纲任务" : "角色"}`}</strong>
+                        <strong>{editingCanonEntryId ? "编辑资料卡" : `补充${librarySection === "setting" ? "设定" : librarySection === "outline" ? "大纲任务" : "角色"}`}</strong>
                         <button className="icon-btn" onClick={resetKnowledgeComposer} title="关闭"><ChevronLeft size={15} /></button>
                       </div>
                       {librarySection === "setting" && (
@@ -4137,8 +4137,8 @@ export function BookStudioWorkspace() {
                       <input value={knowledgeTitle} onChange={(event) => setKnowledgeTitle(event.target.value)} placeholder="资料标题" />
                       <textarea rows={5} value={knowledgeContent} onChange={(event) => setKnowledgeContent(event.target.value)} placeholder="资料内容" />
                       <div className="button-row">
-                        <button onClick={() => saveKnowledgeCard("pending_human_approval")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>保存待确认</button>
-                        <button className="btn-primary" onClick={() => saveKnowledgeCard("approved")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>
+                        <button onClick={() => saveCanonEntry("pending_human_approval")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>保存待确认</button>
+                        <button className="btn-primary" onClick={() => saveCanonEntry("approved")} disabled={!knowledgeTitle.trim() || !knowledgeContent.trim() || Boolean(busy)}>
                           <Check size={14} /> {adoptionActionLabel}
                         </button>
                       </div>
@@ -4213,11 +4213,11 @@ export function BookStudioWorkspace() {
                           <strong className="managed-card-title">{card.title}</strong>
                           <div className="managed-card-actions">
                               {libraryMode === "workbench" && (
-                              <button className="icon-btn" onClick={() => editKnowledgeCard(card)} title="编辑资料卡"><Edit3 size={14} /></button>
+                              <button className="icon-btn" onClick={() => editCanonEntry(card)} title="编辑资料卡"><Edit3 size={14} /></button>
                               )}
-                              {libraryMode === "workbench" && card.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "approved")} title={`${adoptionActionLabel}资料卡`}><Check size={14} /></button>}
-                              {libraryMode === "workbench" && card.status !== "archived" && <button className="icon-btn" onClick={() => updateKnowledgeCardStatus(card, "archived")} title="归档资料卡"><Trash2 size={14} /></button>}
-                              <button className="icon-btn danger" onClick={() => deleteKnowledgeCard(card)} title="彻底删除资料卡"><Trash2 size={14} /></button>
+                              {libraryMode === "workbench" && card.status === "pending_human_approval" && <button className="icon-btn" onClick={() => updateCanonEntryStatus(card, "approved")} title={`${adoptionActionLabel}资料卡`}><Check size={14} /></button>}
+                              {libraryMode === "workbench" && card.status !== "archived" && <button className="icon-btn" onClick={() => updateCanonEntryStatus(card, "archived")} title="归档资料卡"><Trash2 size={14} /></button>}
+                              <button className="icon-btn danger" onClick={() => deleteCanonEntry(card)} title="彻底删除资料卡"><Trash2 size={14} /></button>
                             </div>
                         </div>
                         <KnowledgeSectionCard section={{ title: card.title, content: card.content.split("\n") }} />

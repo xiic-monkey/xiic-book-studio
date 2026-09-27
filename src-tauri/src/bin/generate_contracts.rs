@@ -25,7 +25,7 @@ fn render() -> String {
     output.push_str(&declaration::<Approval>());
     output.push_str(&declaration::<Message>());
     output.push_str(&declaration::<StoryThread>());
-    output.push_str(&declaration::<KnowledgeCard>());
+    output.push_str(&declaration::<CanonEntry>());
     output.push_str(&declaration::<Foreshadowing>());
     output.push_str(&declaration::<StoryEntity>());
     output.push_str(&declaration::<StoryEvent>());

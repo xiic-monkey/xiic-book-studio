@@ -133,8 +133,8 @@ impl ApplicationGateway {
         self.state.save_writing_skill(input)
     }
 
-    pub fn save_knowledge_card(&self, input: SaveKnowledgeCard) -> AppResult<KnowledgeCard> {
-        let card = self.state.save_knowledge_card(input)?;
+    pub fn save_canon_entry(&self, input: SaveCanonEntry) -> AppResult<CanonEntry> {
+        let card = self.state.save_canon_entry(input)?;
         if let Err(error) = index_jobs::enqueue_project_search_job(&self.state, card.project_id) {
             eprintln!(
                 "knowledge card search refresh unavailable; queueing project rebuild: {error}"
@@ -143,9 +143,9 @@ impl ApplicationGateway {
         Ok(card)
     }
 
-    pub fn delete_knowledge_card(&self, input: DeleteKnowledgeCardRequest) -> AppResult<()> {
+    pub fn delete_canon_entry(&self, input: DeleteCanonEntryRequest) -> AppResult<()> {
         self.state
-            .delete_knowledge_card(input.project_id, input.card_id)
+            .delete_canon_entry(input.project_id, input.card_id)
     }
 
     pub fn save_foreshadowing(&self, input: SaveForeshadowing) -> AppResult<Foreshadowing> {

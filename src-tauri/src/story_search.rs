@@ -220,16 +220,16 @@ pub async fn refresh_approved_artifact_stage(
     Ok(())
 }
 
-pub async fn refresh_knowledge_card(
+pub async fn refresh_canon_entry(
     state: &AppState,
     project_id: i64,
     card_id: i64,
 ) -> AppResult<()> {
     ensure_sqlite_vec_loaded_if_present(state)?;
-    state.with_conn(|conn| delete_source(conn, project_id, "knowledge_card", card_id))?;
+    state.with_conn(|conn| delete_source(conn, project_id, "canon_entry", card_id))?;
 
     if let Some(card) = state
-        .list_knowledge_cards(project_id)?
+        .list_canon_entries(project_id)?
         .into_iter()
         .find(|card| card.id == card_id && card.status == "approved")
     {
@@ -239,7 +239,7 @@ pub async fn refresh_knowledge_card(
             state,
             &SearchSourcePayload {
                 project_id,
-                source_kind: "knowledge_card",
+                source_kind: "canon_entry",
                 source_id: card.id,
                 chapter_id,
                 chapter_no_sort: chapter_no(state, project_id, chapter_id)?,
@@ -247,7 +247,7 @@ pub async fn refresh_knowledge_card(
                 source_artifact_id,
                 title: card.title.clone(),
                 content: card.content,
-                search_label: format!("知识卡：{}", card.title),
+                search_label: format!("资料：{}", card.title),
                 chunk_max: 400,
                 overlap: 60,
                 single_document_if_short: true,
@@ -693,7 +693,7 @@ fn collect_project_sources(
     }
 
     for card in state
-        .list_knowledge_cards(project_id)?
+        .list_canon_entries(project_id)?
         .into_iter()
         .filter(|card| card.status == "approved")
     {
@@ -701,7 +701,7 @@ fn collect_project_sources(
         let source_artifact_id = existing_artifact_id(state, project_id, card.source_artifact_id)?;
         sources.push(SearchSourcePayload {
             project_id,
-            source_kind: "knowledge_card",
+            source_kind: "canon_entry",
             source_id: card.id,
             chapter_id,
             chapter_no_sort: chapter_no(state, project_id, chapter_id)?,
@@ -709,7 +709,7 @@ fn collect_project_sources(
             source_artifact_id,
             title: card.title.clone(),
             content: card.content,
-            search_label: format!("知识卡：{}", card.title),
+            search_label: format!("资料：{}", card.title),
             chunk_max: 400,
             overlap: 60,
             single_document_if_short: true,
@@ -1336,7 +1336,7 @@ fn source_label(document: &SearchDocument) -> String {
             document.title
         ),
         "artifact" => format!("资料：{}", document.title),
-        "knowledge_card" => format!("知识卡：{}", document.title),
+        "canon_entry" => format!("资料：{}", document.title),
         "foreshadowing" => format!("伏笔：{}", document.title),
         _ => document.title.clone(),
     }

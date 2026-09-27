@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-const V2_SCHEMA_VERSION: i64 = 8;
+const V2_SCHEMA_VERSION: i64 = 9;
 
 pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
@@ -58,6 +58,10 @@ pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
         if current < 8 {
             apply_migration(conn, 8, migrate_v8)?;
             current = 8;
+        }
+        if current < 9 {
+            apply_migration(conn, 9, migrate_v9)?;
+            current = 9;
         }
         debug_assert!(V2_SCHEMA_VERSION >= current);
         Ok(())
@@ -111,6 +115,39 @@ fn migrate_v8(conn: &Connection) -> AppResult<()> {
          VALUES ('orchestrator', '主 Agent', '负责对话理解、只读检索和子任务编排；不直接修改项目数据', ?1, 0.2)
          ON CONFLICT(stage) DO NOTHING",
         params![prompt],
+    )?;
+    Ok(())
+}
+
+/// 知识卡体系更名 canon entry：表名与检索来源标记跟随改名，数据保留。
+fn migrate_v9(conn: &Connection) -> AppResult<()> {
+    let has_old_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_cards')",
+            [],
+            |row| row.get(0),
+        )?;
+    if has_old_table {
+        // 全新数据库由 ensure_schema 直接建 canon_entries（空表）；旧库才是真有 knowledge_cards。
+        let canon_is_empty: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'canon_entries')
+                 AND NOT EXISTS(SELECT 1 FROM canon_entries)",
+                [],
+                |row| row.get(0),
+            )?;
+        if canon_is_empty != 0 {
+            conn.execute("DROP TABLE canon_entries", [])?;
+        }
+        conn.execute("ALTER TABLE knowledge_cards RENAME TO canon_entries", [])?;
+    }
+    conn.execute(
+        "UPDATE story_search_sources SET source_kind = 'canon_entry' WHERE source_kind = 'knowledge_card'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE story_search_documents SET source_kind = 'canon_entry' WHERE source_kind = 'knowledge_card'",
+        [],
     )?;
     Ok(())
 }
@@ -822,7 +859,7 @@ impl AppState {
                 .is_some_and(|proposal_type| {
                     matches!(
                         proposal_type.as_str(),
-                        "knowledge_card_update" | "knowledge_card_delete"
+                        "canon_entry_update" | "canon_entry_delete"
                     )
                 });
             if needs_vector_runtime {
@@ -1040,10 +1077,10 @@ fn proposal_is_stale(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
             )
             .optional()?
         }
-        "knowledge_card_update" | "knowledge_card_delete" => {
+        "canon_entry_update" | "canon_entry_delete" => {
             let card_id = json_i64(&proposal.payload, "card_id")?;
             tx.query_row(
-                "SELECT updated_at FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                "SELECT updated_at FROM canon_entries WHERE id = ?1 AND project_id = ?2",
                 params![card_id, proposal.project_id],
                 |row| row.get::<_, String>(0),
             )
@@ -1069,9 +1106,9 @@ fn validate_proposal_payload(proposal_type: &str, payload: &Value) -> AppResult<
         "rename_chapter" => &["chapter_id", "title"][..],
         "artifact_candidate" => &["stage", "title", "content"][..],
         "chapter_revision" => &["source_artifact_id"][..],
-        "knowledge_card" => &["category", "title", "content"][..],
-        "knowledge_card_update" => &["card_id", "category", "title", "content"][..],
-        "knowledge_card_delete" => &["card_id"][..],
+        "canon_entry" => &["category", "title", "content"][..],
+        "canon_entry_update" => &["card_id", "category", "title", "content"][..],
+        "canon_entry_delete" => &["card_id"][..],
         "foreshadowing" => &["title", "content"][..],
         _ => {
             return Err(AppError::Validation(format!(
@@ -1265,14 +1302,14 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
             )?;
             Ok(("artifact".to_string(), tx.last_insert_rowid()))
         }
-        "knowledge_card" => {
+        "canon_entry" => {
             let category = json_string(&proposal.payload, "category")?;
             let title = json_string(&proposal.payload, "title")?;
             let content = json_string(&proposal.payload, "content")?;
             let source_chapter_id =
                 existing_chapter_id(tx, proposal.project_id, proposal.chapter_id)?;
             tx.execute(
-                "INSERT INTO knowledge_cards
+                "INSERT INTO canon_entries
                     (project_id, category, title, content, status, source_artifact_id,
                      source_chapter_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, 'pending_human_approval', NULL, ?5, ?6, ?6)",
@@ -1285,23 +1322,23 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
                     now,
                 ],
             )?;
-            Ok(("knowledge_card".to_string(), tx.last_insert_rowid()))
+            Ok(("canon_entry".to_string(), tx.last_insert_rowid()))
         }
-        "knowledge_card_update" => {
+        "canon_entry_update" => {
             let card_id = json_i64(&proposal.payload, "card_id")?;
             let category = json_string(&proposal.payload, "category")?;
             let title = json_string(&proposal.payload, "title")?;
             let content = json_string(&proposal.payload, "content")?;
             let status = tx
                 .query_row(
-                    "SELECT status FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                    "SELECT status FROM canon_entries WHERE id = ?1 AND project_id = ?2",
                     params![card_id, proposal.project_id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .ok_or_else(|| AppError::Validation("知识卡不存在或不属于当前项目".to_string()))?;
+                .ok_or_else(|| AppError::Validation("资料不存在或不属于当前项目".to_string()))?;
             let changed = tx.execute(
-                "UPDATE knowledge_cards
+                "UPDATE canon_entries
                  SET category = ?1, title = ?2, content = ?3, updated_at = ?4
                  WHERE id = ?5 AND project_id = ?6",
                 params![
@@ -1315,10 +1352,10 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
             )?;
             if changed == 0 {
                 return Err(AppError::Validation(
-                    "知识卡不存在或不属于当前项目".to_string(),
+                    "资料不存在或不属于当前项目".to_string(),
                 ));
             }
-            crate::story_search::delete_source(tx, proposal.project_id, "knowledge_card", card_id)?;
+            crate::story_search::delete_source(tx, proposal.project_id, "canon_entry", card_id)?;
             tx.execute(
                 "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
                 params![now, proposal.project_id],
@@ -1326,26 +1363,26 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
             if status == "approved" {
                 crate::db::mark_story_bible_changed_tx(tx, proposal.project_id, &now)?;
             }
-            Ok(("knowledge_card".to_string(), card_id))
+            Ok(("canon_entry".to_string(), card_id))
         }
-        "knowledge_card_delete" => {
+        "canon_entry_delete" => {
             let card_id = json_i64(&proposal.payload, "card_id")?;
             let status = tx
                 .query_row(
-                    "SELECT status FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                    "SELECT status FROM canon_entries WHERE id = ?1 AND project_id = ?2",
                     params![card_id, proposal.project_id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .ok_or_else(|| AppError::Validation("知识卡不存在或不属于当前项目".to_string()))?;
-            crate::story_search::delete_source(tx, proposal.project_id, "knowledge_card", card_id)?;
+                .ok_or_else(|| AppError::Validation("资料不存在或不属于当前项目".to_string()))?;
+            crate::story_search::delete_source(tx, proposal.project_id, "canon_entry", card_id)?;
             let changed = tx.execute(
-                "DELETE FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                "DELETE FROM canon_entries WHERE id = ?1 AND project_id = ?2",
                 params![card_id, proposal.project_id],
             )?;
             if changed == 0 {
                 return Err(AppError::Validation(
-                    "知识卡不存在或不属于当前项目".to_string(),
+                    "资料不存在或不属于当前项目".to_string(),
                 ));
             }
             tx.execute(
@@ -1355,7 +1392,7 @@ fn apply_proposal_tx(tx: &Transaction<'_>, proposal: &ActionProposal) -> AppResu
             if status == "approved" {
                 crate::db::mark_story_bible_changed_tx(tx, proposal.project_id, &now)?;
             }
-            Ok(("knowledge_card".to_string(), card_id))
+            Ok(("canon_entry".to_string(), card_id))
         }
         "foreshadowing" => {
             let title = json_string(&proposal.payload, "title")?;
@@ -1605,7 +1642,7 @@ fn json_sql_error(error: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NewChapter, NewProject, SaveKnowledgeCard};
+    use crate::models::{NewChapter, NewProject, SaveCanonEntry};
 
     #[test]
     fn proposal_does_not_mutate_until_applied() {
@@ -1691,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_card_proposal_detects_version_conflict() {
+    fn canon_entry_proposal_detects_version_conflict() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state = AppState::from_path(file.path().to_path_buf()).unwrap();
         let project = state
@@ -1703,7 +1740,7 @@ mod tests {
             })
             .unwrap();
         let card = state
-            .save_knowledge_card(SaveKnowledgeCard {
+            .save_canon_entry(SaveCanonEntry {
                 id: None,
                 project_id: project.id,
                 category: "人物".to_string(),
@@ -1719,7 +1756,7 @@ mod tests {
                 project.id,
                 None,
                 None,
-                "knowledge_card_update",
+                "canon_entry_update",
                 "更新资料卡",
                 &serde_json::json!({
                     "card_id": card.id,
@@ -1731,7 +1768,7 @@ mod tests {
             )
             .unwrap();
         state
-            .save_knowledge_card(SaveKnowledgeCard {
+            .save_canon_entry(SaveCanonEntry {
                 id: Some(card.id),
                 project_id: project.id,
                 category: "人物".to_string(),
@@ -1748,7 +1785,7 @@ mod tests {
             .is_err());
         assert_eq!(
             state
-                .get_knowledge_card(project.id, card.id)
+                .get_canon_entry(project.id, card.id)
                 .unwrap()
                 .content,
             "人工内容"
@@ -1766,7 +1803,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_knowledge_card_proposal_removes_search_documents() {
+    fn deleting_a_canon_entry_proposal_removes_search_documents() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state = AppState::from_path(file.path().to_path_buf()).unwrap();
         let project = state
@@ -1778,7 +1815,7 @@ mod tests {
             })
             .unwrap();
         let card = state
-            .save_knowledge_card(SaveKnowledgeCard {
+            .save_canon_entry(SaveCanonEntry {
                 id: None,
                 project_id: project.id,
                 category: "world".to_string(),
@@ -1797,7 +1834,7 @@ mod tests {
                          title, content, search_text, chunk_no, chunk_start, chunk_end,
                          visibility_cutoff_chapter_no, source_text_hash, normalization_version,
                          updated_at)
-                     VALUES (?1, 'knowledge_card', ?2, NULL, NULL, NULL, ?3, ?4, ?4,
+                     VALUES (?1, 'canon_entry', ?2, NULL, NULL, NULL, ?3, ?4, ?4,
                              0, 0, 6, NULL, 'test-hash', 'test-v1', ?5)",
                     params![
                         project.id,
@@ -1815,7 +1852,7 @@ mod tests {
                 project.id,
                 None,
                 None,
-                "knowledge_card_delete",
+                "canon_entry_delete",
                 "删除资料卡",
                 &serde_json::json!({"card_id": card.id}),
                 Some(&card.updated_at),
@@ -1825,12 +1862,12 @@ mod tests {
         state
             .apply_action_proposal(project.id, proposal.id, "确认")
             .unwrap();
-        assert!(state.get_knowledge_card(project.id, card.id).is_err());
+        assert!(state.get_canon_entry(project.id, card.id).is_err());
         state
             .with_conn(|conn| {
                 let remaining: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM story_search_documents
-                     WHERE project_id = ?1 AND source_kind = 'knowledge_card' AND source_id = ?2",
+                     WHERE project_id = ?1 AND source_kind = 'canon_entry' AND source_id = ?2",
                     params![project.id, card.id],
                     |row| row.get(0),
                 )?;

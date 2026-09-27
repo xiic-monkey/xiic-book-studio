@@ -107,7 +107,7 @@ impl ApplicationGateway {
             messages: self.state.list_messages(project_id)?,
             workflow_runs: self.state.list_workflow_run_summaries(project_id)?,
             story_threads: self.state.list_story_threads(project_id)?,
-            knowledge_cards: self.state.list_knowledge_cards(project_id)?,
+            canon_entries: self.state.list_canon_entries(project_id)?,
             foreshadowings: self.state.list_foreshadowings(project_id)?,
             story_entities: self.state.list_story_entities(project_id)?,
             story_events: self.state.list_story_events(project_id)?,
@@ -164,7 +164,7 @@ impl ApplicationGateway {
                 .apply_action_proposal(input.project_id, input.proposal_id, &input.note)?;
         if matches!(
             result.proposal.proposal_type.as_str(),
-            "knowledge_card" | "knowledge_card_update" | "knowledge_card_delete"
+            "canon_entry" | "canon_entry_update" | "canon_entry_delete"
         ) {
             if let Err(error) =
                 index_jobs::enqueue_project_search_job(&self.state, input.project_id)
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn applying_a_knowledge_card_proposal_queues_search_rebuild() {
+    fn applying_a_canon_entry_proposal_queues_search_rebuild() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let state = AppState::from_path(file.path().to_path_buf()).unwrap();
         let project = state
@@ -300,7 +300,7 @@ mod tests {
                 project.id,
                 None,
                 None,
-                "knowledge_card",
+                "canon_entry",
                 "创建资料卡",
                 &serde_json::json!({
                     "category": "world",

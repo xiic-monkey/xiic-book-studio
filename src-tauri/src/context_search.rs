@@ -395,7 +395,7 @@ fn known_reference_labels(
     );
     weighted.extend(
         state
-            .list_knowledge_cards(project_id)?
+            .list_canon_entries(project_id)?
             .into_iter()
             .filter(|card| card.status == "approved")
             .map(|card| (4, card.title)),

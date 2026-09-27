@@ -245,7 +245,7 @@ export interface DeleteArtifactInput {
   artifact_id: number;
 }
 
-export interface DeleteKnowledgeCardInput {
+export interface DeleteCanonEntryInput {
   project_id: number;
   card_id: number;
 }
@@ -320,7 +320,7 @@ export interface StoryThread {
   updated_at: string;
 }
 
-export interface KnowledgeCard {
+export interface CanonEntry {
   id: number;
   project_id: number;
   category: string;
@@ -333,7 +333,7 @@ export interface KnowledgeCard {
   updated_at: string;
 }
 
-export interface SaveKnowledgeCardInput {
+export interface SaveCanonEntryInput {
   id?: number | null;
   project_id: number;
   category: string;
@@ -474,7 +474,7 @@ export interface StorySearchStatus {
   sources: StorySearchSource[];
 }
 
-export type AdoptionTargetKind = "knowledge_card" | "foreshadowing";
+export type AdoptionTargetKind = "canon_entry" | "foreshadowing";
 export type AdoptionProposalStatus = "pending" | "applied" | "rejected" | "stale";
 
 export interface AdoptionProposal {
@@ -579,7 +579,7 @@ export interface ProjectDetail {
   messages: Message[];
   workflow_runs: WorkflowRun[];
   story_threads: StoryThread[];
-  knowledge_cards: KnowledgeCard[];
+  canon_entries: CanonEntry[];
   foreshadowings: Foreshadowing[];
   story_entities: StoryEntity[];
   story_events: StoryEvent[];

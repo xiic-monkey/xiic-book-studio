@@ -14,7 +14,7 @@ function workspace(overrides: Record<string, unknown> = {}) {
     story_bible: null,
     story_bible_review: null,
     canonical_fingerprint: "current",
-    knowledge_cards: [],
+    canon_entries: [],
     ...overrides,
   } as Parameters<typeof currentPlanStatus>[0];
 }
@@ -26,13 +26,13 @@ describe("currentPlanStatus", () => {
 
   it("counts only book-level foundation cards as pending plan material", () => {
     expect(currentPlanStatus(workspace({
-      knowledge_cards: [
+      canon_entries: [
         { category: "world", status: "pending_human_approval", source_chapter_id: null },
         { category: "character", status: "pending_human_approval", source_chapter_id: 7 },
       ],
     }))).toEqual({ label: "待确认资料", tone: "draft" });
     expect(currentPlanStatus(workspace({
-      knowledge_cards: [
+      canon_entries: [
         { category: "character", status: "pending_human_approval", source_chapter_id: 7 },
       ],
     }))).toEqual({ label: "待完善计划", tone: "draft" });

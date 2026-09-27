@@ -12,12 +12,12 @@ use crate::{
     index_jobs,
     models::{
         AdoptionBatchResult, AdoptionProposal, Artifact, DecideAdoptionProposalsRequest,
-        Foreshadowing, KnowledgeCard, SaveForeshadowing, SaveKnowledgeCard,
+        Foreshadowing, CanonEntry, SaveForeshadowing, SaveCanonEntry,
         UpdateAdoptionProposalRequest,
     },
 };
 
-const KNOWLEDGE_CARD: &str = "knowledge_card";
+const CANON_ENTRY: &str = "canon_entry";
 const FORESHADOWING: &str = "foreshadowing";
 const PENDING: &str = "pending";
 
@@ -68,8 +68,8 @@ pub async fn prepare_artifact_adoptions(
         .ok_or_else(|| AppError::Validation("请先为当前供应商保存 API Key".to_string()))?;
 
     let current_library = json!({
-        "knowledge_cards": state
-            .list_knowledge_cards(project_id)?
+        "canon_entries": state
+            .list_canon_entries(project_id)?
             .into_iter()
             .filter(|item| item.status == "approved")
             .collect::<Vec<_>>(),
@@ -290,15 +290,15 @@ pub fn reject_adoption_proposals(
     })
 }
 
-pub fn save_human_knowledge_card(
+pub fn save_human_canon_entry(
     state: &AppState,
-    input: SaveKnowledgeCard,
-) -> AppResult<KnowledgeCard> {
+    input: SaveCanonEntry,
+) -> AppResult<CanonEntry> {
     state.get_project(input.project_id)?;
     validate_optional_chapter(state, input.project_id, input.source_chapter_id)?;
     validate_optional_artifact(state, input.project_id, input.source_artifact_id)?;
     let data = normalize_data(
-        KNOWLEDGE_CARD,
+        CANON_ENTRY,
         json!({
             "category": input.category,
             "title": input.title,
@@ -319,7 +319,7 @@ pub fn save_human_knowledge_card(
         let tx = conn.unchecked_transaction()?;
         let was_canonical = if let Some(id) = input.id {
             tx.query_row(
-                "SELECT status FROM knowledge_cards WHERE id = ?1 AND project_id = ?2",
+                "SELECT status FROM canon_entries WHERE id = ?1 AND project_id = ?2",
                 params![id, input.project_id],
                 |row| row.get::<_, String>(0),
             )
@@ -330,7 +330,7 @@ pub fn save_human_knowledge_card(
         };
         let id = if let Some(id) = input.id {
             let changed = tx.execute(
-                "UPDATE knowledge_cards SET category = ?1, title = ?2, content = ?3,
+                "UPDATE canon_entries SET category = ?1, title = ?2, content = ?3,
                     status = ?4, source_artifact_id = ?5, source_chapter_id = ?6, updated_at = ?7
                  WHERE id = ?8 AND project_id = ?9",
                 params![category, title, content, status, input.source_artifact_id, source_chapter_id, now, id, input.project_id],
@@ -341,7 +341,7 @@ pub fn save_human_knowledge_card(
             id
         } else {
             tx.execute(
-                "INSERT INTO knowledge_cards
+                "INSERT INTO canon_entries
                     (project_id, category, title, content, status, source_artifact_id, source_chapter_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                 params![input.project_id, category, title, content, status, input.source_artifact_id, source_chapter_id, now],
@@ -355,7 +355,7 @@ pub fn save_human_knowledge_card(
         if was_canonical || status == "approved" {
             crate::db::mark_story_bible_changed_tx(&tx, input.project_id, &now)?;
         }
-        let card = query_knowledge_card(&tx, id)?;
+        let card = query_canon_entry(&tx, id)?;
         tx.commit()?;
         Ok(card)
     })
@@ -521,7 +521,7 @@ fn resolve_candidate(
     let target_kind = normalize_target(&candidate.target_kind);
     let evidence_quote = candidate.evidence_quote.trim().to_string();
     let mut errors = Vec::new();
-    if !matches!(target_kind.as_str(), KNOWLEDGE_CARD | FORESHADOWING) {
+    if !matches!(target_kind.as_str(), CANON_ENTRY | FORESHADOWING) {
         errors.push(format!("未知采纳目标：{}", candidate.target_kind));
     }
     if evidence_quote.is_empty() || !artifact.content.contains(&evidence_quote) {
@@ -625,14 +625,14 @@ fn preflight_proposal(tx: &Transaction<'_>, proposal: &AdoptionProposal) -> AppR
 
 fn apply_proposal(tx: &Transaction<'_>, proposal: &AdoptionProposal, now: &str) -> AppResult<()> {
     match proposal.target_kind.as_str() {
-        KNOWLEDGE_CARD => {
+        CANON_ENTRY => {
             let category = string_field(&proposal.data, "category")?;
             let title = string_field(&proposal.data, "title")?;
             let content = string_field(&proposal.data, "content")?;
             let chapter_id = optional_i64_field(&proposal.data, "source_chapter_id")?;
             if let Some(id) = proposal.target_id {
                 tx.execute(
-                    "UPDATE knowledge_cards SET category = ?1, title = ?2, content = ?3,
+                    "UPDATE canon_entries SET category = ?1, title = ?2, content = ?3,
                         status = 'approved', source_artifact_id = ?4, source_chapter_id = ?5,
                         updated_at = ?6 WHERE id = ?7 AND project_id = ?8",
                     params![
@@ -648,7 +648,7 @@ fn apply_proposal(tx: &Transaction<'_>, proposal: &AdoptionProposal, now: &str) 
                 )?;
             } else {
                 tx.execute(
-                    "INSERT INTO knowledge_cards
+                    "INSERT INTO canon_entries
                         (project_id, category, title, content, status, source_artifact_id,
                          source_chapter_id, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, 'approved', ?5, ?6, ?7, ?7)",
@@ -718,7 +718,7 @@ fn normalize_data(target_kind: &str, data: Value) -> AppResult<Value> {
         .as_object()
         .ok_or_else(|| AppError::Validation("候选 data 必须是对象".to_string()))?;
     let aliases: HashMap<&str, &str> = match target_kind {
-        KNOWLEDGE_CARD => HashMap::from([
+        CANON_ENTRY => HashMap::from([
             ("name", "title"),
             ("body", "content"),
             ("type", "category"),
@@ -734,7 +734,7 @@ fn normalize_data(target_kind: &str, data: Value) -> AppResult<Value> {
         _ => return Err(AppError::Validation(format!("未知采纳目标：{target_kind}"))),
     };
     let allowed: HashSet<&str> = match target_kind {
-        KNOWLEDGE_CARD => ["category", "title", "content", "source_chapter_id"]
+        CANON_ENTRY => ["category", "title", "content", "source_chapter_id"]
             .into_iter()
             .collect(),
         FORESHADOWING => [
@@ -773,7 +773,7 @@ fn normalize_data(target_kind: &str, data: Value) -> AppResult<Value> {
         normalized.insert(field.to_string(), Value::String(value.to_string()));
     }
     match target_kind {
-        KNOWLEDGE_CARD => {
+        CANON_ENTRY => {
             let category = normalized
                 .get("category")
                 .and_then(Value::as_str)
@@ -832,8 +832,8 @@ fn normalize_category(category: &str) -> Option<&'static str> {
 
 fn normalize_target(target: &str) -> String {
     match target.trim().to_lowercase().as_str() {
-        "knowledge_card" | "knowledge" | "card" | "资料卡" | "角色卡" => {
-            KNOWLEDGE_CARD.to_string()
+        "canon_entry" | "knowledge" | "card" | "资料卡" | "角色卡" => {
+            CANON_ENTRY.to_string()
         }
         "foreshadowing" | "foreshadow" | "伏笔" => FORESHADOWING.to_string(),
         other => other.to_string(),
@@ -998,10 +998,10 @@ fn find_identity_target_conn(
 ) -> AppResult<Option<i64>> {
     let title = string_field(data, "title")?;
     match target_kind {
-        KNOWLEDGE_CARD => {
+        CANON_ENTRY => {
             let category = string_field(data, "category")?;
             conn.query_row(
-                "SELECT id FROM knowledge_cards WHERE project_id = ?1 AND lower(trim(category)) = lower(trim(?2)) AND lower(trim(title)) = lower(trim(?3)) ORDER BY id LIMIT 1",
+                "SELECT id FROM canon_entries WHERE project_id = ?1 AND lower(trim(category)) = lower(trim(?2)) AND lower(trim(title)) = lower(trim(?3)) ORDER BY id LIMIT 1",
                 params![project_id, category, title],
                 |row| row.get(0),
             ).optional().map_err(AppError::from)
@@ -1022,7 +1022,7 @@ fn target_belongs_to_project(
     target_id: i64,
 ) -> AppResult<bool> {
     let table = match target_kind {
-        KNOWLEDGE_CARD => "knowledge_cards",
+        CANON_ENTRY => "canon_entries",
         FORESHADOWING => "foreshadowings",
         _ => return Ok(false),
     };
@@ -1061,7 +1061,7 @@ fn target_snapshot_conn(
     target_id: i64,
 ) -> AppResult<String> {
     let table = match target_kind {
-        KNOWLEDGE_CARD => "knowledge_cards",
+        CANON_ENTRY => "canon_entries",
         FORESHADOWING => "foreshadowings",
         _ => return Err(AppError::Validation("未知采纳目标".to_string())),
     };
@@ -1081,7 +1081,7 @@ fn normalized_identity(target_kind: &str, data: &Value) -> String {
         .unwrap_or("")
         .trim()
         .to_lowercase();
-    if target_kind == KNOWLEDGE_CARD {
+    if target_kind == CANON_ENTRY {
         let category = data
             .get("category")
             .and_then(Value::as_str)
@@ -1134,11 +1134,11 @@ fn map_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdoptionProposal> {
     })
 }
 
-fn query_knowledge_card(conn: &rusqlite::Connection, id: i64) -> AppResult<KnowledgeCard> {
+fn query_canon_entry(conn: &rusqlite::Connection, id: i64) -> AppResult<CanonEntry> {
     conn.query_row(
-        "SELECT id, project_id, category, title, content, status, source_artifact_id, source_chapter_id, created_at, updated_at FROM knowledge_cards WHERE id = ?1",
+        "SELECT id, project_id, category, title, content, status, source_artifact_id, source_chapter_id, created_at, updated_at FROM canon_entries WHERE id = ?1",
         params![id],
-        |row| Ok(KnowledgeCard { id: row.get(0)?, project_id: row.get(1)?, category: row.get(2)?, title: row.get(3)?, content: row.get(4)?, status: row.get(5)?, source_artifact_id: row.get(6)?, source_chapter_id: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)? }),
+        |row| Ok(CanonEntry { id: row.get(0)?, project_id: row.get(1)?, category: row.get(2)?, title: row.get(3)?, content: row.get(4)?, status: row.get(5)?, source_artifact_id: row.get(6)?, source_chapter_id: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)? }),
     ).map_err(AppError::from)
 }
 
@@ -1180,7 +1180,7 @@ mod tests {
         assert_eq!(normalize_category("rule"), Some("rule"));
         assert_eq!(normalize_category("规则"), Some("rule"));
     }
-    use crate::models::{NewProject, SaveKnowledgeCard};
+    use crate::models::{NewProject, SaveCanonEntry};
     use std::ops::Deref;
 
     struct TestState {
@@ -1224,7 +1224,7 @@ mod tests {
     #[test]
     fn registry_normalizes_aliases_and_categories() {
         let normalized = normalize_data(
-            KNOWLEDGE_CARD,
+            CANON_ENTRY,
             json!({"type": "角色", "name": "宁烬", "body": "矿奴少年。"}),
         )
         .unwrap();
@@ -1236,7 +1236,7 @@ mod tests {
     #[test]
     fn registry_rejects_unknown_fields() {
         let error = normalize_data(
-            KNOWLEDGE_CARD,
+            CANON_ENTRY,
             json!({"category": "world", "title": "矿场", "content": "事实", "status": "approved"}),
         )
         .unwrap_err();
@@ -1246,7 +1246,7 @@ mod tests {
     #[test]
     fn extraction_parser_accepts_fenced_json() {
         let parsed = parse_extracted_candidates(
-            "```json\n[{\"target_kind\":\"knowledge_card\",\"data\":{\"category\":\"world\",\"title\":\"矿场\",\"content\":\"事实\"},\"evidence_quote\":\"事实\"}]\n```",
+            "```json\n[{\"target_kind\":\"canon_entry\",\"data\":{\"category\":\"world\",\"title\":\"矿场\",\"content\":\"事实\"},\"evidence_quote\":\"事实\"}]\n```",
         ).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].operation, "create");
@@ -1256,7 +1256,7 @@ mod tests {
     fn extraction_parser_accepts_empty_array_and_embedded_array() {
         assert!(parse_extracted_candidates("[]").unwrap().is_empty());
         let parsed = parse_extracted_candidates(
-            "整理结果如下：[{\"target_kind\":\"knowledge_card\",\"data\":{\"category\":\"world\",\"title\":\"矿场\",\"content\":\"事实\"},\"evidence_quote\":\"事实\"}]。以上。",
+            "整理结果如下：[{\"target_kind\":\"canon_entry\",\"data\":{\"category\":\"world\",\"title\":\"矿场\",\"content\":\"事实\"},\"evidence_quote\":\"事实\"}]。以上。",
         )
         .unwrap();
         assert_eq!(parsed.len(), 1);
@@ -1265,7 +1265,7 @@ mod tests {
     #[test]
     fn extraction_parser_accepts_json_object_envelope() {
         let parsed = parse_extracted_candidates(
-            r#"{"items":[{"target_kind":"knowledge_card","data":{"category":"world","title":"矿场","content":"事实"},"evidence_quote":"事实"}]}"#,
+            r#"{"items":[{"target_kind":"canon_entry","data":{"category":"world","title":"矿场","content":"事实"},"evidence_quote":"事实"}]}"#,
         )
         .unwrap();
         assert_eq!(parsed.len(), 1);
@@ -1284,7 +1284,7 @@ mod tests {
         assert!(error.to_string().contains("items 契约"));
 
         let error = parse_extracted_candidates(
-            r#"{"items":[{"target_kind":"knowledge_card","data":{},"evidence_quote":"事实","extra":true}]}"#,
+            r#"{"items":[{"target_kind":"canon_entry","data":{},"evidence_quote":"事实","extra":true}]}"#,
         )
         .unwrap_err();
         assert!(error.to_string().contains("items 契约"));
@@ -1298,7 +1298,7 @@ mod tests {
             &state,
             &artifact,
             vec![ExtractedCandidate {
-                target_kind: KNOWLEDGE_CARD.to_string(),
+                target_kind: CANON_ENTRY.to_string(),
                 target_id: None,
                 operation: "create".to_string(),
                 data: json!({"category": "character", "title": "宁烬", "content": "来自黑石矿场"}),
@@ -1308,7 +1308,7 @@ mod tests {
         .unwrap();
         assert_eq!(proposals.len(), 1);
         assert!(state
-            .list_knowledge_cards(artifact.project_id)
+            .list_canon_entries(artifact.project_id)
             .unwrap()
             .is_empty());
     }
@@ -1318,7 +1318,7 @@ mod tests {
         let state = test_state();
         let artifact = approved_artifact(&state, "宁烬来自黑石矿场。");
         let extracted = || ExtractedCandidate {
-            target_kind: KNOWLEDGE_CARD.to_string(),
+            target_kind: CANON_ENTRY.to_string(),
             target_id: None,
             operation: "create".to_string(),
             data: json!({"category": "character", "title": "宁烬", "content": "来自黑石矿场"}),
@@ -1348,7 +1348,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             state
-                .list_knowledge_cards(artifact.project_id)
+                .list_canon_entries(artifact.project_id)
                 .unwrap()
                 .len(),
             1
@@ -1360,7 +1360,7 @@ mod tests {
         let state = test_state();
         let artifact = approved_artifact(&state, "宁烬来自黑石矿场。矿场位于北荒。");
         let existing = state
-            .save_knowledge_card(SaveKnowledgeCard {
+            .save_canon_entry(SaveCanonEntry {
                 id: None,
                 project_id: artifact.project_id,
                 category: "character".to_string(),
@@ -1373,14 +1373,14 @@ mod tests {
             .unwrap();
         let proposals = replace_pending_proposals(&state, &artifact, vec![
             ExtractedCandidate {
-                target_kind: KNOWLEDGE_CARD.to_string(),
+                target_kind: CANON_ENTRY.to_string(),
                 target_id: Some(existing.id),
                 operation: "update".to_string(),
                 data: json!({"category": "character", "title": "宁烬", "content": "来自黑石矿场"}),
                 evidence_quote: "宁烬来自黑石矿场".to_string(),
             },
             ExtractedCandidate {
-                target_kind: KNOWLEDGE_CARD.to_string(),
+                target_kind: CANON_ENTRY.to_string(),
                 target_id: None,
                 operation: "create".to_string(),
                 data: json!({"category": "map", "title": "北荒", "content": "矿场位于北荒"}),
@@ -1388,7 +1388,7 @@ mod tests {
             },
         ]).unwrap();
         state
-            .save_knowledge_card(SaveKnowledgeCard {
+            .save_canon_entry(SaveCanonEntry {
                 id: Some(existing.id),
                 project_id: artifact.project_id,
                 category: "character".to_string(),
@@ -1408,7 +1408,7 @@ mod tests {
             },
         );
         assert!(result.is_err());
-        let cards = state.list_knowledge_cards(artifact.project_id).unwrap();
+        let cards = state.list_canon_entries(artifact.project_id).unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].content, "人工刚刚修改");
         assert_eq!(
@@ -1436,7 +1436,7 @@ mod tests {
             })
             .unwrap();
         let proposals = replace_pending_proposals(&state, &artifact, vec![ExtractedCandidate {
-            target_kind: KNOWLEDGE_CARD.to_string(),
+            target_kind: CANON_ENTRY.to_string(),
             target_id: None,
             operation: "create".to_string(),
             data: json!({"category": "map", "title": "北荒", "content": "矿场已经封闭", "source_chapter_id": chapter.id}),

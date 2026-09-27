@@ -8,7 +8,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         ActionProposal, Agent, AgentToolDefinition, ChapterSplitPlanRequest, ReferenceSelection,
-        SaveChapterPlan, SaveKnowledgeCard, Stage, StoryContextSearchInput, ToolCall, ToolKind,
+        SaveChapterPlan, SaveCanonEntry, Stage, StoryContextSearchInput, ToolCall, ToolKind,
         ToolProtocol, ToolResult,
     },
     quality, workflow,
@@ -89,12 +89,12 @@ pub fn definitions_for_agent(
                     && matches!(stage, Stage::Setting | Stage::Outline | Stage::Characters)
                     && matches!(
                         definition.key.as_str(),
-                        agent_tools::CREATE_KNOWLEDGE_CARD
-                            | agent_tools::UPDATE_KNOWLEDGE_CARD
+                        agent_tools::CREATE_CANON_ENTRY
+                            | agent_tools::UPDATE_CANON_ENTRY
                             | agent_tools::CREATE_CHAPTER_PLAN
                             | agent_tools::UPDATE_CHAPTER_PLAN
-                            | agent_tools::PROPOSE_KNOWLEDGE_CARD
-                            | agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD
+                            | agent_tools::PROPOSE_CANON_ENTRY
+                            | agent_tools::PROPOSE_UPDATE_CANON_ENTRY
                     ))
         })
         .filter(|definition| {
@@ -978,13 +978,13 @@ async fn execute_call(
                 None,
             ))
         }
-        agent_tools::CREATE_KNOWLEDGE_CARD | agent_tools::PROPOSE_KNOWLEDGE_CARD => {
+        agent_tools::CREATE_CANON_ENTRY | agent_tools::PROPOSE_CANON_ENTRY => {
             if is_direct_story_architect_run(context) {
                 let category = required_string(&call.arguments, "category")?;
                 validate_story_architect_card_category(context.stage, &category)?;
                 let title = required_string(&call.arguments, "title")?;
                 let content = required_string(&call.arguments, "content")?;
-                let card = context.state.save_knowledge_card(SaveKnowledgeCard {
+                let card = context.state.save_canon_entry(SaveCanonEntry {
                     id: None,
                     project_id: context.project_id,
                     category: category.to_string(),
@@ -1004,24 +1004,24 @@ async fn execute_call(
             } else {
                 create_proposal(
                     context,
-                    "knowledge_card",
-                    "创建知识卡候选",
+                    "canon_entry",
+                    "新增资料候选",
                     &call.arguments,
                     None,
                 )
             }
         }
-        agent_tools::UPDATE_KNOWLEDGE_CARD | agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD => {
+        agent_tools::UPDATE_CANON_ENTRY | agent_tools::PROPOSE_UPDATE_CANON_ENTRY => {
             let card_id = required_i64(&call.arguments, "card_id")?;
             let card = context
                 .state
-                .get_knowledge_card(context.project_id, card_id)?;
+                .get_canon_entry(context.project_id, card_id)?;
             if is_direct_story_architect_run(context) {
                 let category = required_string(&call.arguments, "category")?;
                 validate_story_architect_card_category(context.stage, &category)?;
                 let title = required_string(&call.arguments, "title")?;
                 let content = required_string(&call.arguments, "content")?;
-                let updated = context.state.save_knowledge_card(SaveKnowledgeCard {
+                let updated = context.state.save_canon_entry(SaveCanonEntry {
                     id: Some(card_id),
                     project_id: context.project_id,
                     category: category.to_string(),
@@ -1041,22 +1041,22 @@ async fn execute_call(
             } else {
                 create_proposal(
                     context,
-                    "knowledge_card_update",
-                    &format!("更新知识卡 #{}", card_id),
+                    "canon_entry_update",
+                    &format!("更新资料 #{}", card_id),
                     &call.arguments,
                     Some(&card.updated_at),
                 )
             }
         }
-        agent_tools::PROPOSE_DELETE_KNOWLEDGE_CARD => {
+        agent_tools::PROPOSE_DELETE_CANON_ENTRY => {
             let card_id = required_i64(&call.arguments, "card_id")?;
             let card = context
                 .state
-                .get_knowledge_card(context.project_id, card_id)?;
+                .get_canon_entry(context.project_id, card_id)?;
             create_proposal(
                 context,
-                "knowledge_card_delete",
-                &format!("删除知识卡 #{}", card_id),
+                "canon_entry_delete",
+                &format!("删除资料 #{}", card_id),
                 &call.arguments,
                 Some(&card.updated_at),
             )
@@ -1104,7 +1104,7 @@ fn validate_story_architect_card_category(stage: &Stage, category: &str) -> AppR
         Ok(())
     } else {
         Err(AppError::Validation(format!(
-            "当前{}阶段不允许创建 {} 类型知识卡；请把内容放入对应阶段",
+            "当前{}阶段不允许写入 {} 类型的资料；请把内容放入对应阶段",
             stage.title(),
             category
         )))
@@ -1253,10 +1253,10 @@ mod tests {
 
         let setting = definitions_for_agent(&agent, &Stage::Setting, false);
         for key in [
-            agent_tools::CREATE_KNOWLEDGE_CARD,
-            agent_tools::UPDATE_KNOWLEDGE_CARD,
-            agent_tools::PROPOSE_KNOWLEDGE_CARD,
-            agent_tools::PROPOSE_UPDATE_KNOWLEDGE_CARD,
+            agent_tools::CREATE_CANON_ENTRY,
+            agent_tools::UPDATE_CANON_ENTRY,
+            agent_tools::PROPOSE_CANON_ENTRY,
+            agent_tools::PROPOSE_UPDATE_CANON_ENTRY,
         ] {
             assert!(setting.iter().any(|definition| definition.key == key));
         }
