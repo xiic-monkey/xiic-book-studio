@@ -799,7 +799,6 @@ export function BookStudioWorkspace() {
   const assistantFeedRef = useRef<HTMLDivElement | null>(null);
   const assistantStickToBottomRef = useRef(true);
   const mainFeedScrollTopRef = useRef<number | null>(null);
-  const loadedHistoryRunIdsRef = useRef<Set<number>>(new Set());
   const assistantPanelRef = useRef<HTMLElement | null>(null);
   const autoFilledReviewArtifactRef = useRef<string | null>(null);
 
@@ -1065,13 +1064,12 @@ export function BookStudioWorkspace() {
       (run) => run.parent_run_id != null && parentIds.has(run.parent_run_id),
     );
     const runIds = [...parentRuns, ...childRuns].map((run) => run.id)
-      .filter((runId) => !loadedHistoryRunIdsRef.current.has(runId));
-    for (const runId of runIds) loadedHistoryRunIdsRef.current.add(runId);
     if (runIds.length === 0) return;
 
     void Promise.all(runIds.map((runId) => api.listRunEvents(runId)))
       .then((eventLists) => {
-        if (!disposed) mergeAssistantRunEvents(eventLists.flat());
+        if (disposed) return;
+        mergeAssistantRunEvents(eventLists.flat());
       })
       .catch(() => {
         // Persisted messages remain available when historical event loading fails.
@@ -1763,6 +1761,9 @@ export function BookStudioWorkspace() {
 
   function openProject(projectId: number | null) {
     activeProjectRequestRef.current = projectId;
+    // 重复点击同一本书时不清空会话时间线：清空后没有重新加载路径，
+    // 历史事件会永久丢失（仅项目真正切换时才重置会话数据）。
+    const projectChanged = projectId !== selectedProjectId;
     setNotice(null);
     setError(null);
     setSelectedProjectId(projectId);
@@ -1785,12 +1786,14 @@ export function BookStudioWorkspace() {
     setAssistantMessages([]);
     setAssistantHistoryCutoff(null);
     setLiveToolEvents([]);
-    setAssistantTimelineEvents([]);
+    if (projectChanged) {
+      setAssistantTimelineEvents([]);
+      setDelegatedRunEvents({});
+    }
     setSelectedSubagentRunId(null);
     setAssistantAdvancedOpen(false);
     setOrchestratorParentRunId(null);
     setOrchestratorCancellationRequested(false);
-    setDelegatedRunEvents({});
     setThinkingRounds([]);
     setChapterDraft("");
     setContextQuery("");
@@ -4517,7 +4520,6 @@ export function BookStudioWorkspace() {
                   onClick={() => {
                     assistantStickToBottomRef.current = true;
                     mainFeedScrollTopRef.current = null;
-                    loadedHistoryRunIdsRef.current = new Set();
                     setAssistantMessages([]);
                     setAssistantHistoryCutoff(Date.now());
                     setInstruction("");
