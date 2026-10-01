@@ -2886,10 +2886,6 @@ export function BookStudioWorkspace() {
     document.querySelector(".chapter-candidate-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function useAssistantPrompt(prompt: string) {
-    setInstruction(prompt);
-  }
-
   async function runAgent(
     stage: Stage = selectedStage,
     sourceArtifactIdOverride?: number | null,
@@ -4542,15 +4538,6 @@ export function BookStudioWorkspace() {
               </div>
             </header>
 
-            <div className="assistant-context-strip">
-              <span role="status" className={busy || orchestratorRunIsActive ? "assistant-status busy" : "assistant-status"}>
-                <span className="assistant-status-dot" />
-                {orchestratorCancellationRequested ? "正在停止" : busy || orchestratorRunIsActive ? "Agent 执行中" : "已就绪"}
-              </span>
-              {selectedChapter && <span className="assistant-context-chip">章节 · {selectedChapter.title}</span>}
-              <span className="assistant-context-chip">{isChapterWorkbench ? `章节状态 · ${chapterFlow?.label ?? "候选稿"}` : `当前阶段 · ${stageLabel(selectedStage)}`}</span>
-            </div>
-
             <div
               ref={assistantFeedRef}
               className={`assistant-chat-feed${selectedSubagentRunId != null ? " assistant-chat-feed-subagent" : ""}`}
@@ -4559,10 +4546,6 @@ export function BookStudioWorkspace() {
                 <article className="assistant-message assistant-message-agent assistant-empty-state">
                   <div className="assistant-message-body">
                     <div className="assistant-message-meta"><strong>Book Agent</strong><span>准备好了</span></div>
-                    <div className="assistant-suggestion-list">
-                      <button type="button" onClick={() => useAssistantPrompt("基于当前设定，给出下一步最值得推进的创作建议")}>下一步建议 <ChevronRight size={12} /></button>
-                      <button type="button" onClick={() => useAssistantPrompt("检查当前内容是否存在角色或时间线矛盾")}>检查连续性 <ChevronRight size={12} /></button>
-                    </div>
                   </div>
                 </article>
               )}
