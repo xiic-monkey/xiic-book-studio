@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-const V2_SCHEMA_VERSION: i64 = 10;
+const V2_SCHEMA_VERSION: i64 = 11;
 
 pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
@@ -66,6 +66,10 @@ pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
         if current < 10 {
             apply_migration(conn, 10, migrate_v10)?;
             current = 10;
+        }
+        if current < 11 {
+            apply_migration(conn, 11, migrate_v11)?;
+            current = 11;
         }
         debug_assert!(V2_SCHEMA_VERSION >= current);
         Ok(())
@@ -144,6 +148,49 @@ fn migrate_v10(conn: &Connection) -> AppResult<()> {
          ON CONFLICT(stage) DO NOTHING",
         params![prompt],
     )?;
+    Ok(())
+}
+
+/// v9 的改名迁移在部分存量库上因版本号被提前占用而从未执行：这里兜底收尾。
+/// 把旧 `knowledge_cards` 表的数据并入 `canon_entries`，修正检索来源标记，然后删除旧表。
+fn migrate_v11(conn: &Connection) -> AppResult<()> {
+    let has_old_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_cards')",
+            [],
+            |row| row.get(0),
+        )?;
+    if has_old_table {
+        // 引用已不存在的 artifact/chapter 时置空，等价 ON DELETE SET NULL，避免外键约束卡住迁移。
+        conn.execute(
+            "INSERT OR IGNORE INTO canon_entries
+                 (id, project_id, category, title, content, status,
+                  source_artifact_id, source_chapter_id, created_at, updated_at)
+             SELECT id, project_id, category, title, content, status,
+                    CASE
+                        WHEN EXISTS(SELECT 1 FROM artifacts WHERE artifacts.id = knowledge_cards.source_artifact_id)
+                        THEN knowledge_cards.source_artifact_id
+                    END,
+                    CASE
+                        WHEN EXISTS(SELECT 1 FROM chapters WHERE chapters.id = knowledge_cards.source_chapter_id)
+                        THEN knowledge_cards.source_chapter_id
+                    END,
+                    created_at, updated_at
+             FROM knowledge_cards",
+            [],
+        )?;
+    }
+    conn.execute(
+        "UPDATE story_search_sources SET source_kind = 'canon_entry' WHERE source_kind = 'knowledge_card'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE story_search_documents SET source_kind = 'canon_entry' WHERE source_kind = 'knowledge_card'",
+        [],
+    )?;
+    if has_old_table {
+        conn.execute("DROP TABLE knowledge_cards", [])?;
+    }
     Ok(())
 }
 

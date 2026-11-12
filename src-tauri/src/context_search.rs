@@ -77,6 +77,7 @@ struct RerankExecutionContext<'a> {
     source_material: &'a str,
     settings: &'a AiSettings,
     api_key: &'a str,
+    system_prompt: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +190,7 @@ pub async fn prepare_tool_context(
             source_material,
             settings: &rerank_settings,
             api_key: &rerank_api_key,
+            system_prompt: &rerank_agent.system_prompt,
         },
         &snippets,
     )
@@ -249,6 +251,7 @@ pub async fn rerank_story_context(
     match rerank_candidates_with_model(
         &settings,
         &api_key,
+        &rerank_agent.system_prompt,
         input.stage.as_ref(),
         input.task_context.as_deref().unwrap_or_default(),
         &rerank_candidates,
@@ -289,22 +292,12 @@ fn build_planner_prompt(stage: &Stage, source_material: &str, ledger_catalog: &[
 
 你正在决定是否调用 App 的 `search_story` 工具。只为确实依赖前文状态的对象发起查询；当前章首次出现且不依赖历史的内容不要搜索。最多 {MAX_AGENT_SEARCHES} 次。试读正文超过 1500 字且多次使用前文人物、物件或事件时，通常需要 3-6 个不同查询，不能因为状态账本目录存在就省略正文搜索。
 
-# 搜索规则
-1. `query` 使用 2-24 个字的具体名称或短语，例如人物名、物件名、事件名、地点名、承诺对象；不要写“相关历史”“前文伏笔”之类泛词。
-2. `evidence_quote` 必须是下方输入中连续出现的 6-100 个字原文，且能证明为什么需要回查。不得改写、拼接或使用省略号。
-3. `reason` 说明要核对什么状态，例如角色知情边界、入场路径、物件归属/消耗/封印、伤势、承诺是否兑现、旧事件的实际结果。
-4. 试读阶段宁可多查真正的旧引用，也不要只复述章纲。修订阶段必须以被修订正文为主要搜索来源。需要核对原子状态时另行使用 `search_story_facts`，不要用事实检索替代正文检索。
-5. 不得搜索未来剧情，也不得把候选稿自身当成历史事实。
-
 # 已有状态账本实体目录
 目录只用于提醒名称，不代表当前状态；状态仍由 App 查询结果提供。
 {catalog}
 
 # 当前输入
-{source_material}
-
-# 输出
-只输出 JSON 对象：{{"searches":[{{"query":"...","reason":"...","evidence_quote":"..."}}]}}。没有需要回查的旧引用时返回 {{"searches":[]}}。"#,
+{source_material}"#,
     )
 }
 
@@ -531,6 +524,7 @@ async fn rerank_agent_snippets(
     match rerank_candidates_with_model(
         context.settings,
         context.api_key,
+        context.system_prompt,
         Some(context.stage),
         context.source_material,
         &candidates,
@@ -606,6 +600,7 @@ fn candidates_for_manual_rerank(
 async fn rerank_candidates_with_model(
     settings: &AiSettings,
     api_key: &str,
+    agent_system_prompt: &str,
     stage: Option<&Stage>,
     task_context: &str,
     candidates: &[RerankCandidate],
@@ -614,12 +609,24 @@ async fn rerank_candidates_with_model(
     let raw = ai::complete_json_chat(
         settings,
         api_key,
-        "你是小说历史上下文的证据筛选器。你不能搜索、不能编造事实、不能改写候选内容；只能从候选编号中选择与当前任务直接相关的原文证据。",
+        &resolve_rerank_system_prompt(agent_system_prompt),
         &prompt,
         0.0,
     )
     .await?;
     parse_rerank_plan(&raw, candidates.len())
+}
+
+/// 筛选 Agent 的 system prompt 以 agent 记录为准（即设置界面可编辑的 .md 内容）；
+/// 记录缺失或为空时回退到编译期内置模板，避免人格与契约静默失联。
+fn resolve_rerank_system_prompt(agent_system_prompt: &str) -> String {
+    let trimmed = agent_system_prompt.trim();
+    if trimmed.is_empty() {
+        return crate::prompt_templates::require_default_prompt(RERANK_STAGE)
+            .unwrap_or_default()
+            .to_string();
+    }
+    trimmed.to_string()
 }
 
 fn build_reranker_prompt(
@@ -650,7 +657,7 @@ fn build_reranker_prompt(
         .join("\n\n");
 
     format!(
-        "# 任务\n当前阶段：{stage_label}\n只保留能够帮助当前任务核对历史人物、物件、地点、事件、状态或承诺的候选。删除明显无关、只共享字面词但没有事实关联、或与已选证据重复的候选。\n\n# 当前材料\n{task_context}\n\n# 候选证据\n{rendered_candidates}\n\n# 输出约束\n只输出 JSON 对象：{{\"selections\":[{{\"candidate_id\":1,\"category\":\"core|supporting|conflict\",\"reason\":\"不超过80字的筛选理由\"}}]}}。\n- `candidate_id` 必须来自候选证据，不能新增。\n- `core` 表示后续 Agent 应直接使用的关键历史证据；`supporting` 表示保守保留的辅助证据；`conflict` 表示候选证明当前材料可能与历史冲突。\n- 没有相关候选时返回 `{{\"selections\":[]}}`。\n- 不得输出摘要、改写后的原文、未在候选中出现的事实或来源。"
+        "# 当前阶段\n{stage_label}\n\n# 当前材料\n{task_context}\n\n# 候选证据\n{rendered_candidates}"
     )
 }
 
@@ -1045,6 +1052,18 @@ mod tests {
     use super::*;
     use crate::models::{NewChapter, NewProject};
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn rerank_system_prompt_prefers_agent_record_and_falls_back_to_template() {
+        assert_eq!(
+            resolve_rerank_system_prompt("  自定义筛选人格  "),
+            "自定义筛选人格"
+        );
+        assert_eq!(
+            resolve_rerank_system_prompt("   "),
+            crate::prompt_templates::require_default_prompt(RERANK_STAGE).unwrap()
+        );
+    }
 
     #[test]
     fn planner_queries_must_be_grounded_in_source() {

@@ -24,6 +24,14 @@ pub const PROPOSE_CANON_ENTRY: &str = "propose_canon_entry";
 pub const PROPOSE_UPDATE_CANON_ENTRY: &str = "propose_update_canon_entry";
 pub const PROPOSE_DELETE_CANON_ENTRY: &str = "propose_delete_canon_entry";
 pub const PROPOSE_FORESHADOWING: &str = "propose_foreshadowing";
+
+// 知识卡体系更名 canon entry（d5acb24）之前的旧工具键。不再下发给模型，
+// 但仍接受模型吐出的这些键并路由到现行实现，避免旧提示词/历史上下文触发"未注册的工具"。
+pub const LEGACY_CREATE_KNOWLEDGE_CARD: &str = "create_knowledge_card";
+pub const LEGACY_UPDATE_KNOWLEDGE_CARD: &str = "update_knowledge_card";
+pub const LEGACY_PROPOSE_KNOWLEDGE_CARD: &str = "propose_knowledge_card";
+pub const LEGACY_PROPOSE_UPDATE_KNOWLEDGE_CARD: &str = "propose_update_knowledge_card";
+pub const LEGACY_PROPOSE_DELETE_KNOWLEDGE_CARD: &str = "propose_delete_knowledge_card";
 pub const REPLACE_TEXT: &str = "replace_text";
 pub const INSERT_AFTER: &str = "insert_after";
 pub const DELETE_RANGE: &str = "delete_range";

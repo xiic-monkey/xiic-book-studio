@@ -282,4 +282,55 @@ mod tests {
         assert!(text.contains("发育修炼章"));
         assert!(text.contains("不要连续堆谜团而不给进度"));
     }
+
+    /// section() 对标题做整行精确匹配，段落缺失会被静默丢弃；此守卫测试
+    /// 确保每个内置 skill 模板始终覆盖 Always 与全部六个阶段。
+    #[test]
+    fn every_skill_template_covers_all_stages() {
+        let templates = [
+            ("general_serialized", GENERAL_SERIALIZED_FALLBACK),
+            ("urban_supernatural", URBAN_SUPERNATURAL_FALLBACK),
+            ("mystery", MYSTERY_FALLBACK),
+            ("xianxia_power_fantasy", XIANXIA_POWER_FANTASY_FALLBACK),
+            ("continuity_and_agency", CONTINUITY_AND_AGENCY_FALLBACK),
+        ];
+        let stages = [
+            "setting",
+            "outline",
+            "characters",
+            "draft",
+            "review",
+            "revision",
+        ];
+        for (key, template) in templates {
+            assert!(
+                !section(template, "Always").trim().is_empty(),
+                "skill {key} 缺少 Always 段"
+            );
+            for stage in stages {
+                assert!(
+                    !section(template, &format!("Stage: {stage}"))
+                        .trim()
+                        .is_empty(),
+                    "skill {key} 缺少 Stage: {stage} 段（会被静默丢弃）"
+                );
+            }
+        }
+    }
+
+    /// craft skill 面向全部题材，规则只能陈述在状态类别层面；具象题材
+    /// 道具词汇只允许出现在 genres/ 下的题材 skill 里。
+    #[test]
+    fn craft_skill_stays_free_of_genre_specific_props() {
+        let genre_props = [
+            "信物", "封印", "阵法", "丹炉", "丹药", "禁制", "灵物", "炼化", "血脉", "修炼",
+            "炼药", "令牌", "修为",
+        ];
+        for prop in genre_props {
+            assert!(
+                !CONTINUITY_AND_AGENCY_FALLBACK.contains(prop),
+                "craft skill 出现题材道具词汇: {prop}"
+            );
+        }
+    }
 }

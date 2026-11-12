@@ -245,33 +245,7 @@ fn validate_candidate(artifact: &Artifact, project_id: i64) -> AppResult<()> {
 
 fn extraction_prompt(title: &str, content: &str) -> String {
     format!(
-        r#"# 任务
-从以下已通过正文提取可供后续章节核对的明确状态变化。账本是派生索引，不是新设定；没有可靠状态就输出 []。
-
-# 只允许记录
-1. 具名物品或资源：持有、获得、消耗、遗失、耗尽。
-2. 具名门、阵法、禁制、令牌、药物等：开启、封闭、激活、失效、受损、可用。
-3. 具名伤势或异常状态：存在、痊愈、解除、持续。
-
-# 规则
-1. 实体必须是正文中明确出现的具名对象；不要使用“令牌”“丹药”“伤势”“此物”这类泛称。
-2. entity_key 只能是实体名称的标准化写法：去掉空白与标点，不加别名、解释或编号推断。
-3. evidence_quote 必须是正文连续出现的 8-100 个字符原文。
-4. 不记录角色猜测、隐情、未来计划、抽象规则或未确认传闻。
-5. 每个实体只写本章真正改变或明确确认的状态；不确定就省略。
-6. 只输出 JSON 数组，不要 Markdown。
-
-# JSON
-{{
-  "entity_kind": "item" | "resource" | "barrier" | "condition",
-  "entity_key": "标准化实体名",
-  "entity_label": "正文中的实体名",
-  "state_kind": "possession" | "availability" | "condition",
-  "state_value": "held" | "consumed" | "lost" | "depleted" | "usable" | "sealed" | "active" | "inactive" | "damaged" | "present" | "recovered" | "cleared" | "ongoing",
-  "evidence_quote": "正文逐字引文"
-}}
-
-# 章节
+        r#"# 章节
 {title}
 
 # 已通过正文
@@ -305,17 +279,7 @@ async fn extract_candidate_claims(
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        r#"# 任务
-检查候选稿是否把下列已通过状态中的对象当作仍可持有、可用或已无伤。只提取“直接引用旧对象但没有写出获得、修复、解封、疗伤等状态变化动作”的句子。
-
-# 规则
-1. entity_key 必须逐字使用状态清单中的 entity_key；没有精确命中的名称不要输出。
-2. claim_mode 只能是 reference 或 transition。正文明确写出获得、修复、解封、疗伤等动作时填 transition，且不作为冲突候选。
-3. required_state：possession 只用 held；availability 只用 usable；condition 只用 recovered。
-4. evidence_quote 必须是候选稿连续出现的 8-100 个字符原文。
-5. 只输出 JSON 数组，不要 Markdown。
-
-# 已通过状态清单
+        r#"# 已通过状态清单
 {states}
 
 # 候选稿

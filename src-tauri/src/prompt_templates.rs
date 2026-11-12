@@ -73,7 +73,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_agent_registry_has_fifteen_unique_keys() {
+    fn builtin_agent_registry_has_sixteen_unique_keys() {
         let keys = BUILTIN_AGENT_KEYS
             .iter()
             .collect::<std::collections::HashSet<_>>();
@@ -107,14 +107,97 @@ mod tests {
         }
     }
 
+    /// 边界规则：.md 模板 = 人格 + 行为准则 + 输出契约；Rust 侧 user prompt
+    /// 只注入运行时数据。下表为每个内置 Agent 在 .md 中的契约锚点。
     #[test]
-    fn stage_output_contracts_live_in_runtime_prompts() {
+    fn builtin_prompt_contracts_live_in_prompt_templates() {
+        let anchors: &[(&str, &[&str])] = &[
+            ("orchestrator", &["只输出一个 JSON 对象", "kind"]),
+            ("story_architect", &["Canon"]),
+            ("draft", &["只输出正文", "资料汇总"]),
+            (
+                "review",
+                &[
+                    "只输出 JSON 数组",
+                    "issue_type",
+                    "evidence_quote",
+                    "severity",
+                ],
+            ),
+            (
+                "revision",
+                &["输出修订后的完整章节正文", "修订不可突破的事实边界"],
+            ),
+            ("adoption", &["只返回一个 JSON 对象", "evidence_quote"]),
+            ("story_index", &["entities", "events", "facts"]),
+            ("canon_align", &["updates", "archive_ids", "writing_notes"]),
+            (
+                "chapter_memory",
+                &["state_changes", "knowledge_changes", "evidence_quote"],
+            ),
+            (
+                "continuity_ledger",
+                &["entity_kind", "state_value", "evidence_quote"],
+            ),
+            (
+                "continuity_check",
+                &["claim_mode", "required_state", "evidence_quote"],
+            ),
+            ("context_search_plan", &["searches", "evidence_quote"]),
+            (
+                "context_search_rerank",
+                &["selections", "candidate_id", "core"],
+            ),
+            (
+                "continuity_review",
+                &["issues", "issue_type", "evidence_quote", "同场景衔接"],
+            ),
+            (
+                "chapter_split_plan",
+                &["suggested_current_title", "next_chapter_instruction"],
+            ),
+            ("artifact_revision", &["只输出", "替换后的新片段"]),
+        ];
+        for (key, fragments) in anchors {
+            let prompt = require_default_prompt(key).unwrap();
+            for fragment in *fragments {
+                assert!(
+                    prompt.contains(fragment),
+                    "agent {key} prompt 模板缺少契约片段: {fragment}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stage_output_contracts_live_in_prompt_templates() {
         let draft = require_default_prompt("draft").unwrap();
         let revision = require_default_prompt("revision").unwrap();
         let artifact_revision = require_default_prompt("artifact_revision").unwrap();
 
-        assert!(!draft.contains("只输出章节正文"));
-        assert!(!revision.contains("只输出修订后的完整正文"));
-        assert!(!artifact_revision.contains("只输出替换后的新片段正文"));
+        assert!(draft.contains("只输出正文"));
+        assert!(revision.contains("输出修订后的完整章节正文"));
+        assert!(artifact_revision.contains("只输出"));
+        // 运行时 user prompt 不再重复输出契约。
+        assert!(!draft.contains("本章柔性任务契约"));
+    }
+
+    /// 通用层提示词面向全部题材服务，规则只能陈述在状态类别层面；
+    /// 具象题材道具词汇只允许出现在题材 skill 或运行时数据里。
+    #[test]
+    fn builtin_prompts_stay_free_of_genre_specific_props() {
+        let genre_props = [
+            "信物", "封印", "阵法", "丹炉", "丹药", "禁制", "灵物", "炼化", "血脉", "修炼",
+            "炼药", "令牌", "修为",
+        ];
+        for key in BUILTIN_AGENT_KEYS {
+            let prompt = require_default_prompt(key).unwrap();
+            for prop in genre_props {
+                assert!(
+                    !prompt.contains(prop),
+                    "agent {key} 的内置提示词出现题材道具词汇: {prop}"
+                );
+            }
+        }
     }
 }

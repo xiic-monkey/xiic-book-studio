@@ -145,7 +145,7 @@ pub async fn prepare_tools(
                 None,
             );
         }
-        let (calls, protocol, narrative) = await_run_result(
+        let (mut calls, protocol, narrative) = await_run_result(
             context.state,
             context.run_id,
             plan_calls(
@@ -160,6 +160,10 @@ pub async fn prepare_tools(
             ),
         )
         .await?;
+        // 旧工具键统一改写为现行键：去重、校验、执行与落库都只见到现行实现。
+        for call in &mut calls {
+            call.tool_key = canonical_tool_key(&call.tool_key).to_string();
+        }
         if let Some(run_id) = context.run_id {
             // 优先记录模型本轮的真实决策/推理文本；供应商没给时退回占位说明。
             let fallback = if round == 0 {
@@ -527,6 +531,18 @@ async fn plan_calls(
             }
             Err(ai::ToolPlanningError::Other(error)) => Err(error),
         },
+    }
+}
+
+/// 知识卡更名 canon entry 前的旧工具键，一律路由到现行实现。
+fn canonical_tool_key(tool_key: &str) -> &str {
+    match tool_key {
+        agent_tools::LEGACY_CREATE_KNOWLEDGE_CARD => agent_tools::CREATE_CANON_ENTRY,
+        agent_tools::LEGACY_UPDATE_KNOWLEDGE_CARD => agent_tools::UPDATE_CANON_ENTRY,
+        agent_tools::LEGACY_PROPOSE_KNOWLEDGE_CARD => agent_tools::PROPOSE_CANON_ENTRY,
+        agent_tools::LEGACY_PROPOSE_UPDATE_KNOWLEDGE_CARD => agent_tools::PROPOSE_UPDATE_CANON_ENTRY,
+        agent_tools::LEGACY_PROPOSE_DELETE_KNOWLEDGE_CARD => agent_tools::PROPOSE_DELETE_CANON_ENTRY,
+        other => other,
     }
 }
 

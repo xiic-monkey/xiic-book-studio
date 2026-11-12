@@ -70,9 +70,6 @@ struct ChapterTaskContract {
     must_avoid_threads: Vec<String>,
 }
 
-const REVISION_FACT_BOUNDARY: &str = "这是最高优先级的修订约束。源稿、已批准设定/大纲/角色、已批准前章、试读报告和人工指令共同构成唯一事实来源。除非其中已经明确存在，否则不得新增过去发生过的事件、隐藏物件/证据、人物、地点、组织、规则、交易习惯、制度条款、关系或角色已知信息。不要为了制造更刺激的结尾补写‘原来早有’的物件、记录、目击、计划或外部安排。需要强化结尾时，只能落稳或推进已出现的结果、决定、压力、时限、伤势、资源、关系、场景或主角已经开始的动作。若事实来源不足以支持某项建议，宁可保留原有选择或删去该建议，不得编造补丁。";
-const REVIEW_FACT_BOUNDARY: &str = "审校建议也受事实边界约束：只能引用候选稿、已批准资料和已批准前章已经明确的事实。若候选稿凭空加入过去事件、隐藏物件/证据、人物、地点、组织、规则、交易习惯、制度条款、关系或角色已知信息，必须标为“事实越界”，severity 为 major，并指出它不在何处已有来源。建议只能删减、重排、强化或继续使用已有事实；不得建议编造石片、旧记录、目击、临时交易窗口、既有计划、额外物件或新规则来修问题。";
-
 fn review_evidence_corpus(
     state: &AppState,
     project_id: i64,
@@ -1326,7 +1323,7 @@ pub async fn revise_artifact_span_with_ai(
 
     let system_prompt = &revision_agent.system_prompt;
     let user_prompt = format!(
-        "# 当前产物阶段\n{}\n\n# 全文上下文（仅供你保持风格、信息和连续性，不要改未指定部分）\n{}{}\n\n# 需要局部改写的原文片段\n{}\n\n# 局部修订要求\n{}\n\n# 输出要求\n1. 只输出“替换后的新片段”本身，不要输出别的。\n2. 只改这段，未被要求修改的信息、事实、称呼、物件状态、上下文关系要尽量保持连续。\n3. 若要求与上下文冲突，优先做最小必要修改，不扩展新设定。\n4. 新片段必须能直接替换原文片段。",
+        "# 当前产物阶段\n{}\n\n# 全文上下文（仅供你保持风格、信息和连续性，不要改未指定部分）\n{}{}\n\n# 需要局部改写的原文片段\n{}\n\n# 局部修订要求\n{}",
         stage_label(&source.stage),
         source.content,
         tool_context
@@ -1510,6 +1507,10 @@ pub async fn review_project_continuity(
 
     let mut context = project_context(&detail.project);
     append_approved_context(state, input.project_id, &mut context)?;
+    let method_context = continuity_review_method_context(state, &detail.project, &review_agent)?;
+    if !method_context.trim().is_empty() {
+        context.push_str(&method_context);
+    }
     if let Some(candidate) = candidate_by_chapter.values().next() {
         if let Ok(ledger_report) = continuity_ledger::check_artifact_continuity(
             state,
@@ -1527,10 +1528,7 @@ pub async fn review_project_continuity(
             }
         }
     }
-    let prompt = format!(
-        "{context}\n\n# 审校任务\n你是连载小说总编，请检查以下连续章节是否具备可追读的一致性和衔接性。重点检查：\n1. 角色口吻、动机、能力、已知信息是否前后一致\n2. 上一章钩子是否在下一章被有效承接\n3. 物件、地点、时间、规则是否自洽\n4. 节奏是否出现断层，是否像不同人拼接出来的\n5. 多章是否持续兑现题材卖点，而不是每章重置气氛\n6. 若相邻两章明显属于同一场景、同一时段或同一冲突的直接续接，检查对白语气、情绪张力、追逐/伤势/门禁/站位等即时状态是否自然延续\n\n# 候选稿事实边界（审批前硬审计）\n若某章标注为“候选稿，尚未人工通过”，先把已批准设定、角色、大纲和此前已通过正文视为唯一事实来源，再审候选稿。不能因为候选稿写得顺、情绪够强或有更好看的场面，就把候选稿新增的内容默认视为有效。\n- 必须逐项核对候选稿是否偷换既有规则的触发条件、作用对象、效果、代价、结算时点或可重复性。\n- 必须核对人物知道什么、为何到场、已经发生过什么；不得把未建立的交易、调查、目击、计划、旧账、组织、地点、物件或关系补写成“原来早有”。\n- 必须核对物件、资源、伤势、禁制、门、令牌、药物和交易余额的状态；已耗尽、受损、未获得、未支付或未确认的内容不能在候选稿中直接可用或变成既成事实。\n- 候选稿可以出现新的现场细节和自然衍生动作，但凡新增内容会改变主角能力、资源、风险、人物动机、世界规则或下一步选择，必须能在已批准资料或前章正文中找到明确来源。找不到来源就是“事实越界”，severity 必须为 major。\n- 事实越界的 suggestion 只能要求删除、降为未确认痕迹、改回已有事实，或补回已有动作与过渡；不得建议再发明一条新规则去解释它。\n- 这条事实审计优先级高于文笔、节奏和爽点建议。\n\n# 同场景衔接规则\n- 这是一条软检查，不是强制要求每次跨章都连续同场景。\n- 若作者显然已经切场景、切视角、切主线，或存在合理时间跳跃，不要硬判问题。\n- 只有当两章看起来是直接接续同一场面时，才检查对白、氛围和即时状态是否接得上。\n- 若只是承接略生硬、气氛突然变调、人物刚才还在对峙下一章却像重开一幕，severity 优先给 minor 或 moderate。\n- 只有出现明确硬伤，例如伤势、位置、门是否打开、谁听见了什么、谁正在追谁等即时事实自相矛盾时，才可以给 major。\n- 遇到这类问题时，issue_type 优先写“同场景衔接”或“即时状态延续”。\n\n# 输出协议\n只输出一个 JSON 对象，不要 Markdown、代码围栏或解释：{{\"issues\":[...]}}。没有真实、可引用的问题时必须返回 {{\"issues\":[]}}，不要为了满足数量制造问题。`issues` 的值必须始终是问题对象数组，不是问题数量；发现两条问题时也必须输出两个对象，绝不能输出 `{{\"issues\":2}}` 或其他数字。每个 issue 必须包含 issue_type、severity、chapters、reason、suggestion、evidence_quote；severity 只能是 minor、moderate、major。evidence_quote 必须是下面章节正文数据中连续出现的 8-80 个字原文，用来证明问题；不能引用本提示词或自行改写。\n\n# 连续章节\n{}\n",
-        chapter_blocks.join("\n")
-    );
+    let prompt = format!("{context}\n\n# 连续章节\n{}\n", chapter_blocks.join("\n"));
     let run_input = format!("# continuity-cache-key: {}\n\n{}", cache_key, prompt);
 
     let started = Instant::now();
@@ -1700,10 +1698,6 @@ pub async fn generate_chapter_split_plan(
             ));
         }
     }
-
-    prompt.push_str(
-        "\n\n# 任务\n你是长篇连载策划编辑，不负责润色正文，只负责把超载章节拆成更可用的两章执行方案。目标不是把内容越拆越多，而是把当前候选稿里最影响读者消化的负载拆开，让当前章和下一章各自只承担一个更清晰的章节功能。\n\n规则：\n1. 优先沿用现有设定、大纲、角色和已批准章节，不要为了拆章新增新体系、新人物职责、新设定。\n2. 当前章要保留最能兑现本章标题/任务的一条主动作线；其余过密信息移到下一章。\n3. 若上一章压力仍在，当前章结尾必须把压力接住，而不是凭空重开。\n4. 下一章开头必须承接当前章章末状态，不能像重置场景。\n5. 只做最小必要拆分；如果原稿只需要减法，也允许把“下一章”写成较窄的承接任务。\n6. 输出必须具体可执行，避免空泛词，如“加强节奏”“增加冲突”。\n\n只输出 JSON 对象，不要解释，不要 Markdown。字段必须齐全：\n- suggested_current_title: string\n- suggested_next_title: string\n- rationale: string\n- current_chapter_mission: string\n- next_chapter_mission: string\n- keep_in_current: string[]\n- move_to_next: string[]\n- carryover_closing_beats: string[]\n- next_chapter_opening_beats: string[]\n- revision_prompt_current: string\n- next_chapter_instruction: string\n",
-    );
 
     let raw = ai::complete_json_chat(
         &settings,
@@ -2065,7 +2059,9 @@ fn build_prompt_internal(
         Stage::Setting => prompt.push_str("\n\n# 任务\n生成或重写本书的核心设定。必须包含：一句话卖点、核心规则、主要禁忌、风格标尺、可持续冲突来源。按设定复杂度写足，不用为了压缩字数省掉必要边界；也不要写百科式世界史。"),
         Stage::Outline => prompt.push_str(&outline_task_for_prompt(state, project_id)?),
         Stage::Characters => prompt.push_str("\n\n# 任务\n基于已批准设定和大纲整理角色信息；每个主要角色必须包含：欲望、恐惧、底线、说话方式、首次登场功能、与主角的冲突/互补。按角色复杂度写足，减少履历堆砌。"),
-        Stage::Draft => prompt.push_str("\n\n# 任务\n为当前章节写完整正文。只输出正文，不要写标题、分析或说明。优先场景、动作、对白和细节推进；少解释设定，少抽象总结，避免连续使用“像……一样”的模板化比喻。开篇应让读者逐渐或立即看清本章正在处理什么，以及人物为何选择现在行动；章末完成本章功能并形成自然延续，可以落在结果、决定、信息改写、行动启动、关系新平衡或情绪余韵，不强制危险和反转。严禁把当前章节写成资料汇总、线索清单或设定说明会。若你发现前文有很多待回收线索，本章最多处理其中 1-2 条，其余保留到后续章节。章节可按场景、对白、情绪承接和冲突解决的实际需要写长；只有在重复解释、重复确认或多个独立章节功能互相争抢篇幅时，才应删减或拆章。\n\n把这一章理解成一次主要推进，不是一次世界观清仓：优先完成 1 个明确章节功能，例如修炼小成、炼药试错、开门、核验、跟踪、谈判、藏证据、确认身份或布局下一场。新名词、新地点和新人物功能只在完成本章任务确有必要时引入，不按固定数量机械限制。若故事自然冒出更多谜底或设定，只保留最能改变主角下一步选择的一条，其余只写成物证、异常、疑点或未确认线索。不要用“第一/第二/第三”总结真相，不要连续写“不是……而是……”解释机制。\n\n若本章动用了旧能力、旧物件、旧血脉、旧令牌或旧资源做比前文更强的新动作，必须同时满足两件事：1）明确这仍然基于前文已出现的功能，或来自同源外物/一次性触发，不是主角无铺垫永久升级；2）当章立刻兑现更重代价、暴露或失控风险。若做不到，就降回感知、开门、试探、逼退、换取片段信息等较窄用途。"),
+        // Draft / Review / Revision 的输出契约与阶段任务全部位于 agent 的
+        // system prompt（prompts/v2/*.md）；user prompt 只承载运行时数据。
+        Stage::Draft => {}
         Stage::Review => {
             let chapter_id = chapter_id.ok_or_else(|| {
                 AppError::Validation("写作、试读、修订阶段必须选择章节".to_string())
@@ -2086,11 +2082,10 @@ fn build_prompt_internal(
                     .to_string()
             };
             prompt.push_str(&format!(
-                "\n\n# 待试读章节\n{}\n{}\n\n# 本地质量信号\n{}\n\n# 章节任务兑现审校\n本章柔性任务契约和章节任务卡是本次审校的语义合同。请先判断候选稿是否实质执行了其中的“本章目标、主要阻力、必须发生的变化、离开状态”：关键行动、选择或结果缺席，被其他事件替代，或只被一句话提及而没有改变局面时，标出 issue_type 为“章节任务未兑现”。只有主要章节功能整体缺席时才给 major；结尾形式与建议不同但已经完成等效状态变化，不算问题。允许同义表达、等效行动、合理场景改写和不同结尾类型；绝不要求照抄章节标题、人物名、资源名或任务卡的字面词汇。\n\n# 审校事实边界\n{}\n建议只能删减、重排、强化候选稿已有动作，或继续使用已批准资料中明确存在的事实。不要建议增加新人物、新物件、新地点、新规则、临时安排或过去事件；如果某个问题只能靠新增事实解决，直接标为事实越界，保留问题但不要给出该新增修法。\n\n# 输出格式\n请只输出 JSON 数组，列出所有真实、可引用的问题，按影响排序，最多 8 条；没有问题时返回 []，不要为了满足数量制造问题。每项包含 issue_type、severity、location、reason、suggestion、evidence_quote、action_evidence_quote 七个字段，不要额外解释。evidence_quote 必须是候选稿、已批准资料或已通过前章中连续出现的 8-80 个字原文，用来证明问题。action_evidence_quote 是可选字段：建议需要强化或继续使用既有动作时，提供其中连续出现的 8-80 个字原文；建议只是删减、合并或重排已有文字时可以留空。若建议需要新增事实、物件、人物、地点、规则、安排或过去事件，就不要给出该建议。severity 只能是 minor、moderate、major。优先覆盖本地质量信号暴露出的真实阅读风险，但不要机械复述指标名。",
+                "\n\n# 待试读章节\n{}\n{}\n\n# 本地质量信号\n{}",
                 draft.content,
                 DATA_BLOCK_BOUNDARY,
-                quality_context,
-                REVIEW_FACT_BOUNDARY
+                quality_context
             ));
         }
         Stage::Revision => {
@@ -2120,7 +2115,7 @@ fn build_prompt_internal(
                 .map(|artifact| artifact.content.as_str())
                 .unwrap_or("尚无已批准试读报告；请严格依据人工反馈、本地质量信号和连续性修复卡修订。");
             prompt.push_str(&format!(
-                "\n\n# 原稿\n{}\n{}\n\n# 已批准试读报告\n{}\n{}\n\n# 本地质量信号\n{}\n\n# 修订约束卡\n{}\n\n# 任务\n输出修订后的完整章节正文，不要解释修改。必须优先解决 major/moderate 问题；保留有效氛围和题材细节；删掉解释感、模板化比喻和重复句式。若本地质量信号显示开篇驱动力、结尾功能、段落重量、解释感或信息反转偏密存在问题，必须在正文里实质修正；但不能为了指标把成长、关系、恢复或过渡章强改成冲突章。若本地质量信号显示叙事失焦，保留必要场景、对白和情绪承接，只删重复解释、重复确认或无后果过渡。\n\n修订时如果发现原稿塞入了过多新名词、新规则、新人物职责、多层真相或多层反转，你必须主动减法：只保留最能改变主角选择的一条核心信息，其余改成疑点、物证、未确认线索或后续章再验证。不要用“第一/第二/第三”总结真相，不要连续写“不是……而是……”解释机制；把说明改成场景阻碍、对白试探、物件状态变化或具体代价。只有当人物互动确实承担本章变化时才补对白，不为对白密度硬塞对话。结尾应按本章模式完成结果、决定、信息改写、行动启动、关系新平衡或情绪余韵；不得为了更刺激凭空加入外部事件、时限、人物或威胁。若旧能力、旧物件、旧血脉或旧资源在本章被写出了明显超出前文的新用途，优先降效果、补外部来源或改成一次性触发，并把代价写得比收益更具体，不能把一次性爆发写成无铺垫永久升级。",
+                "\n\n# 原稿\n{}\n{}\n\n# 已批准试读报告\n{}\n{}\n\n# 本地质量信号\n{}\n\n# 修订约束卡\n{}",
                 source.content,
                 DATA_BLOCK_BOUNDARY,
                 review_content,
@@ -2128,7 +2123,6 @@ fn build_prompt_internal(
                 quality_context,
                 revision_contract
             ));
-            prompt.push_str("\n\n# 连续性优先级\n修订不是润色。若以下任一类问题存在，必须先改结构再改句子：\n1. 角色已知信息断点：旧角色不能突然知道上一章没有给出的秘密；若必须知道，正文必须写出他/她刚刚获得该信息的动作、代价或路径。\n2. 角色动机断点：上一章为资源、排名、仇怨、交易而行动的人，本章不能无说明变成守门、旁观或单纯推动剧情的工具人。\n3. 物件/禁制状态断点：令牌、门、阵、伤势、药力、封锁若上一章有状态变化，本章必须交代复原、重新激活、持续生效或失效原因。\n4. 主角收益断点：探索/布局章必须让主角带走一个能用的小收益或明确避祸路线；只知道更多秘密不算可用收益。\n若原稿无法同时修好这些问题，允许重写场景顺序、删掉角色提前入场、推迟部分秘密揭示。");
             prompt.push_str("\n\n修订时必须保留并兑现上面的“本章柔性任务契约”。如果原稿没有完成目标状态变化，应先修因果与人物选择；不要为了贴合模板强行重排成固定场景数或固定转折位置。");
         }
     }
@@ -2140,12 +2134,6 @@ fn build_prompt_internal(
                 instruction.trim()
             ));
         }
-    }
-
-    if matches!(stage, Stage::Revision) {
-        prompt.push_str(&format!(
-            "\n\n# 修订不可突破的事实边界\n{REVISION_FACT_BOUNDARY}"
-        ));
     }
 
     Ok(enforce_workflow_prompt_budget(prompt))
@@ -2281,6 +2269,24 @@ fn compact_prompt_section(section: &str, target_chars: usize) -> String {
             .skip(count.saturating_sub(tail_chars))
             .collect::<String>()
     )
+}
+
+/// 裸取路径的 Agent 不会自动注入 Skill。连续性审校需要两套判据：
+/// 题材 Skill 回答"这一类书该持续兑现什么"，craft Skill 回答"连续性硬伤怎么判 severity"。
+/// 两者都按 Stage: review 切片，只注入审校阶段需要的规则。
+fn continuity_review_method_context(
+    state: &AppState,
+    project: &Project,
+    agent: &Agent,
+) -> AppResult<String> {
+    let mut context = render_project_genre_skill(state, project, &Stage::Review)?;
+    context.push_str(&render_supporting_skills_for_agent(
+        state,
+        project,
+        &Stage::Review,
+        Some(&agent.allowed_skill_keys),
+    )?);
+    Ok(context)
 }
 
 fn render_project_genre_skill(
@@ -4891,17 +4897,17 @@ mod tests {
     }
 
     #[test]
-    fn revision_fact_boundary_forbids_invented_evidence() {
-        assert!(REVISION_FACT_BOUNDARY.contains("隐藏物件/证据"));
-        assert!(REVISION_FACT_BOUNDARY.contains("原来早有"));
-        assert!(REVISION_FACT_BOUNDARY.contains("不得编造补丁"));
-    }
+    fn fact_boundaries_live_in_stage_prompt_templates() {
+        let revision = crate::prompt_templates::require_default_prompt("revision").unwrap();
+        assert!(revision.contains("隐藏物件/证据"));
+        assert!(revision.contains("原来早有"));
+        assert!(revision.contains("不得编造补丁"));
+        assert!(revision.contains("# 修订不可突破的事实边界"));
 
-    #[test]
-    fn review_fact_boundary_requires_major_issue_for_invented_history() {
-        assert!(REVIEW_FACT_BOUNDARY.contains("事实越界"));
-        assert!(REVIEW_FACT_BOUNDARY.contains("severity 为 major"));
-        assert!(REVIEW_FACT_BOUNDARY.contains("不得建议编造"));
+        let review = crate::prompt_templates::require_default_prompt("review").unwrap();
+        assert!(review.contains("事实越界"));
+        assert!(review.contains("severity 为 major"));
+        assert!(review.contains("不要给出该新增修法"));
     }
 
     #[test]
@@ -5286,9 +5292,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(review_prompt.contains("# 章节任务兑现审校"));
-        assert!(review_prompt.contains("章节任务未兑现"));
-        assert!(review_prompt.contains("允许同义表达、等效行动"));
+        // 审校契约位于 system prompt 模板；user prompt 只承载章节任务卡等数据。
+        let review_contract = crate::prompt_templates::require_default_prompt("review").unwrap();
+        assert!(review_contract.contains("# 章节任务兑现审校"));
+        assert!(review_contract.contains("章节任务未兑现"));
+        assert!(review_contract.contains("允许同义表达、等效行动"));
         assert!(review_prompt.contains("# 本章任务卡"));
         assert!(review_prompt.contains("核心冲突：主角想按流程收尸"));
     }
@@ -5563,6 +5571,61 @@ mod tests {
         assert!(prompt.contains("写作 Craft Skill"));
         assert!(prompt.contains("长篇连续性与主动性"));
         assert!(prompt.contains("同一个悬念或结论，最多用两件证据确认"));
+    }
+
+    /// continuity_review 走裸取路径，默认拿不到任何 Skill。多章连续性审校恰恰最需要
+    /// craft Skill 里的连续性判据（角色已知信息断点、物件状态断点、威胁断线等），
+    /// 也需要题材 Skill 来判断"这一类书该持续兑现什么"。这里锁定两套判据都到位。
+    #[test]
+    fn continuity_review_receives_genre_and_craft_review_criteria() {
+        let temp = NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "烬骨长生".to_string(),
+                genre: "男频修仙爽文".to_string(),
+                target_words: 220000,
+                premise: "废徒在焚炉谷获得烬火机缘。".to_string(),
+            })
+            .unwrap();
+        let agent = state.get_agent("continuity_review").unwrap();
+
+        let context = continuity_review_method_context(&state, &project, &agent).unwrap();
+
+        // 题材 Skill：审校阶段规则，判断该题材该持续兑现什么
+        assert!(context.contains("# 题材 Skill"));
+        assert!(context.contains("男频修仙/升级流"));
+        assert!(context.contains("压迫链是否持续存在"));
+        // craft Skill：连续性硬伤判据与 severity 映射
+        assert!(context.contains("写作 Craft Skill"));
+        assert!(context.contains("长篇连续性与主动性"));
+        assert!(context.contains("角色已知信息断点"));
+        assert!(context.contains("物件状态断点"));
+        // 只注入审校阶段，不应带入其他阶段的规则
+        assert!(!context.contains("开发修炼章"));
+        assert!(!context.contains("阶段任务卡"));
+    }
+
+    /// 题材 Skill 只切当前项目的题材，不混入其它题材规则。
+    #[test]
+    fn continuity_review_criteria_exclude_other_genres() {
+        let temp = NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "雾港旧案".to_string(),
+                genre: "悬疑".to_string(),
+                target_words: 150000,
+                premise: "旧案重启，知情人各有隐瞒。".to_string(),
+            })
+            .unwrap();
+        let agent = state.get_agent("continuity_review").unwrap();
+
+        let context = continuity_review_method_context(&state, &project, &agent).unwrap();
+
+        assert!(context.contains("公平性"));
+        assert!(!context.contains("男频修仙/升级流"));
+        assert!(!context.contains("都市异能"));
     }
 
     #[test]

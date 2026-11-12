@@ -164,9 +164,7 @@ fn build_alignment_prompt(body: &str, entries: &[CanonEntry]) -> String {
             entry.id, entry.category, entry.status, entry.title, entry.content
         ));
     }
-    format!(
-        "# 任务\n本章正文刚刚定稿（转正）。请对照正文逐条审视下方资料条目：它们产生于写作之前，可能与定稿矛盾、重复或已过时。\n\n# 定稿正文\n{body}\n\n# 待审视资料条目\n{entry_lines}\n\n# 输出协议\n只输出 JSON 对象：\n{{\"updates\":[{{\"entry_id\":1,\"reason\":\"与正文冲突的原因\",\"new_content\":\"修订后的完整内容\"}}],\"archive_ids\":[2],\"additions\":[{{\"category\":\"world\",\"title\":\"...\",\"content\":\"...\"}}],\"writing_notes\":[{{\"title\":\"某角色的说话方式\",\"content\":\"从正文提炼的写作约束\"}}]}}\n\n规则：\n1. updates：条目内容与正文事实冲突或已过时；new_content 必须引用正文的句子逐字摘自正文；修订后 status 会重置为待人工确认。\n2. archive_ids：条目描述与正文明确矛盾且无法通过更新挽救，或与另一条目完全重复。归档不删除，可人工恢复。\n3. additions：正文新出现的、值得长期沉淀的设定。category 只能是 world/cultivation/map/faction/taboo/item/rule/character/outline。\n4. writing_notes：从正文提炼的写作约束——角色说话方式、重复出现的母题、编号/命名规律、叙事纪律。title 写成「写作笔记：XX 的说话方式」这类形式。\n5. 与正文一致且仍有价值的条目不要动。没有把握就不要输出。禁止输出 Markdown。"
-    )
+    format!("# 定稿正文\n{body}\n\n# 待审视资料条目\n{entry_lines}")
 }
 
 fn parse_alignment_report(raw: &str, known_ids: &[i64]) -> AppResult<AlignmentReport> {

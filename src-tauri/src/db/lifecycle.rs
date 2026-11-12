@@ -19,6 +19,8 @@ const DERIVED_SCHEMA_VERSION: i64 = 4;
 
 fn migrate_derived_schema(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
+        ensure_prompt_customized_columns(conn)?;
+        sync_builtin_prompts_and_skills(conn)?;
         ensure_agent_runtime_columns(conn)?;
         ensure_ai_provider_api_key_column(conn)?;
         ensure_ai_provider_runtime_columns(conn)?;
@@ -106,6 +108,59 @@ fn ensure_agent_default_models(conn: &Connection) -> AppResult<()> {
          WHERE stage = 'context_search_rerank' AND trim(model) = ''",
         [],
     )?;
+    Ok(())
+}
+
+/// 内置 prompt / Skill 的唯一事实来源是仓库里的 .md 文件。给两张表补
+/// customized 标记列：0 表示与内置模板一致（含旧库未定制的存量行），允许
+/// 启动时同步到最新模板；1 表示用户改过，永不被启动同步覆盖。
+fn ensure_prompt_customized_columns(conn: &Connection) -> AppResult<()> {
+    for (table, column) in [
+        ("agents", "prompt_customized"),
+        ("writing_skills", "customized"),
+    ] {
+        let exists: bool = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"),
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_builtin_prompts_and_skills(conn: &Connection) -> AppResult<()> {
+    for key in crate::prompt_templates::BUILTIN_AGENT_KEYS {
+        let Some(prompt) = crate::prompt_templates::default_prompt(key) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE agents
+             SET system_prompt = ?1
+             WHERE stage = ?2 AND prompt_customized = 0 AND trim(system_prompt) <> ?1",
+            params![prompt, key],
+        )?;
+    }
+    for skill in crate::genre_skill::default_writing_skills() {
+        conn.execute(
+            "UPDATE writing_skills
+             SET content = ?1, name = ?2, category = ?3, description = ?4
+             WHERE skill_key = ?5 AND customized = 0
+               AND (trim(content) <> trim(?1) OR name <> ?2
+                    OR category <> ?3 OR description <> ?4)",
+            params![
+                skill.content,
+                skill.name,
+                skill.category,
+                skill.description,
+                skill.skill_key
+            ],
+        )?;
+    }
     Ok(())
 }
 
