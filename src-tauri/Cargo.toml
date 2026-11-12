@@ -40,3 +40,18 @@ tower-http = { version = "0.6.6", features = ["cors"] }
 ts-rs = { version = "11.1.0", features = ["serde-json-impl"] }
 
 [dev-dependencies]
+
+# ---- 开发构建体积优化 ----
+# 依据 Cargo 官方指南 Optimizing Build Performance：
+# 自身 crate 保留行号表，panic backtrace 仍可定位到 文件:行号
+# 第三方依赖不生成任何调试信息（依赖通常占 target 体积的 80% 以上）
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# 需要完整调试依赖内部时：cargo build --profile debugging
+[profile.debugging]
+inherits = "dev"
+debug = true
