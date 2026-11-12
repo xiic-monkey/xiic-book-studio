@@ -3,7 +3,6 @@ import {
   Archive,
   BarChart3,
   BookOpen,
-  Bot,
   Check,
   Copy,
   ChevronLeft,
@@ -29,7 +28,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import type { ChangeEvent, KeyboardEvent, PointerEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../../api";
@@ -38,6 +37,20 @@ import { ContinuityLibraryPanel } from "../../components/ContinuityLibraryPanel"
 import type { EntityTimelineEntry, StoryIndexStatus } from "../../components/ContinuityLibraryPanel";
 import { KnowledgeSectionCard } from "../../components/KnowledgeSectionCard";
 import { Select } from "../../components/Select";
+import {
+  AssistantChatLoading,
+} from "../agent-runs/ConversationTimelineRows";
+import { RunTimeline } from "../assistant-panel/RunTimeline";
+import type { AssistantChatItem, AssistantFeedItem, AssistantTimelineItem } from "../assistant-panel/timeline";
+import {
+  attachPendingProposals,
+  backfillTimelineFromSummary,
+  buildAssistantTimeline,
+  buildChildTimeline,
+  groupReadToolItems,
+  mergeRunEvents,
+  runStatusLabel,
+} from "../assistant-panel/timeline";
 import type {
   ActionProposal,
   ActiveAgentRun,
@@ -58,6 +71,7 @@ import type {
   Project,
   ProjectUpdate,
   ContinuityReport,
+  CurrentPlanConfirmationResult,
   ProjectWorkspace,
   QualityReport,
   ReferenceMaterial,
@@ -215,6 +229,84 @@ function isFoundationCanonEntry(card: Pick<CanonEntry, "category" | "source_chap
   return card.source_chapter_id == null && foundationKnowledgeCategories.includes(card.category);
 }
 
+export type FoundationStageKey = "setting" | "outline" | "characters";
+
+const foundationStageLabels: Record<FoundationStageKey, string> = {
+  setting: "世界观",
+  outline: "大纲",
+  characters: "角色",
+};
+
+const foundationStageCategories: Record<FoundationStageKey, string[]> = {
+  setting: ["world", "cultivation", "map", "faction", "taboo", "item", "rule"],
+  outline: ["outline", "chapter_plan"],
+  characters: ["character"],
+};
+
+export interface FoundationStageReadiness {
+  stage: FoundationStageKey;
+  label: string;
+  ready: boolean;
+  pendingCount: number;
+}
+
+/** 三个基础阶段是否已有可用资料：资料卡按类别归属，章节计划归入大纲。 */
+export function foundationStageReadiness(
+  workspace: {
+    canon_entries: Array<Pick<CanonEntry, "category" | "status" | "source_chapter_id" | "content">>;
+    chapter_plans?: Array<Pick<ChapterPlan, "status" | "content">>;
+  } | null,
+): FoundationStageReadiness[] {
+  const usableCards = (workspace?.canon_entries ?? []).filter((card) =>
+    card.source_chapter_id == null
+    && (card.status === "pending_human_approval" || card.status === "approved")
+    && card.content.trim() !== "",
+  );
+  const usablePlans = (workspace?.chapter_plans ?? []).filter((plan) =>
+    (plan.status === "pending_human_approval" || plan.status === "approved")
+    && plan.content.trim() !== "",
+  );
+  return (Object.keys(foundationStageLabels) as FoundationStageKey[]).map((stage) => {
+    const stageCards = usableCards.filter((card) => foundationStageCategories[stage].includes(card.category));
+    return {
+      stage,
+      label: foundationStageLabels[stage],
+      ready: stage === "outline" ? stageCards.length > 0 || usablePlans.length > 0 : stageCards.length > 0,
+      pendingCount: stageCards.filter((card) => card.status === "pending_human_approval").length,
+    };
+  });
+}
+
+export function foundationStageLabel(stage: string): string {
+  return foundationStageLabels[stage as FoundationStageKey] ?? stage;
+}
+
+/** 会话流只在读者仍贴底时跟随新内容；上翻后由滚动事件把跟随关掉。 */
+export function isFeedScrolledToBottom(
+  node: Pick<HTMLElement, "scrollHeight" | "clientHeight" | "scrollTop">,
+): boolean {
+  return node.scrollHeight - node.clientHeight - node.scrollTop <= 2;
+}
+
+/** 贴底跟随：新内容到达时把会话流平滑滚到底部。 */
+export function scrollFeedToBottom(
+  node: Pick<HTMLElement, "scrollHeight"> & {
+    scrollTo(options: ScrollToOptions): void;
+  },
+): void {
+  node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
+}
+
+/** 部分采纳是成功而不是错误：已落地的资料要讲清楚，还缺什么也要讲清楚。 */
+export function partialConfirmationNotice(result: CurrentPlanConfirmationResult): string {
+  const adopted = [
+    result.approved_card_count > 0 ? `已采纳 ${result.approved_card_count} 张资料卡` : "",
+    result.approved_plan_count > 0 ? `已采纳 ${result.approved_plan_count} 个章节计划` : "",
+  ].filter(Boolean).join("，");
+  const missing = result.missing_stages.map(foundationStageLabel);
+  return `${adopted || "现有阶段资料已全部采纳"}；创作基准仍需补齐：${missing.join("、")}`;
+}
+
 export function currentPlanStatus(
   workspace: (Pick<ProjectWorkspace, "story_bible" | "story_bible_review" | "canonical_fingerprint" | "canon_entries"> &
     Partial<Pick<ProjectWorkspace, "chapter_plans">>) | null,
@@ -239,10 +331,10 @@ export function currentPlanStatus(
     return { label: "待审校", tone: "review" };
   }
   const hasFoundationCards = workspace.canon_entries.some((card) =>
-    card.status !== "archived"
+    card.status === "pending_human_approval"
     && isFoundationCanonEntry(card),
   );
-  const hasChapterPlans = (workspace.chapter_plans ?? []).some((plan) => plan.status !== "archived");
+  const hasChapterPlans = (workspace.chapter_plans ?? []).some((plan) => plan.status === "pending_human_approval");
   return { label: hasFoundationCards || hasChapterPlans ? "待确认资料" : "待完善计划", tone: "draft" };
 }
 
@@ -326,20 +418,7 @@ type AssistantMessageOptions = {
   referenceSelection?: ReferenceSelection | null;
 };
 type AssistantChatMessage = { id: string; role: "user" | "assistant"; content: string; order: number };
-type AssistantThinkingRound = { id: string; content: string; active: boolean };
-type AssistantTimelineItem =
-  | { kind: "thinking"; id: string; content: string; active: boolean; sequence: number; order: number }
-  | { kind: "tool"; id: string; toolKey: string; status: "running" | "success" | "failed" | "rejected"; summary?: string; invocationId?: number | null; sequence: number; order: number }
-  | { kind: "output"; id: string; content: string; sequence: number; order: number }
-  | { kind: "subagent"; id: string; runId: number; title: string; agentKey?: string | null; status: string; sequence: number; order: number };
 
-type AssistantToolTimelineItem = {
-  id: string;
-  toolKey: string;
-  status: "running" | "success" | "failed" | "rejected";
-  elapsedMs?: number | null;
-  summary?: string;
-};
 const SIDEBAR_WIDTH_STORAGE_KEY = "book-studio.sidebar-width";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "book-studio.sidebar-collapsed";
 const SIDEBAR_DEFAULT_WIDTH = 280;
@@ -375,136 +454,11 @@ function clampAssistantPanelWidth(width: number) {
   return Math.min(ASSISTANT_PANEL_MAX_WIDTH, Math.max(ASSISTANT_PANEL_MIN_WIDTH, width));
 }
 
-const assistantToolLabels: Record<string, string> = {
-  story_context_search: "检索故事资料",
-  prepare_agent_context: "准备创作上下文",
-  check_continuity: "检查连续性",
-  create_artifact: "生成候选版本",
-  get_current_artifact: "读取当前版本",
-  get_story_bible: "读取创作基准",
-  get_chapter_context: "读取当前章节",
-  search_story: "检索故事内容",
-  search_story_facts: "检索故事事实",
-  create_canon_entry: "写入资料",
-  update_canon_entry: "更新资料",
-  reference_materials: "读取参考资料",
-  chapter_memory: "读取章节记忆",
-  continuity_check: "检查连续性",
-};
-
-function assistantToolLabel(toolKey: string) {
-  return assistantToolLabels[toolKey] ?? toolKey.replace(/[_-]+/g, " ");
-}
-
-function runStatusLabel(status: string) {
-  if (status === "success") return "已完成";
-  if (status === "failed") return "失败";
-  if (status === "cancelled") return "已停止";
-  if (["running", "streaming", "cancellation_requested"].includes(status)) return "执行中";
-  return status;
-}
-
-function timelineToolStatus(status: string, hasError: boolean): "running" | "success" | "failed" | "rejected" {
-  if (hasError) return "failed";
-  if (status === "success") return "success";
-  if (status === "rejected") return "rejected";
-  if (["running", "started", "pending"].includes(status)) return "running";
-  return "failed";
-}
+// 工具中文名统一维护在 agent-runs/toolLabels.ts（与 src-tauri/src/agent_tools.rs 的 definitions 对齐，
+// 含历史运行遗留的 tool_key，如 create_knowledge_card）。
 
 export function isTopLevelStreamingRun(run: ActiveAgentRun | null | undefined) {
   return Boolean(run && run.parent_run_id == null && run.run_kind !== "orchestrator");
-}
-
-function assistantToolTimeline(events: RunEvent[]): AssistantToolTimelineItem[] {
-  const items: AssistantToolTimelineItem[] = [];
-  for (const event of events) {
-    if (!event.tool_key) continue;
-    if (event.kind === "tool_started") {
-      items.push({
-        id: `tool-${event.sequence}`,
-        toolKey: event.tool_key,
-        status: "running",
-      });
-      continue;
-    }
-    if (event.kind !== "tool_completed") continue;
-    const target = [...items].reverse().find((item) => item.toolKey === event.tool_key && item.status === "running");
-    if (target) {
-      target.status = event.status === "success" ? "success" : event.status === "rejected" ? "rejected" : "failed";
-      target.elapsedMs = event.elapsed_ms;
-      target.summary = event.delta || event.error || undefined;
-    } else {
-      items.push({
-        id: `tool-${event.sequence}`,
-        toolKey: event.tool_key,
-        status: event.status === "success" ? "success" : event.status === "rejected" ? "rejected" : "failed",
-        elapsedMs: event.elapsed_ms,
-        summary: event.delta || event.error || undefined,
-      });
-    }
-  }
-  return items;
-}
-
-function toolInvocationEvents(invocations: import("../../types").ToolInvocation[]): RunEvent[] {
-  return invocations.flatMap((invocation, index) => {
-    const summary = invocation.error
-      || (typeof invocation.result?.summary === "string" ? invocation.result.summary : null)
-      || (typeof invocation.result?.message === "string" ? invocation.result.message : null)
-      || "工具已返回结果";
-    const base = {
-      run_id: invocation.run_id ?? 0,
-      project_id: invocation.project_id,
-      chapter_id: invocation.chapter_id,
-      stage: invocation.stage,
-      sequence: index * 2 + 1,
-      tool_key: invocation.tool_key,
-      tool_invocation_id: invocation.id,
-      status: invocation.status,
-      error: invocation.error,
-      elapsed_ms: invocation.elapsed_ms,
-      created_at: invocation.created_at,
-      parent_run_id: null,
-      agent_key: null,
-      agent_role: null,
-      task_title: null,
-    };
-    return [
-      { ...base, kind: "tool_started" as const, delta: "" },
-      { ...base, sequence: index * 2 + 2, kind: "tool_completed" as const, delta: summary },
-    ];
-  });
-}
-
-function buildThinkingRounds(events: RunEvent[]): AssistantThinkingRound[] {
-  return events.reduce(applyThinkingEvent, [] as AssistantThinkingRound[]);
-}
-
-function applyThinkingEvent(
-  rounds: AssistantThinkingRound[],
-  event: RunEvent,
-): AssistantThinkingRound[] {
-  if (event.kind === "thinking_start") {
-    return [...rounds.map((round) => ({ ...round, active: false })), {
-      id: `thinking-${event.sequence}`,
-      content: "",
-      active: true,
-    }];
-  }
-  if (event.kind === "thinking_end") {
-    return rounds.map((round) => ({ ...round, active: false }));
-  }
-  if (event.kind !== "thinking_delta") return rounds;
-  const current = rounds.length > 0 ? rounds[rounds.length - 1] : {
-    id: `thinking-${event.sequence}`,
-    content: "",
-    active: true,
-  };
-  return [
-    ...rounds.slice(0, -1),
-    { ...current, content: `${current.content}${event.delta}` },
-  ];
 }
 
 export function splitThinkingContent(content: string, active: boolean) {
@@ -517,138 +471,10 @@ export function splitThinkingContent(content: string, active: boolean) {
   return { title: title || (active ? "思考中" : "思考摘要"), rest };
 }
 
-function AssistantThinkingPanel({ content, active }: { content: string; active: boolean }) {
-  const { title, rest } = splitThinkingContent(content, active);
-  return (
-    <details
-      className={`assistant-thinking-panel${active ? " assistant-thinking-panel-current" : ""}`}
-      open={active}
-    >
-      <summary>
-        <span><Sparkles size={12} /> {title}</span>
-        <small>{active ? "实时更新" : "已完成"}</small>
-      </summary>
-      {rest ? <p>{rest}</p> : null}
-    </details>
-  );
-}
-
-export function compactAssistantOutput(content: string) {
-  const trimmed = content.trim();
-  const completion = trimmed.match(/^(已完成\s+\d+\s+个子任务)[。.!！]?/);
-  if (!completion) return content;
-
-  // 委托运行的前言一律折叠成短状态行，摘录正文留在子任务详情与候选稿面板里。
-  const remainder = trimmed.slice(completion[0].length).trim();
-  let label = remainder.split(/[:：]/, 1)[0]?.trim() ?? "";
-  if (label.length > 40) label = `${label.slice(0, 40)}…`;
-  return label ? `${completion[1]} · ${label}` : completion[1];
-}
-
 export function compactAssistantModelName(model: string) {
   const trimmed = model.trim();
   const withoutProvider = trimmed.replace(/^(?:deepseek|qwen|openai|anthropic|google|mistral)[-_\/]+/i, "");
   return withoutProvider.replace(/[-_\/]+/g, " ") || trimmed;
-}
-
-const assistantEventOrderCache = new WeakMap<RunEvent, number>();
-
-function assistantEventOrder(event: RunEvent) {
-  // 排序比较器会反复调用：Date.parse 每个事件只算一次。
-  const cached = assistantEventOrderCache.get(event);
-  if (cached !== undefined) return cached;
-  const timestamp = Date.parse(event.created_at);
-  const order = (Number.isFinite(timestamp) ? timestamp : 0) * 1000 + event.sequence;
-  assistantEventOrderCache.set(event, order);
-  return order;
-}
-
-function buildAssistantTimeline(events: RunEvent[]): AssistantTimelineItem[] {
-  const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
-  const items: AssistantTimelineItem[] = [];
-  const openThinking: Extract<AssistantTimelineItem, { kind: "thinking" }>[] = [];
-  const openTools = new Map<string, Extract<AssistantTimelineItem, { kind: "tool" }>>();
-  for (const event of sorted) {
-    if (event.parent_run_id && event.kind === "started") {
-      items.push({
-        kind: "subagent",
-        id: `subagent-${event.run_id}`,
-        runId: event.run_id,
-        title: event.task_title || event.agent_role || event.agent_key || "子 Agent",
-        agentKey: event.agent_key,
-        status: event.status,
-        sequence: event.sequence,
-        order: assistantEventOrder(event),
-      });
-      continue;
-    }
-    if (event.kind === "thinking_start") {
-      const item: AssistantTimelineItem = { kind: "thinking", id: `thinking-${event.sequence}`, content: "", active: true, sequence: event.sequence, order: assistantEventOrder(event) };
-      items.push(item);
-      openThinking.push(item);
-      continue;
-    }
-    if (event.kind === "thinking_delta") {
-      const current = openThinking[openThinking.length - 1];
-      if (current && current.active) {
-        current.content += event.delta;
-        continue;
-      }
-      // start 缺失时兜底，避免逐 token 内容被丢弃。
-      const item: AssistantTimelineItem = { kind: "thinking", id: `thinking-${event.sequence}`, content: event.delta, active: true, sequence: event.sequence, order: assistantEventOrder(event) };
-      items.push(item);
-      openThinking.push(item);
-      continue;
-    }
-    if (event.kind === "thinking_end") {
-      const current = openThinking.pop();
-      if (current) current.active = false;
-      continue;
-    }
-    if (event.kind === "tool_started" && event.tool_key) {
-      const item: AssistantTimelineItem = { kind: "tool", id: `tool-${event.sequence}`, toolKey: event.tool_key, status: "running", invocationId: event.tool_invocation_id, sequence: event.sequence, order: assistantEventOrder(event) };
-      items.push(item);
-      openTools.set(event.tool_key, item);
-      continue;
-    }
-    if (event.kind === "tool_completed" && event.tool_key) {
-      const current = openTools.get(event.tool_key);
-      if (current) {
-        current.status = event.status === "success" ? "success" : event.status === "rejected" ? "rejected" : "failed";
-        current.summary = event.delta || event.error || undefined;
-        if (event.tool_invocation_id != null) current.invocationId = event.tool_invocation_id;
-        openTools.delete(event.tool_key);
-      }
-      continue;
-    }
-    if ((event.kind === "output_delta" || event.kind === "output_reset") && event.delta) {
-      if (event.kind === "output_reset") continue;
-      const previous = items[items.length - 1];
-      if (previous?.kind === "output") {
-        previous.content += event.delta;
-        previous.sequence = event.sequence;
-        previous.order = assistantEventOrder(event);
-      } else {
-        items.push({ kind: "output", id: `output-${event.sequence}`, content: event.delta, sequence: event.sequence, order: assistantEventOrder(event) });
-      }
-    }
-  }
-  return items.filter(
-    (item) => item.kind !== "thinking" || item.active || item.content.trim().length > 0,
-  );
-}
-
-function runEventKey(event: RunEvent) {
-  return `${event.run_id}:${event.sequence}`;
-}
-
-function mergeRunEvents(current: RunEvent[], incoming: RunEvent[]) {
-  const merged = new Map(current.map((event) => [runEventKey(event), event]));
-  incoming.forEach((event) => merged.set(runEventKey(event), event));
-  return [...merged.values()].sort((left, right) => {
-    const orderDelta = assistantEventOrder(left) - assistantEventOrder(right);
-    return orderDelta || left.run_id - right.run_id || left.sequence - right.sequence;
-  });
 }
 
 function assistantMessageKey(role: string, content: string) {
@@ -705,16 +531,14 @@ export function BookStudioWorkspace() {
   const [instruction, setInstruction] = useState("");
   const [assistantMessages, setAssistantMessages] = useState<AssistantChatMessage[]>([]);
   const [assistantHistoryCutoff, setAssistantHistoryCutoff] = useState<number | null>(null);
-  const [liveToolEvents, setLiveToolEvents] = useState<RunEvent[]>([]);
   const [assistantTimelineEvents, setAssistantTimelineEvents] = useState<RunEvent[]>([]);
   const [selectedSubagentRunId, setSelectedSubagentRunId] = useState<number | null>(null);
-  const [thinkingRounds, setThinkingRounds] = useState<AssistantThinkingRound[]>([]);
-  const [workflowStepsCollapsed, setWorkflowStepsCollapsed] = useState(true);
   const [assistantAdvancedOpen, setAssistantAdvancedOpen] = useState(false);
   const [orchestratorParentRunId, setOrchestratorParentRunId] = useState<number | null>(null);
   const [orchestratorCancellationRequested, setOrchestratorCancellationRequested] = useState(false);
+  const [cancellingChildRunIds, setCancellingChildRunIds] = useState<number[]>([]);
   const [delegatedRunEvents, setDelegatedRunEvents] = useState<Record<number, RunEvent[]>>({});
-  const [delegatedRunSummaries, setDelegatedRunSummaries] = useState<Record<number, AgentRunSummary>>({});
+  const [runSummariesById, setRunSummariesById] = useState<Record<number, AgentRunSummary>>({});
   const [versionDrawerOpen, setVersionDrawerOpen] = useState(false);
   const [qualityReport, setQualityReport] = useState<QualityReport | null>(null);
   const [continuityReport, setContinuityReport] = useState<ContinuityReport | null>(null);
@@ -924,16 +748,7 @@ export function BookStudioWorkspace() {
         void api.listRunEvents(run.id)
           .then((events) => {
             if (activeProjectRequestRef.current !== selectedProjectId) return;
-            const historical = events.filter((event) => event.kind === "tool_started" || event.kind === "tool_completed");
-            const thinkingEvents = events.filter((event) => ["thinking_start", "thinking_delta", "thinking_end"].includes(event.kind));
-            setLiveToolEvents((current) => {
-              const merged = new Map<number, RunEvent>();
-              [...historical, ...current]
-                .filter((event) => event.run_id === run.id)
-                .forEach((event) => merged.set(event.sequence, event));
-              return [...merged.values()].sort((a, b) => a.sequence - b.sequence);
-            });
-            setThinkingRounds(buildThinkingRounds(thinkingEvents));
+            setAssistantTimelineEvents((current) => mergeRunEvents(current, events.filter((event) => !event.parent_run_id)));
           })
           .catch(() => {
             // The live event stream remains authoritative when historical loading is unavailable.
@@ -991,23 +806,13 @@ export function BookStudioWorkspace() {
       }
       if (event.kind === "tool_started" || event.kind === "tool_completed") {
         if (activeAgentRunIdRef.current == null) activeAgentRunIdRef.current = event.run_id;
-        if (activeAgentRunIdRef.current !== event.run_id) return;
-        setLiveToolEvents((current) => [...current, event]);
         return;
       }
-      if (["thinking_start", "thinking_delta", "thinking_end"].includes(event.kind)) {
-        if (activeAgentRunIdRef.current == null) activeAgentRunIdRef.current = event.run_id;
-        if (activeAgentRunIdRef.current !== event.run_id) return;
-        setThinkingRounds((current) => applyThinkingEvent(current, event));
-        return;
-      }
+      if (["thinking_start", "thinking_delta", "thinking_end"].includes(event.kind)) return;
       if (event.kind === "started" || event.kind === "output_delta" || event.kind === "output_reset" || event.kind === "cancellation_requested") {
         activeAgentRunIdRef.current = event.run_id;
       }
       if (["completed", "failed", "cancelled"].includes(event.kind)) {
-        // A terminal event closes the current summary even when the worker fails
-        // before it can emit a matching thinking_end event.
-        setThinkingRounds((current) => current.map((round) => ({ ...round, active: false })));
         if (event.run_id !== orchestratorParentRunId) {
           setStreamingRun((current) => current?.id === event.run_id ? null : current);
         }
@@ -1516,11 +1321,9 @@ export function BookStudioWorkspace() {
 
   const visibleAssistantTimelineEvents = useMemo(
     () => assistantTimelineEvents.filter(
-      // Orchestrator output is internal delegation narration. The final answer
-      // is persisted as a normal assistant message after the run completes.
-      (event) =>
-        event.stage !== "orchestrator" &&
-        (event.chapter_id == null || event.chapter_id === selectedChapterId),
+      // 编排事件不再整条丢弃：能渲染哪些 kind 由 timeline 的白名单决定（计划卡、委托播报、警示），
+      // 终态答复仍由 assistant 消息呈现，不会在这里重复。
+      (event) => event.chapter_id == null || event.chapter_id === selectedChapterId,
     ),
     [assistantTimelineEvents, selectedChapterId],
   );
@@ -1533,7 +1336,10 @@ export function BookStudioWorkspace() {
   }, [assistantTimelineEvents, orchestratorParentRunId]);
 
   const assistantFeedItems = useMemo(() => {
-    const timeline = buildAssistantTimeline(visibleAssistantTimelineEvents);
+    const timeline = attachPendingProposals(
+      groupReadToolItems(buildAssistantTimeline(visibleAssistantTimelineEvents)),
+      actionProposals,
+    );
     const timelineOutputs = new Set(
       timeline
         .filter((item): item is Extract<AssistantTimelineItem, { kind: "output" }> => item.kind === "output")
@@ -1543,25 +1349,29 @@ export function BookStudioWorkspace() {
     const persistedMessages = visibleMessages
       .filter((message) => message.role === "user" || message.role === "assistant")
       .filter((message) => assistantHistoryCutoff == null || Date.parse(message.created_at) >= assistantHistoryCutoff - 2000);
-    const persistedItems = persistedMessages
-      .filter((message) => message.role !== "assistant" || !timelineOutputs.has(message.content.trim()))
-      .map((message) => ({
-        kind: message.role === "user" ? "user" as const : "output" as const,
+    const persistedItems: AssistantChatItem[] = [];
+    for (const message of persistedMessages) {
+      if (message.role === "assistant" && timelineOutputs.has(message.content.trim())) continue;
+      const base = {
         id: `message-${message.id}`,
         content: message.content,
         order: (Date.parse(message.created_at) || 0) * 1000 + message.id,
-      }));
+      };
+      persistedItems.push(message.role === "user"
+        ? { kind: "user", ...base }
+        : { kind: "output", ...base });
+    }
     const persistedKeys = new Set(persistedMessages.map((message) => assistantMessageKey(message.role, message.content)));
-    const localItems = assistantMessages
-      .filter((message) => !persistedKeys.has(assistantMessageKey(message.role, message.content)))
-      .map((message) => ({
-        kind: message.role === "user" ? "user" as const : "output" as const,
-        id: message.id,
-        content: message.content,
-        order: message.order,
-      }));
+    const localItems: AssistantChatItem[] = [];
+    for (const message of assistantMessages) {
+      if (persistedKeys.has(assistantMessageKey(message.role, message.content))) continue;
+      const base = { id: message.id, content: message.content, order: message.order };
+      localItems.push(message.role === "user"
+        ? { kind: "user", ...base }
+        : { kind: "output", ...base });
+    }
     // 交接记忆重建失败必须可见：否则下一章会在无前情记忆的情况下静默续写。
-    const memoryWarningItems = detail
+    const memoryWarningItems: AssistantChatItem[] = detail
       ? detail.workflow_runs
           .filter((run) => run.stage === "chapter_memory" && run.status === "failed")
           .filter((run) => run.chapter_id == null || run.chapter_id === selectedChapterId)
@@ -1576,6 +1386,7 @@ export function BookStudioWorkspace() {
       : [];
     return [...persistedItems, ...localItems, ...memoryWarningItems, ...timeline].sort((a, b) => a.order - b.order);
   }, [
+    actionProposals,
     assistantHistoryCutoff,
     assistantMessages,
     detail,
@@ -1584,17 +1395,16 @@ export function BookStudioWorkspace() {
     visibleMessages,
   ]);
 
-  const liveToolTimeline = useMemo(() => assistantToolTimeline(liveToolEvents), [liveToolEvents]);
-  const activeLiveTool = liveToolTimeline.some((item) => item.status === "running");
-  const completedLiveTool = liveToolTimeline.some((item) => item.status !== "running");
-  const waitingForModelOutput = Boolean(streamingRun && !streamingRun.output.trim() && liveToolTimeline.length === 0);
   const pendingActionProposalCount = actionProposals.filter((proposal) => proposal.status === "pending").length;
   const selectedSubagentEvents = useMemo(
     () => (selectedSubagentRunId != null ? delegatedRunEvents[selectedSubagentRunId] ?? [] : []),
     [delegatedRunEvents, selectedSubagentRunId]
   );
-  const selectedSubagentTimeline = useMemo(() => buildAssistantTimeline(selectedSubagentEvents), [selectedSubagentEvents]);
-  const selectedSubagentSummary = selectedSubagentRunId != null ? delegatedRunSummaries[selectedSubagentRunId] : undefined;
+  const selectedSubagentTimeline = useMemo(
+    () => (selectedSubagentRunId != null ? buildChildTimeline(selectedSubagentEvents, selectedSubagentRunId) : []),
+    [selectedSubagentEvents, selectedSubagentRunId]
+  );
+  const selectedSubagentSummary = selectedSubagentRunId != null ? runSummariesById[selectedSubagentRunId] : undefined;
   const selectedSubagentTerminal = selectedSubagentSummary
     ? ["success", "failed", "cancelled"].includes(selectedSubagentSummary.run.status)
     : false;
@@ -1603,37 +1413,8 @@ export function BookStudioWorkspace() {
   // 过程 = 事件时间线 ∪ 运行摘要里的工具调用。历史运行的事件流可能缺失工具/思考
   // 事件，摘要中的 tool_invocations 是权威数据，缺失的按发生时间补进过程。
   const selectedSubagentProcess = useMemo(() => {
-    const items: AssistantTimelineItem[] = [...selectedSubagentTimeline];
-    const summary = selectedSubagentSummary;
-    if (summary) {
-      const represented = new Set(
-        items
-          .filter((item): item is Extract<AssistantTimelineItem, { kind: "tool" }> => item.kind === "tool" && item.invocationId != null)
-          .map((item) => item.invocationId as number)
-      );
-      for (const invocation of summary.tool_invocations) {
-        if (represented.has(invocation.id)) continue;
-        items.push({
-          kind: "tool",
-          id: `invocation-${invocation.id}`,
-          toolKey: invocation.tool_key,
-          status: timelineToolStatus(invocation.status, Boolean(invocation.error)),
-          invocationId: invocation.id,
-          sequence: 0,
-          order: (Number.isFinite(Date.parse(invocation.created_at)) ? Date.parse(invocation.created_at) : 0) * 1000,
-        });
-      }
-      if (!items.some((item) => item.kind === "output") && summary.run.output.trim()) {
-        items.push({
-          kind: "output",
-          id: "run-output",
-          content: summary.run.output,
-          sequence: 0,
-          order: (Number.isFinite(Date.parse(summary.run.created_at)) ? Date.parse(summary.run.created_at) : 0) * 1000 + 1,
-        });
-      }
-    }
-    return items.sort((left, right) => left.order - right.order || left.sequence - right.sequence);
+    const items = backfillTimelineFromSummary(selectedSubagentTimeline, selectedSubagentSummary);
+    return groupReadToolItems(items);
   }, [selectedSubagentTimeline, selectedSubagentSummary]);
 
   // 子会话的真实工具载荷在运行摘要里：选中时拉取；未结束的运行随工具完成而刷新。
@@ -1642,7 +1423,7 @@ export function BookStudioWorkspace() {
     let disposed = false;
     api.getAgentRun(selectedSubagentRunId)
       .then((summary) => {
-        if (!disposed) setDelegatedRunSummaries((current) => ({ ...current, [selectedSubagentRunId]: summary }));
+        if (!disposed) setRunSummariesById((current) => ({ ...current, [selectedSubagentRunId]: summary }));
       })
       .catch(() => {
         // 事件时间线仍然可见，只是没有可展开的载荷。
@@ -1651,6 +1432,35 @@ export function BookStudioWorkspace() {
       disposed = true;
     };
   }, [selectedSubagentRunId, selectedSubagentTerminal, selectedSubagentToolCount]);
+
+  // 子任务内联视图：每个委托 run 的过程条目（事件流 ∪ 摘要补齐）。
+  const childFeedItems = useMemo(() => {
+    const result: Record<number, AssistantFeedItem[]> = {};
+    for (const [runKey, events] of Object.entries(delegatedRunEvents)) {
+      const runId = Number(runKey);
+      const items = backfillTimelineFromSummary(buildChildTimeline(events, runId), runSummariesById[runId]);
+      result[runId] = groupReadToolItems(items);
+    }
+    return result;
+  }, [delegatedRunEvents, runSummariesById]);
+
+  const payloadRequestRef = useRef<Record<number, boolean>>({});
+
+  // 工具载荷只在展开时按 run 拉取：广播事件里没有参数与结果，避免把大载荷塞进时间线。
+  const ensureRunPayloads = useCallback((runId: number) => {
+    if (runSummariesById[runId] || payloadRequestRef.current[runId]) return;
+    payloadRequestRef.current[runId] = true;
+    api.getAgentRun(runId)
+      .then((summary) => {
+        setRunSummariesById((current) => ({ ...current, [runId]: summary }));
+      })
+      .catch(() => {
+        // 拉取失败时事件流仍可用：展开区提示载荷不可用，允许再次展开重试。
+      })
+      .finally(() => {
+        delete payloadRequestRef.current[runId];
+      });
+  }, [runSummariesById]);
 
   const feedOutputIds = useMemo(
     () => assistantFeedItems.filter((item) => item.kind === "output").map((item) => item.id),
@@ -1663,15 +1473,30 @@ export function BookStudioWorkspace() {
   // 从子会话返回时不跳最新输出，恢复进入前主会话的阅读位置。
   useEffect(() => {
     const feed = assistantFeedRef.current;
-    if (!feed) return;
-    if (selectedSubagentRunId == null && mainFeedScrollTopRef.current != null) {
+    if (!feed || selectedSubagentRunId != null) return;
+    if (mainFeedScrollTopRef.current != null) {
       feed.scrollTop = mainFeedScrollTopRef.current;
       mainFeedScrollTopRef.current = null;
       return;
     }
     if (!assistantStickToBottomRef.current) return;
-    feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
+    scrollFeedToBottom(feed);
   }, [assistantFeedItems, selectedSubagentRunId]);
+
+  // 子运行的事件流不进主时间线：子会话视图要单独跟随，否则展开后停在进入时的位置，
+  // 看不到最新执行——主会话跟随得再好也救不了这个视图。
+  useEffect(() => {
+    const feed = assistantFeedRef.current;
+    if (!feed || selectedSubagentRunId == null) return;
+    if (!assistantStickToBottomRef.current) return;
+    scrollFeedToBottom(feed);
+  }, [selectedSubagentProcess, selectedSubagentRunId]);
+
+  function handleAssistantFeedScroll() {
+    const feed = assistantFeedRef.current;
+    if (!feed) return;
+    assistantStickToBottomRef.current = isFeedScrolledToBottom(feed);
+  }
 
   // 输入框随内容自增高，上限 180px 后内部滚动。
   useEffect(() => {
@@ -1785,7 +1610,6 @@ export function BookStudioWorkspace() {
     setInstruction("");
     setAssistantMessages([]);
     setAssistantHistoryCutoff(null);
-    setLiveToolEvents([]);
     if (projectChanged) {
       setAssistantTimelineEvents([]);
       setDelegatedRunEvents({});
@@ -1794,7 +1618,6 @@ export function BookStudioWorkspace() {
     setAssistantAdvancedOpen(false);
     setOrchestratorParentRunId(null);
     setOrchestratorCancellationRequested(false);
-    setThinkingRounds([]);
     setChapterDraft("");
     setContextQuery("");
     setContextSnippets([]);
@@ -2018,8 +1841,8 @@ export function BookStudioWorkspace() {
       const summary = await api.getAgentRun(event.run_id);
       if (activeProjectRequestRef.current !== event.project_id) return;
       setLastAgentRun(summary);
-      setWorkflowStepsCollapsed(true);
-      setLiveToolEvents((current) => current.length > 0 ? current : toolInvocationEvents(summary.tool_invocations));
+      // 工具载荷（参数/结果）只在运行摘要里：缓存起来供时间线展开时懒取，避免把大载荷塞进广播事件。
+      setRunSummariesById((current) => ({ ...current, [event.run_id]: summary }));
       mergeActionProposals(summary.proposals);
 
       if (event.kind === "failed") {
@@ -2860,9 +2683,7 @@ export function BookStudioWorkspace() {
         activeAgentRunIdRef.current = response.parent_run.id;
         setOrchestratorParentRunId(response.parent_run.id);
         setDelegatedRunEvents({});
-        setLiveToolEvents([]);
-        setThinkingRounds([]);
-        setWorkflowStepsCollapsed(false);
+        setRunSummariesById({});
         // The orchestrator is a conversation run. It must never occupy the
         // central artifact/output surface reserved for specialist child runs.
         setStreamingRun(null);
@@ -2948,6 +2769,10 @@ export function BookStudioWorkspace() {
           ? `已纳入 ${result.approved_card_count} 张资料卡，审校结论已生成，请查看后再次${adoptionActionLabel}`
           : `审校结论已生成，请查看后再次${adoptionActionLabel}`,
       );
+      return;
+    }
+    if (result.status === "partially_confirmed") {
+      setNotice(partialConfirmationNotice(result));
       return;
     }
 
@@ -3183,6 +3008,21 @@ export function BookStudioWorkspace() {
       setOrchestratorCancellationRequested(true);
       setNotice("正在停止 Agent");
     });
+  }
+
+  // 子任务是父 run 下的独立 run：停止它要单独调 cancel，不影响主 Agent。
+  async function cancelChildRun(runId: number) {
+    if (cancellingChildRunIds.includes(runId)) return;
+    setCancellingChildRunIds((current) => (current.includes(runId) ? current : [...current, runId]));
+    try {
+      const summary = await api.cancelAgentRun(runId);
+      setRunSummariesById((current) => ({ ...current, [runId]: summary }));
+      setNotice("已发送停止请求，等待子任务收尾");
+    } catch {
+      setNotice("停止子任务失败");
+    } finally {
+      setCancellingChildRunIds((current) => current.filter((id) => id !== runId));
+    }
   }
 
   async function deleteSelectedArtifact() {
@@ -3961,6 +3801,19 @@ export function BookStudioWorkspace() {
                       {pendingChapterPlanCount(detail) > 0 && <span>待确认章节计划 {pendingChapterPlanCount(detail)} 个</span>}
                       {detail?.story_bible_review && <span>审校 {detail.story_bible_review.status === "confirmed" ? adoptedStatusLabel : "待处理"}</span>}
                     </div>
+                    <div className="story-bible-stage-row" aria-label="基础资料齐备情况">
+                      {foundationStageReadiness(detail).map((stage) => (
+                        <span
+                          key={stage.stage}
+                          className={`story-bible-stage ${stage.ready ? "ready" : "missing"}`}
+                        >
+                          {stage.label}
+                          {stage.ready
+                            ? ` 已就绪${stage.pendingCount > 0 ? ` · 待确认 ${stage.pendingCount}` : ""}`
+                            : " 待补齐"}
+                        </span>
+                      ))}
+                    </div>
                   </div>
                   <div className="story-bible-plan-actions">
                     <button
@@ -4519,7 +4372,6 @@ export function BookStudioWorkspace() {
                     setAssistantMessages([]);
                     setAssistantHistoryCutoff(Date.now());
                     setInstruction("");
-                    setLiveToolEvents([]);
                     setAssistantTimelineEvents([]);
                     setSelectedSubagentRunId(null);
                     setLastAgentRun(null);
@@ -4527,8 +4379,7 @@ export function BookStudioWorkspace() {
                     setOrchestratorParentRunId(null);
                     setOrchestratorCancellationRequested(false);
                     setDelegatedRunEvents({});
-                    setDelegatedRunSummaries({});
-                    setThinkingRounds([]);
+                    setRunSummariesById({});
                   }}
                   title="新建会话"
                   aria-label="新建会话"
@@ -4541,6 +4392,7 @@ export function BookStudioWorkspace() {
             <div
               ref={assistantFeedRef}
               className={`assistant-chat-feed${selectedSubagentRunId != null ? " assistant-chat-feed-subagent" : ""}`}
+              onScroll={handleAssistantFeedScroll}
             >
               {assistantFeedItems.length === 0 && selectedSubagentRunId == null && (
                 <article className="assistant-message assistant-message-agent assistant-empty-state">
@@ -4550,54 +4402,32 @@ export function BookStudioWorkspace() {
                 </article>
               )}
 
-              {selectedSubagentRunId == null && assistantFeedItems.map((item) => {
-                if (item.kind === "user") {
-                  return <article className="assistant-message assistant-message-user" key={item.id}><div className="assistant-message-body"><p>{item.content}</p></div></article>;
-                }
-                if (item.kind === "memory_warning") {
-                  return (
-                    <article className="assistant-memory-warning" key={item.id}>
-                      <AlertCircle size={14} />
-                      <div>
-                        <strong>章节交接记忆生成失败</strong>
-                        <p>{item.content}</p>
-                        <small>写下一章时会自动重试；也可让子 Agent 重新生成。</small>
-                      </div>
-                    </article>
-                  );
-                }
-                if (item.kind === "thinking") {
-                  return <AssistantThinkingPanel key={item.id} content={item.content} active={item.active} />;
-                }
-                if (item.kind === "tool") {
-                  return <article className="assistant-tool-message" key={item.id}><div className="assistant-tool-message-mark">{item.status === "success" ? "✓" : item.status === "running" ? "•" : "!"}</div><div className="assistant-tool-message-body"><div className="assistant-message-meta"><strong>{assistantToolLabel(item.toolKey)}</strong><span>{item.status === "running" ? "执行中" : item.status === "success" ? "已完成" : "失败"}</span></div><p>{item.summary || (item.status === "running" ? "正在调用工具……" : "工具已返回结果")}</p></div></article>;
-                }
-                if (item.kind === "subagent") {
-                  const childEvents = delegatedRunEvents[item.runId] ?? [];
-                  const latest = childEvents[childEvents.length - 1];
-                  return <button type="button" className="assistant-subagent-timeline-item" key={item.id} onClick={() => { const feed = assistantFeedRef.current; if (feed) mainFeedScrollTopRef.current = feed.scrollTop; assistantStickToBottomRef.current = true; setSelectedSubagentRunId(item.runId); }}><span className="assistant-subagent-mark"><Bot size={13} /></span><span className="assistant-subagent-timeline-copy"><strong>{item.title}</strong><small className="assistant-subagent-status">{latest?.status === "success" ? "已完成" : latest?.status === "failed" ? "失败" : "执行中"}</small></span><ChevronRight size={14} /></button>;
-                }
-                const outputText = compactAssistantOutput(item.content);
-                const isLiveOutput = item.id === liveOutputItemId;
-                return (
-                  <article
-                    className={`assistant-message assistant-message-agent${isLiveOutput ? " assistant-output-live" : ""}`}
-                    key={item.id}
-                  >
-                    <div className="assistant-message-body">
-                      {outputText.length > 240
-                        ? <details className="assistant-output-details"><summary>查看全文（{outputText.length} 字）</summary><p>{outputText}</p></details>
-                        : <p>{outputText}</p>}
-                      {!isLiveOutput && item.id === lastOutputItemId && chapterFlow?.bodyArtifact && (
-                        <button type="button" className="assistant-output-link" onClick={openCandidatePanel}>
-                          {chapterFlow?.state === "adopted" ? "查看正文" : "打开候选稿"}
-                          <ChevronRight size={12} />
-                        </button>
-                      )}
-                    </div>
-                  </article>
-                );
-              })}
+              {selectedSubagentRunId == null && (
+                <RunTimeline
+                  items={assistantFeedItems}
+                  summaries={runSummariesById}
+                  onRequestPayloads={ensureRunPayloads}
+                  childItems={childFeedItems}
+                  childEvents={delegatedRunEvents}
+                  onOpenChild={(runId) => {
+                    const feed = assistantFeedRef.current;
+                    if (feed) mainFeedScrollTopRef.current = feed.scrollTop;
+                    assistantStickToBottomRef.current = true;
+                    setSelectedSubagentRunId(runId);
+                  }}
+                  onCancelChild={(runId) => void cancelChildRun(runId)}
+                  cancellingChildRunIds={cancellingChildRunIds}
+                  onApplyProposal={(proposal) => void applyAgentProposal(proposal)}
+                  onRejectProposal={(proposal) => void rejectAgentProposal(proposal)}
+                  actionBusy={busy != null}
+                  lastOutputItemId={lastOutputItemId}
+                  liveOutputItemId={liveOutputItemId}
+                  onOpenCandidate={chapterFlow?.bodyArtifact ? openCandidatePanel : undefined}
+                  candidateLabel={chapterFlow?.state === "adopted" ? "查看正文" : "打开候选稿"}
+                />
+              )}
+
+              <AssistantChatLoading active={selectedSubagentRunId == null && (orchestratorRunIsActive || Boolean(streamingRun))} />
 
               {selectedSubagentRunId != null && (
                 <>
@@ -4617,77 +4447,25 @@ export function BookStudioWorkspace() {
                       {` · ${selectedSubagentSummary.tool_invocations.length} 次工具调用`}
                     </p>
                   )}
-                  {selectedSubagentProcess.map((item) => {
-                    if (item.kind === "thinking") {
-                      return <AssistantThinkingPanel key={item.id} content={item.content} active={item.active} />;
-                    }
-                    if (item.kind === "tool") {
-                      const invocation = item.invocationId != null
-                        ? selectedSubagentSummary?.tool_invocations.find((candidate) => candidate.id === item.invocationId)
-                        : undefined;
-                      const statusLabel = item.status === "running" ? "执行中" : item.status === "success" ? "已完成" : item.status === "rejected" ? "已拒绝" : "失败";
-                      return (
-                        <article className="assistant-tool-message" key={item.id}>
-                          <div className="assistant-tool-message-mark">{item.status === "success" ? "✓" : item.status === "running" ? "•" : "!"}</div>
-                          {invocation ? (
-                            <details className="assistant-tool-message-body assistant-tool-entry">
-                              <summary className="assistant-message-meta">
-                                <strong>{assistantToolLabel(item.toolKey)}</strong>
-                                <span>{statusLabel}{invocation.elapsed_ms > 0 ? ` · ${invocation.elapsed_ms.toLocaleString()} ms` : ""}</span>
-                              </summary>
-                              <label>参数</label>
-                              <pre>{JSON.stringify(invocation.arguments, null, 2)}</pre>
-                              <label>{invocation.error ? "错误" : "结果"}</label>
-                              <pre>{invocation.error ?? JSON.stringify(invocation.result, null, 2)}</pre>
-                            </details>
-                          ) : (
-                            <div className="assistant-tool-message-body">
-                              <div className="assistant-message-meta">
-                                <strong>{assistantToolLabel(item.toolKey)}</strong>
-                                <span>{statusLabel}</span>
-                              </div>
-                              <p>{item.summary || (item.status === "running" ? "正在调用工具……" : "工具已返回结果")}</p>
-                            </div>
-                          )}
-                        </article>
-                      );
-                    }
-                    if (item.kind !== "output") return null;
-                    const output = item.content;
-                    return output.trim().length > 240 || /[\[{]/.test(output.trim())
-                      ? <details className="assistant-subagent-output-panel" key={item.id}><summary><span>查看输出</span><small>{output.trim().length} 字</small></summary><pre>{output}</pre></details>
-                      : <p className="assistant-subagent-output" key={item.id}>{output}</p>;
-                  })}
+                  <RunTimeline
+                    items={selectedSubagentProcess}
+                    summaries={runSummariesById}
+                    onRequestPayloads={ensureRunPayloads}
+                    variant="child"
+                    childItems={childFeedItems}
+                    childEvents={delegatedRunEvents}
+                    onOpenChild={(runId) => setSelectedSubagentRunId(runId)}
+                    onCancelChild={(runId) => void cancelChildRun(runId)}
+                    cancellingChildRunIds={cancellingChildRunIds}
+                    onApplyProposal={(proposal) => void applyAgentProposal(proposal)}
+                    onRejectProposal={(proposal) => void rejectAgentProposal(proposal)}
+                    actionBusy={busy != null}
+                  />
+                  <AssistantChatLoading active={Boolean(streamingRun) && !selectedSubagentTerminal} />
                 </>
               )}
 
             </div>
-
-            {(streamingRun || lastAgentRun) && !orchestratorParentRunId && (
-              <details
-                className={`assistant-workflow-panel${streamingRun ? " assistant-workflow-panel-live" : ""}`}
-                open={!workflowStepsCollapsed}
-                onToggle={(event) => setWorkflowStepsCollapsed(!event.currentTarget.open)}
-              >
-                <summary>
-                  <span><Check size={13} /> 执行状态</span>
-                </summary>
-                <div className="assistant-workflow-todo">
-                  <div className="assistant-workflow-todo-item done">
-                    <span>✓</span><strong>准备</strong>
-                  </div>
-                  <div className={`assistant-workflow-todo-item${activeLiveTool ? " active" : completedLiveTool ? " done" : " pending"}`}>
-                    <span>{completedLiveTool ? "✓" : activeLiveTool ? "•" : "·"}</span><strong>工具</strong>
-                  </div>
-                  <div className={`assistant-workflow-todo-item${waitingForModelOutput ? " active" : streamingRun ? " pending" : " done"}`}>
-                    <span>{streamingRun ? "•" : "✓"}</span><strong>生成结果</strong>
-                  </div>
-                  <div className={`assistant-workflow-todo-item${streamingRun ? " pending" : " done"}`}>
-                    <span>{streamingRun ? "·" : "✓"}</span><strong>完成</strong>
-                  </div>
-                </div>
-              </details>
-            )}
 
             <div className="assistant-composer-dock">
             <div className="assistant-composer">

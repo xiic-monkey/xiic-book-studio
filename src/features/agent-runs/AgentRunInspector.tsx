@@ -1,5 +1,6 @@
 import { Check, ChevronDown, Clock3, ShieldCheck, Wrench, X } from "lucide-react";
 import type { ActionProposal, AgentRunSummary, ToolInvocation } from "../../types";
+import { proposalTypeLabel, toolLabel } from "./toolLabels";
 
 interface AgentRunInspectorProps {
   run: AgentRunSummary | null;
@@ -10,22 +11,7 @@ interface AgentRunInspectorProps {
   onRejectProposal: (proposal: ActionProposal) => void;
 }
 
-const toolLabels: Record<string, string> = {
-  story_context_search: "检索故事资料",
-  prepare_agent_context: "准备创作上下文",
-  check_continuity: "检查连续性",
-  create_artifact: "生成候选版本",
-  get_current_artifact: "读取当前版本",
-  get_story_bible: "读取创作基准",
-  get_chapter_context: "读取当前章节",
-  search_story: "检索故事内容",
-};
-
 const adoptionActionLabel = "确认采用";
-
-function toolLabel(toolKey: string) {
-  return toolLabels[toolKey] ?? toolKey.replace(/[_-]+/g, " ").replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
-}
 
 function invocationStatusLabel(invocation: ToolInvocation) {
   if (invocation.status === "success") return "成功";
@@ -53,17 +39,6 @@ export function resultSummary(invocation: ToolInvocation) {
   );
   if (count !== undefined) return `返回 ${count.toLocaleString()} 条结果`;
   return "已返回结构化结果";
-}
-
-function proposalTypeLabel(proposalType: string) {
-  const labels: Record<string, string> = {
-    create_chapter: "创建章节",
-    rename_chapter: "重命名章节",
-    artifact_candidate: "资料候选版本",
-    canon_entry: "资料候选",
-    foreshadowing: "伏笔候选",
-  };
-  return labels[proposalType] ?? proposalType;
 }
 
 function CompactRunInspector({ run }: { run: AgentRunSummary }) {

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -726,6 +727,16 @@ async fn run_orchestrator_turn(
     )?;
 
     let mut task_runs: Vec<Option<WorkflowRun>> = vec![None; decision.tasks.len()];
+    let tasks = decision.tasks.clone();
+    let mut statuses = vec!["pending".to_string(); tasks.len()];
+    emit_plan_snapshot(
+        state,
+        parent.id,
+        input.project_id,
+        input.chapter_id,
+        &tasks,
+        &statuses,
+    );
     let mut start_errors = Vec::new();
     // Start independent tasks immediately, but wait for every declared dependency before
     // starting a dependent task. Internal starts bypass the legacy single-active-run guard,
@@ -761,6 +772,17 @@ async fn run_orchestrator_turn(
             };
             let dependency_run =
                 wait_for_child_terminal(state, dependency_run_id, Some(parent.id)).await?;
+            if let Some(slot) = statuses.get_mut(*dependency) {
+                *slot = plan_status_for_run(&dependency_run.status).to_string();
+                emit_plan_snapshot(
+                    state,
+                    parent.id,
+                    input.project_id,
+                    input.chapter_id,
+                    &tasks,
+                    &statuses,
+                );
+            }
             if dependency_run.status != "success" {
                 dependency_error = Some(format!(
                     "依赖任务 {} 未成功（{}），跳过“{}”",
@@ -777,6 +799,17 @@ async fn run_orchestrator_turn(
 
         if let Some(error) = dependency_error {
             start_errors.push(error.clone());
+            if let Some(slot) = statuses.get_mut(index) {
+                *slot = "skipped".to_string();
+            }
+            emit_plan_snapshot(
+                state,
+                parent.id,
+                input.project_id,
+                input.chapter_id,
+                &tasks,
+                &statuses,
+            );
             state.insert_run_event(
                 parent.id,
                 input.project_id,
@@ -790,9 +823,17 @@ async fn run_orchestrator_turn(
         }
 
         match start_delegated_task(state, input, parent.id, task).await {
-            Ok(child) => task_runs[index] = Some(child.run),
+            Ok(child) => {
+                task_runs[index] = Some(child.run);
+                if let Some(slot) = statuses.get_mut(index) {
+                    *slot = "running".to_string();
+                }
+            }
             Err(error) => {
                 start_errors.push(format!("{}：{}", task.title, error));
+                if let Some(slot) = statuses.get_mut(index) {
+                    *slot = "failed".to_string();
+                }
                 state.insert_run_event(
                     parent.id,
                     input.project_id,
@@ -804,8 +845,16 @@ async fn run_orchestrator_turn(
                 )?;
             }
         }
+        emit_plan_snapshot(
+            state,
+            parent.id,
+            input.project_id,
+            input.chapter_id,
+            &tasks,
+            &statuses,
+        );
     }
-    let children = task_runs.into_iter().flatten().collect::<Vec<_>>();
+    let children = task_runs.iter().flatten().cloned().collect::<Vec<_>>();
     if children.is_empty() {
         return Err(AppError::Validation(format!(
             "主 Agent 未能启动任何子任务：{}",
@@ -818,9 +867,17 @@ async fn run_orchestrator_turn(
     let chapter_id = input.chapter_id;
     let orchestration_errors = start_errors.join("；");
     tokio::spawn(async move {
-        let summary =
-            wait_for_children_and_summarize(&state, parent_id, &children, &orchestration_errors)
-                .await;
+        let summary = wait_for_children_and_summarize(
+            &state,
+            parent_id,
+            project_id,
+            chapter_id,
+            &tasks,
+            &task_runs,
+            statuses,
+            &orchestration_errors,
+        )
+        .await;
         let cancelled = state.run_cancellation_requested(parent_id).unwrap_or(false);
         let (status, text, error) = if cancelled {
             (
@@ -933,6 +990,56 @@ fn parse_orchestrator_decision(
         }
     }
     Ok(decision)
+}
+
+/// 子运行状态 -> 计划快照状态。计划卡只关心"这件事到哪一步了"。
+fn plan_status_for_run(status: &str) -> &'static str {
+    match status {
+        "success" => "success",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "running",
+    }
+}
+
+/// `plan_updated` 的事件载荷。整体快照而非增量：前端用最新一条替换计划卡，
+/// 因此事件乱序不会让某个任务永久停在 pending。
+fn plan_snapshot_payload(tasks: &[OrchestratorTask], statuses: &[String]) -> String {
+    let entries = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            json!({
+                "index": index,
+                "title": task.title,
+                "task_type": task.task_type,
+                "chapter_id": task.chapter_id,
+                "depends_on": task.depends_on,
+                "status": statuses.get(index).map(String::as_str).unwrap_or("pending"),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&json!({ "tasks": entries }))
+        .unwrap_or_else(|_| "{\"tasks\":[]}".to_string())
+}
+
+fn emit_plan_snapshot(
+    state: &AppState,
+    run_id: i64,
+    project_id: i64,
+    chapter_id: Option<i64>,
+    tasks: &[OrchestratorTask],
+    statuses: &[String],
+) {
+    let _ = state.insert_run_event(
+        run_id,
+        project_id,
+        chapter_id,
+        "plan_updated",
+        &plan_snapshot_payload(tasks, statuses),
+        "running",
+        None,
+    );
 }
 
 fn orchestrator_plan_context(state: &AppState, project_id: i64) -> AppResult<String> {
@@ -1218,16 +1325,24 @@ fn child_run_summary(run: &WorkflowRun) -> String {
 async fn wait_for_children_and_summarize(
     state: &AppState,
     parent_run_id: i64,
-    children: &[WorkflowRun],
+    project_id: i64,
+    chapter_id: Option<i64>,
+    tasks: &[OrchestratorTask],
+    task_runs: &[Option<WorkflowRun>],
+    mut statuses: Vec<String>,
     orchestration_errors: &str,
 ) -> AppResult<String> {
-    for child in children {
-        wait_for_child_terminal(state, child.id, Some(parent_run_id)).await?;
+    let mut completed: Vec<Option<WorkflowRun>> = vec![None; task_runs.len()];
+    for (index, child) in task_runs.iter().enumerate() {
+        let Some(child) = child else { continue };
+        let terminal = wait_for_child_terminal(state, child.id, Some(parent_run_id)).await?;
+        if let Some(slot) = statuses.get_mut(index) {
+            *slot = plan_status_for_run(&terminal.status).to_string();
+        }
+        emit_plan_snapshot(state, parent_run_id, project_id, chapter_id, tasks, &statuses);
+        completed[index] = Some(terminal);
     }
-    let completed = children
-        .iter()
-        .map(|child| state.get_workflow_run_v2(child.id))
-        .collect::<AppResult<Vec<_>>>()?;
+    let completed = completed.into_iter().flatten().collect::<Vec<_>>();
     let successes = completed
         .iter()
         .filter(|run| run.status == "success")
@@ -1818,6 +1933,74 @@ mod tests {
         panic!("Agent run {run_id} did not emit {event_type}");
     }
 
+    fn orchestrator_task(task_type: &str, title: &str, depends_on: Vec<usize>) -> OrchestratorTask {
+        OrchestratorTask {
+            task_type: task_type.to_string(),
+            title: title.to_string(),
+            instruction: format!("执行「{title}」"),
+            depends_on,
+            source_artifact_id: None,
+            chapter_id: Some(3),
+            story_architect_mode: None,
+        }
+    }
+
+    #[test]
+    fn plan_snapshot_keeps_index_dependency_and_falls_back_to_pending() {
+        let tasks = vec![
+            orchestrator_task("draft", "写第三章", vec![]),
+            orchestrator_task("review", "试读第三章", vec![0]),
+        ];
+        let statuses = vec!["running".to_string()];
+        let value: Value =
+            serde_json::from_str(&plan_snapshot_payload(&tasks, &statuses)).unwrap();
+        let entries = value["tasks"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["index"], json!(0));
+        assert_eq!(entries[0]["task_type"], json!("draft"));
+        assert_eq!(entries[0]["chapter_id"], json!(3));
+        assert_eq!(entries[0]["status"], json!("running"));
+        assert_eq!(entries[1]["depends_on"], json!([0]));
+        // 状态数组短于任务数时按 pending 呈现，前端永远拿不到 null 状态。
+        assert_eq!(entries[1]["status"], json!("pending"));
+    }
+
+    #[test]
+    fn plan_status_maps_child_run_statuses() {
+        assert_eq!(plan_status_for_run("success"), "success");
+        assert_eq!(plan_status_for_run("failed"), "failed");
+        assert_eq!(plan_status_for_run("cancelled"), "cancelled");
+        assert_eq!(plan_status_for_run("running"), "running");
+        assert_eq!(plan_status_for_run("whatever"), "running");
+    }
+
+    #[test]
+    fn plan_updated_event_is_persisted_on_the_orchestrator_run() {
+        let (_temp_dir, state, project) = test_state("http://127.0.0.1:1");
+        let run = state
+            .insert_workflow_run(project.id, None, "orchestrator", "input", "", "running", None, 0)
+            .unwrap();
+        let tasks = vec![orchestrator_task("draft", "写第三章", vec![])];
+        emit_plan_snapshot(
+            &state,
+            run.id,
+            project.id,
+            None,
+            &tasks,
+            &["running".to_string()],
+        );
+
+        let events = state.list_run_events(run.id, 0).unwrap();
+        let plan = events
+            .iter()
+            .find(|event| event.kind == "plan_updated")
+            .expect("plan_updated 事件应落在主 Agent 运行上");
+        assert_eq!(plan.stage, "orchestrator");
+        assert_eq!(plan.status, "running");
+        let value: Value = serde_json::from_str(&plan.delta).unwrap();
+        assert_eq!(value["tasks"][0]["status"], json!("running"));
+    }
+
     #[test]
     fn orchestrator_decision_accepts_answer_without_tasks() {
         let decision = parse_orchestrator_decision(r#"{"kind":"answer","answer":"你好","tasks":[{"task_type":"draft","title":"x","instruction":"x"}]}"#, None).unwrap();
@@ -1866,8 +2049,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_chapter_id_overrides_model_chapter_id() {
-        assert_eq!(
+    fn workspace_chapter_id_overrides_model_chapter_id() {        assert_eq!(
             delegated_chapter_id(Some(42), Some(1), "missing").unwrap(),
             42
         );

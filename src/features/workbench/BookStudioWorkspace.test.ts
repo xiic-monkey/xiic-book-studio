@@ -1,11 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildChapterAgentPrompt,
   compactAssistantModelName,
-  compactAssistantOutput,
   currentPlanStatus,
   formatReviewInstructions,
+  foundationStageReadiness,
+  isFeedScrolledToBottom,
   isTopLevelStreamingRun,
+  partialConfirmationNotice,
+  scrollFeedToBottom,
   splitThinkingContent,
 } from "./BookStudioWorkspace";
 
@@ -18,6 +21,40 @@ function workspace(overrides: Record<string, unknown> = {}) {
     ...overrides,
   } as Parameters<typeof currentPlanStatus>[0];
 }
+
+describe("isFeedScrolledToBottom", () => {
+  it("treats a feed within the threshold as following the bottom", () => {
+    expect(isFeedScrolledToBottom({ scrollHeight: 1000, clientHeight: 400, scrollTop: 600 })).toBe(true);
+    expect(isFeedScrolledToBottom({ scrollHeight: 1000, clientHeight: 400, scrollTop: 598 })).toBe(true);
+  });
+
+  it("stops following once the reader scrolls away from the bottom", () => {
+    expect(isFeedScrolledToBottom({ scrollHeight: 1000, clientHeight: 400, scrollTop: 100 })).toBe(false);
+  });
+
+  it("treats content that does not overflow as at the bottom", () => {
+    expect(isFeedScrolledToBottom({ scrollHeight: 400, clientHeight: 400, scrollTop: 0 })).toBe(true);
+  });
+});
+
+describe("scrollFeedToBottom", () => {
+  it("scrolls the feed to its full height with a smooth animation", () => {
+    const scrollTo = vi.fn();
+    scrollFeedToBottom({ scrollHeight: 1800, scrollTo });
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+    expect(scrollTo).toHaveBeenCalledWith({ top: 1800, behavior: "smooth" });
+  });
+
+  it("targets the current height rather than a captured one", () => {
+    const scrollTo = vi.fn();
+    const feed = { scrollHeight: 500, scrollTo };
+    scrollFeedToBottom(feed);
+    feed.scrollHeight = 1200;
+    scrollFeedToBottom(feed);
+    expect(scrollTo).toHaveBeenNthCalledWith(1, { top: 500, behavior: "smooth" });
+    expect(scrollTo).toHaveBeenNthCalledWith(2, { top: 1200, behavior: "smooth" });
+  });
+});
 
 describe("currentPlanStatus", () => {
   it("maps an empty plan to the drafting state", () => {
@@ -34,6 +71,14 @@ describe("currentPlanStatus", () => {
     expect(currentPlanStatus(workspace({
       canon_entries: [
         { category: "character", status: "pending_human_approval", source_chapter_id: 7 },
+      ],
+    }))).toEqual({ label: "待完善计划", tone: "draft" });
+  });
+
+  it("stops asking for confirmation once every card is adopted", () => {
+    expect(currentPlanStatus(workspace({
+      canon_entries: [
+        { category: "world", status: "approved", source_chapter_id: null },
       ],
     }))).toEqual({ label: "待完善计划", tone: "draft" });
   });
@@ -56,6 +101,80 @@ describe("currentPlanStatus", () => {
       story_bible: { status: "confirmed" },
       story_bible_review: { ...review, status: "confirmed" },
     }))).toEqual({ label: "已采用", tone: "confirmed" });
+  });
+});
+
+describe("foundationStageReadiness", () => {
+  it("marks a stage as ready once it has book-level material", () => {
+    const stages = foundationStageReadiness({
+      canon_entries: [
+        { category: "world", status: "pending_human_approval", source_chapter_id: null, content: "火脉残缺者只能做杂役。" },
+      ],
+      chapter_plans: [],
+    });
+
+    expect(stages.map((stage) => [stage.stage, stage.ready, stage.pendingCount])).toEqual([
+      ["setting", true, 1],
+      ["outline", false, 0],
+      ["characters", false, 0],
+    ]);
+  });
+
+  it("treats chapter plans and outline cards as outline material", () => {
+    const stages = foundationStageReadiness({
+      canon_entries: [
+        { category: "outline", status: "approved", source_chapter_id: null, content: "第一阶段目标。" },
+      ],
+      chapter_plans: [{ status: "pending_human_approval", content: "第一章计划。" }],
+    });
+
+    expect(stages.find((stage) => stage.stage === "outline")?.ready).toBe(true);
+  });
+
+  it("ignores chapter-derived cards and archived material", () => {
+    const stages = foundationStageReadiness({
+      canon_entries: [
+        { category: "character", status: "approved", source_chapter_id: 7, content: "正文抽出的角色。" },
+        { category: "world", status: "archived", source_chapter_id: null, content: "已归档。" },
+      ],
+      chapter_plans: [{ status: "archived", content: "已归档计划。" }],
+    });
+
+    expect(stages.every((stage) => !stage.ready)).toBe(true);
+  });
+});
+
+describe("partialConfirmationNotice", () => {
+  it("reports the adopted cards and the stages that are still missing", () => {
+    const notice = partialConfirmationNotice({
+      status: "partially_confirmed",
+      approved_card_count: 12,
+      approved_plan_count: 0,
+      story_bible: null,
+      review: null,
+      blockers: ["缺少大纲基础资料", "缺少角色基础资料"],
+      missing_stages: ["outline", "characters"],
+    });
+
+    expect(notice).toContain("已采纳 12 张资料卡");
+    expect(notice).toContain("大纲");
+    expect(notice).toContain("角色");
+    expect(notice).not.toContain("世界观");
+  });
+
+  it("says the available material is already adopted when nothing new was pending", () => {
+    const notice = partialConfirmationNotice({
+      status: "partially_confirmed",
+      approved_card_count: 0,
+      approved_plan_count: 0,
+      story_bible: null,
+      review: null,
+      blockers: ["缺少大纲基础资料", "缺少角色基础资料"],
+      missing_stages: ["outline", "characters"],
+    });
+
+    expect(notice).toContain("现有阶段资料已全部采纳");
+    expect(notice).toContain("大纲、角色");
   });
 });
 
@@ -88,32 +207,6 @@ describe("buildChapterAgentPrompt", () => {
     expect(buildChapterAgentPrompt("潮痕档案", "第 1 章", "draft", "把结尾停在门打开之前")).toContain(
       "补充要求：把结尾停在门打开之前",
     );
-  });
-});
-
-describe("compactAssistantOutput", () => {
-  it("folds a delegated task's raw JSON into a short status line", () => {
-    const output = '已完成 1 个子任务。第 1 章试读检查：[ { "issue_type": "事实越界" } ]';
-
-    expect(compactAssistantOutput(output)).toBe("已完成 1 个子任务 · 第 1 章试读检查");
-  });
-
-  it("keeps excerpt text out of the main conversation even without JSON", () => {
-    const output = "已完成 1 个子任务。按试读反馈修订第 1 章候选稿：林默把最后一盘归档带推进修复机。";
-
-    expect(compactAssistantOutput(output)).toBe("已完成 1 个子任务 · 按试读反馈修订第 1 章候选稿");
-  });
-
-  it("truncates an overlong task label", () => {
-    const output = `已完成 2 个子任务。${"长".repeat(60)}：正文`;
-
-    expect(compactAssistantOutput(output)).toBe(`已完成 2 个子任务 · ${"长".repeat(40)}…`);
-  });
-
-  it("keeps outputs without the completion preamble unchanged", () => {
-    const output = "第 1 章草稿已生成，请查看候选稿。";
-
-    expect(compactAssistantOutput(output)).toBe(output);
   });
 });
 
