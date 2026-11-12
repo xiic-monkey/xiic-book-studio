@@ -2,6 +2,8 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    time::SystemTime,
 };
 
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -75,6 +77,62 @@ struct EmbeddingRuntime {
     device: Device,
 }
 
+/// 模型文件的指纹（长度 + 修改时间）。打包资源被替换时用来让缓存失效。
+#[derive(Clone, PartialEq, Eq)]
+struct ModelSignature {
+    manifest: (u64, Option<SystemTime>),
+    weights: (u64, Option<SystemTime>),
+}
+
+fn model_signature(directory: &Path) -> Option<ModelSignature> {
+    let stamp = |name: &str| {
+        let metadata = fs::metadata(directory.join(name)).ok()?;
+        Some((metadata.len(), metadata.modified().ok()))
+    };
+    Some(ModelSignature {
+        manifest: stamp("manifest.json")?,
+        weights: stamp("pytorch_model.bin")?,
+    })
+}
+
+struct ModelCache {
+    directory: PathBuf,
+    signature: ModelSignature,
+    /// `None` 表示只做过可用性探测，尚未加载权重。
+    runtime: Option<Arc<EmbeddingRuntime>>,
+}
+
+/// 进程级缓存：模型是打包资源，加载一次后应在整个会话内复用。
+/// 此前搜索热路径和增量索引每次调用都重新读 95MB 权重并做 SHA256 全文件校验。
+static MODEL_CACHE: OnceLock<Mutex<Option<ModelCache>>> = OnceLock::new();
+
+fn model_cache() -> &'static Mutex<Option<ModelCache>> {
+    MODEL_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 锁被 panic 污染时继续使用内层数据，避免一次异常让本地检索永久失效。
+fn lock_model_cache() -> MutexGuard<'static, Option<ModelCache>> {
+    model_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 缓存条目是否仍然有效：目录一致且模型文件未被替换。
+fn cache_is_fresh(
+    cache: &Option<ModelCache>,
+    directory: &Path,
+    signature: Option<&ModelSignature>,
+) -> bool {
+    let (Some(entry), Some(signature)) = (cache.as_ref(), signature) else {
+        return false;
+    };
+    entry.directory.as_path() == directory && entry.signature == *signature
+}
+
+fn cached_runtime_from(cache: &Option<ModelCache>) -> Option<Arc<EmbeddingRuntime>> {
+    cache.as_ref()?.runtime.clone()
+}
+
 pub async fn rebuild_story_search_index(
     state: &AppState,
     input: RebuildStorySearchIndexRequest,
@@ -83,7 +141,7 @@ pub async fn rebuild_story_search_index(
     ensure_sqlite_vec_loaded_if_present(state)?;
     clear_project_index(state, input.project_id)?;
 
-    let runtime = EmbeddingRuntime::load(state);
+    let runtime = EmbeddingRuntime::cached(state);
     let runtime_error = runtime.as_ref().err().map(ToString::to_string);
     let vector_ready = runtime.as_ref().is_ok() && ensure_vector_table(state).is_ok();
 
@@ -91,7 +149,7 @@ pub async fn rebuild_story_search_index(
         replace_source(
             state,
             &payload,
-            runtime.as_ref().ok(),
+            runtime.as_deref().ok(),
             vector_ready,
             runtime_error.as_deref(),
         )?;
@@ -346,7 +404,7 @@ fn search_story_context_with_embeddings(
     }
 
     if use_embeddings {
-        if let Ok(runtime) = EmbeddingRuntime::load(state) {
+        if let Ok(runtime) = EmbeddingRuntime::cached(state) {
             if ensure_vector_table(state).is_ok() {
                 if let Ok(vector) = runtime.encode(&query) {
                     for (rank, document) in
@@ -509,13 +567,13 @@ pub(crate) fn chunk_text(
 }
 
 fn replace_source_with_runtime(state: &AppState, payload: &SearchSourcePayload) -> AppResult<()> {
-    let runtime = EmbeddingRuntime::load(state);
+    let runtime = EmbeddingRuntime::cached(state);
     let runtime_error = runtime.as_ref().err().map(ToString::to_string);
     let vector_ready = runtime.as_ref().is_ok() && ensure_vector_table(state).is_ok();
     replace_source(
         state,
         payload,
-        runtime.as_ref().ok(),
+        runtime.as_deref().ok(),
         vector_ready,
         runtime_error.as_deref(),
     )
@@ -1369,15 +1427,52 @@ fn now() -> String {
 }
 
 impl EmbeddingRuntime {
+    /// 可用性探测：命中缓存时只比对文件指纹，不再重复读 95MB 权重算 SHA256。
+    /// 返回值保持不变，避免影响前端展示的状态文案。
     fn probe(state: &AppState) -> Result<String, AppError> {
         let directory = model_directory(state)?;
+        let signature = model_signature(&directory);
+        let mut cache = lock_model_cache();
+        if cache_is_fresh(&cache, &directory, signature.as_ref()) {
+            return Ok("available (lazy load)".to_string());
+        }
+        // 指纹缺失或变更：走一次完整校验；通过后只记指纹，不加载权重。
         verify_model_package(&directory)?;
+        if let Some(signature) = signature {
+            *cache = Some(ModelCache {
+                directory,
+                signature,
+                runtime: None,
+            });
+        }
         Ok("available (lazy load)".to_string())
     }
 
-    fn load(state: &AppState) -> Result<Self, AppError> {
+    /// 正常路径统一走这里：命中缓存时零 IO；未命中时校验并加载。
+    /// 加载失败不写缓存，用户补齐模型资源后无需重启即可重试。
+    fn cached(state: &AppState) -> Result<Arc<Self>, AppError> {
         let directory = model_directory(state)?;
-        verify_model_package(&directory)?;
+        let signature = model_signature(&directory);
+        // 持锁加载：首次加载较慢，但可避免并发首次访问时重复读权重。
+        let mut cache = lock_model_cache();
+        if cache_is_fresh(&cache, &directory, signature.as_ref()) {
+            if let Some(runtime) = cached_runtime_from(&cache) {
+                return Ok(runtime);
+            }
+        }
+        let runtime = Arc::new(Self::load_from(&directory)?);
+        if let Some(signature) = signature {
+            *cache = Some(ModelCache {
+                directory,
+                signature,
+                runtime: Some(Arc::clone(&runtime)),
+            });
+        }
+        Ok(runtime)
+    }
+
+    fn load_from(directory: &Path) -> Result<Self, AppError> {
+        verify_model_package(directory)?;
         let device = embedding_device();
         let config: BertConfig = serde_json::from_slice(&fs::read(directory.join("config.json"))?)?;
         let tokenizer =
@@ -1394,6 +1489,12 @@ impl EmbeddingRuntime {
             model,
             device,
         })
+    }
+
+    /// 创建独占实例，仅供手动 RSS 测量；业务路径一律用 [`Self::cached`]。
+    #[cfg(test)]
+    fn load(state: &AppState) -> Result<Self, AppError> {
+        Self::load_from(&model_directory(state)?)
     }
 
     fn encode(&self, text: &str) -> Result<Vec<f32>, AppError> {
@@ -1504,15 +1605,80 @@ fn candle_error(error: candle_core::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, process::Command, thread, time::Duration};
+    use std::{path::PathBuf, process::Command, sync::Arc, thread, time::Duration};
 
     use super::{
-        chunk_text, get_story_search_status, invalidate_chapters_from, search_story_context,
-        EmbeddingRuntime, NORMALIZATION_VERSION,
+        cache_is_fresh, cached_runtime_from, chunk_text, get_story_search_status,
+        invalidate_chapters_from, lock_model_cache, model_signature, search_story_context,
+        EmbeddingRuntime, ModelCache, NORMALIZATION_VERSION,
     };
     use crate::{db::AppState, models::StoryContextSearchInput};
     use rusqlite::params;
     use tempfile::tempdir;
+
+    #[test]
+    fn model_cache_invalidates_when_model_files_change() {
+        let dir = tempdir().unwrap();
+        let directory = dir.path();
+        std::fs::write(directory.join("manifest.json"), "{}").unwrap();
+        std::fs::write(directory.join("pytorch_model.bin"), b"weights-v1").unwrap();
+
+        let signature = model_signature(directory).expect("文件齐全时取到指纹");
+        let cache = Some(ModelCache {
+            directory: directory.to_path_buf(),
+            signature: signature.clone(),
+            runtime: None,
+        });
+
+        assert!(cache_is_fresh(&cache, directory, Some(&signature)));
+        // 只探测过、尚未加载权重时不应被当成可复用的运行时。
+        assert!(cached_runtime_from(&cache).is_none());
+        // 指纹无法取得（资源缺失）时保守视为失效，每次重新走完整校验。
+        assert!(!cache_is_fresh(&cache, directory, None));
+        let missing = tempdir().unwrap();
+        assert!(model_signature(missing.path()).is_none());
+        // 换了模型目录也必须失效。
+        let other = tempdir().unwrap();
+        assert!(!cache_is_fresh(&cache, other.path(), Some(&signature)));
+
+        // 权重被替换后，旧条目失效；记录新指纹后重新命中。
+        std::fs::write(directory.join("pytorch_model.bin"), b"weights-v2-much-longer").unwrap();
+        let refreshed_signature = model_signature(directory).unwrap();
+        assert!(!cache_is_fresh(
+            &cache,
+            directory,
+            Some(&refreshed_signature)
+        ));
+        let refreshed = Some(ModelCache {
+            directory: directory.to_path_buf(),
+            signature: refreshed_signature.clone(),
+            runtime: None,
+        });
+        assert!(cache_is_fresh(&refreshed, directory, Some(&refreshed_signature)));
+    }
+
+    #[test]
+    #[ignore = "manual: loads the real 95MB model; run with --ignored --nocapture"]
+    fn cached_runtime_reuses_the_loaded_model() {
+        use std::time::Instant;
+
+        let dir = tempdir().unwrap();
+        let state =
+            AppState::from_path(PathBuf::from(dir.path()).join("search.sqlite3")).unwrap();
+        *lock_model_cache() = None;
+
+        let started = Instant::now();
+        let first = EmbeddingRuntime::cached(&state).expect("bundled model should load");
+        let cold_ms = started.elapsed().as_millis();
+
+        let started = Instant::now();
+        let second = EmbeddingRuntime::cached(&state).expect("bundled model should load");
+        let warm_ms = started.elapsed().as_millis();
+
+        assert!(Arc::ptr_eq(&first, &second), "第二次应复用同一实例");
+        eprintln!("EMBEDDING_CACHE cold_ms={cold_ms} warm_ms={warm_ms}");
+        assert!(warm_ms < cold_ms, "命中缓存应快于冷加载");
+    }
 
     #[test]
     fn chunking_is_stable_and_overlaps() {
