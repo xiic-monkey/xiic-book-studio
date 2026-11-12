@@ -57,11 +57,15 @@ export type CanonIssue = { domain: string, severity: string, title: string, conf
 
 export type StoryBibleReview = { id: number, project_id: number, canon_fingerprint: string, verdict: string, summary: string, issues: Array<CanonIssue>, status: string, note: string, created_at: string, confirmed_at: string | null, };
 
-export type CurrentPlanConfirmationStatus = "confirmed" | "awaiting_review_confirmation" | "blocked";
+export type CurrentPlanConfirmationStatus = "confirmed" | "awaiting_review_confirmation" | "blocked" | "partially_confirmed";
 
 export type ConfirmCurrentPlanRequest = { project_id: number, note: string, };
 
-export type CurrentPlanConfirmationResult = { status: CurrentPlanConfirmationStatus, approved_card_count: number, approved_plan_count: number, story_bible: StoryBible | null, review: StoryBibleReview | null, blockers: Array<string>, };
+export type CurrentPlanConfirmationResult = { status: CurrentPlanConfirmationStatus, approved_card_count: number, approved_plan_count: number, story_bible: StoryBible | null, review: StoryBibleReview | null, blockers: Array<string>, 
+/**
+ * 还没有资料的基础阶段（setting/outline/characters）。
+ */
+missing_stages: Array<string>, };
 
 export type AiSettings = { base_url: string, model: string, temperature: number, thinking_enabled: boolean, thinking_level: "off" | "low" | "medium" | "high", has_api_key: boolean, };
 
@@ -99,7 +103,7 @@ export type OrchestratorTurnResponse = { kind: string, answer: string | null, pa
 
 export type AgentRunSummary = { run: WorkflowRun, artifact: Artifact | null, prepared_context_id: number | null, tool_invocations: Array<ToolInvocation>, proposals: Array<ActionProposal>, };
 
-export type RunEvent = { run_id: number, project_id: number, chapter_id: number | null, stage: string, sequence: number, kind: "completed" | "failed" | "cancelled" | "started" | "output_delta" | "output_reset" | "thinking_start" | "thinking_delta" | "thinking_end" | "cancellation_requested" | "proposal_warning" | "tool_started" | "tool_completed", delta: string, status: string, error: string | null, tool_key: string | null, tool_invocation_id: number | null, elapsed_ms: number | null, created_at: string, parent_run_id: number | null, agent_key: string | null, agent_role: string | null, task_title: string | null, };
+export type RunEvent = { run_id: number, project_id: number, chapter_id: number | null, stage: string, sequence: number, kind: "completed" | "failed" | "cancelled" | "started" | "output_delta" | "output_reset" | "thinking_start" | "thinking_delta" | "thinking_end" | "cancellation_requested" | "proposal_warning" | "plan_updated" | "tool_started" | "tool_completed", delta: string, status: string, error: string | null, tool_key: string | null, tool_invocation_id: number | null, elapsed_ms: number | null, created_at: string, parent_run_id: number | null, agent_key: string | null, agent_role: string | null, task_title: string | null, };
 
 export type ActiveAgentRun = { id: number, project_id: number, chapter_id: number | null, stage: string, output: string, status: string, error: string | null, elapsed_ms: number, created_at: string, parent_run_id: number | null, run_kind: string, task_title: string | null, };
 

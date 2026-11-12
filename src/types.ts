@@ -8,6 +8,8 @@ export type {
   ArtifactSummary,
   ChapterPlan,
   ContextSegment,
+  CurrentPlanConfirmationResult,
+  CurrentPlanConfirmationStatus,
   PreparedContext,
   ProposalApplyResult,
   ProposalStatus,
@@ -136,20 +138,6 @@ export interface StoryBible {
   source_artifact_id?: number | null;
   created_at: string;
   updated_at: string;
-}
-
-export type CurrentPlanConfirmationStatus =
-  | "confirmed"
-  | "awaiting_review_confirmation"
-  | "blocked";
-
-export interface CurrentPlanConfirmationResult {
-  status: CurrentPlanConfirmationStatus;
-  approved_card_count: number;
-  approved_plan_count: number;
-  story_bible: StoryBible | null;
-  review: StoryBibleReview | null;
-  blockers: string[];
 }
 
 export interface StoryArc {

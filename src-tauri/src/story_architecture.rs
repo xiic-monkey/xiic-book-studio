@@ -133,6 +133,7 @@ pub async fn confirm_current_plan(
                 story_bible: initial_story_bible,
                 review: initial_review,
                 blockers,
+                missing_stages: Vec::new(),
             });
         }
     }
@@ -143,14 +144,22 @@ pub async fn confirm_current_plan(
         .or(state.get_story_bible(input.project_id)?);
     let latest_review = state.latest_story_bible_review(input.project_id)?;
 
-    if !data.blockers.is_empty() {
+    if !data.missing_stages.is_empty() {
+        // 资料卡按阶段独立采纳：已有阶段的资料先落地，创作基准等缺阶段补齐后再建立。
+        // 只有三个阶段都空才是真的无从下手。
+        let nothing_to_adopt = data.missing_stages.len() == 3;
         return Ok(CurrentPlanConfirmationResult {
-            status: CurrentPlanConfirmationStatus::Blocked,
+            status: if nothing_to_adopt {
+                CurrentPlanConfirmationStatus::Blocked
+            } else {
+                CurrentPlanConfirmationStatus::PartiallyConfirmed
+            },
             approved_card_count: data.approved_card_count,
             approved_plan_count: data.approved_plan_count,
             story_bible,
             review: latest_review,
             blockers: data.blockers,
+            missing_stages: data.missing_stages,
         });
     }
 
@@ -167,6 +176,7 @@ pub async fn confirm_current_plan(
             story_bible: state.get_story_bible(input.project_id)?,
             review: Some(review),
             blockers: Vec::new(),
+            missing_stages: Vec::new(),
         });
     }
 
@@ -180,6 +190,7 @@ pub async fn confirm_current_plan(
             story_bible,
             review: Some(review),
             blockers,
+            missing_stages: Vec::new(),
         });
     }
 
@@ -195,6 +206,7 @@ pub async fn confirm_current_plan(
             story_bible,
             review: Some(review),
             blockers: Vec::new(),
+            missing_stages: Vec::new(),
         });
     }
 
@@ -207,6 +219,7 @@ pub async fn confirm_current_plan(
         story_bible: Some(story_bible),
         review: Some(review),
         blockers: Vec::new(),
+        missing_stages: Vec::new(),
     })
 }
 
@@ -746,6 +759,99 @@ mod tests {
             "needs_review"
         );
         assert!(ensure_ready_for_draft(&state, project_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn confirming_current_plan_adopts_world_cards_even_without_outline_and_characters() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "只有世界观".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "先有世界".to_string(),
+            })
+            .unwrap();
+        state
+            .save_canon_entry(SaveCanonEntry {
+                id: None,
+                project_id: project.id,
+                category: "world".to_string(),
+                title: "火脉边界".to_string(),
+                content: "火脉残缺者不得直接炼化赤焰。".to_string(),
+                status: "pending_human_approval".to_string(),
+                source_artifact_id: None,
+                source_chapter_id: None,
+            })
+            .unwrap();
+
+        let result = confirm_current_plan(
+            &state,
+            ConfirmCurrentPlanRequest {
+                project_id: project.id,
+                note: "采纳世界观".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.status,
+            CurrentPlanConfirmationStatus::PartiallyConfirmed
+        );
+        assert_eq!(result.approved_card_count, 1);
+        assert_eq!(result.missing_stages, vec!["outline".to_string(), "characters".to_string()]);
+        assert!(result.story_bible.is_none());
+        assert!(state.get_story_bible(project.id).unwrap().is_none());
+        assert!(state
+            .list_canon_entries(project.id)
+            .unwrap()
+            .iter()
+            .all(|card| card.status == "approved"));
+    }
+
+    #[tokio::test]
+    async fn confirming_current_plan_stays_partial_when_everything_available_is_already_adopted() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "只有世界观".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "先有世界".to_string(),
+            })
+            .unwrap();
+        state
+            .save_canon_entry(SaveCanonEntry {
+                id: None,
+                project_id: project.id,
+                category: "world".to_string(),
+                title: "火脉边界".to_string(),
+                content: "火脉残缺者不得直接炼化赤焰。".to_string(),
+                status: "approved".to_string(),
+                source_artifact_id: None,
+                source_chapter_id: None,
+            })
+            .unwrap();
+
+        let result = confirm_current_plan(
+            &state,
+            ConfirmCurrentPlanRequest {
+                project_id: project.id,
+                note: "再次采纳".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.status,
+            CurrentPlanConfirmationStatus::PartiallyConfirmed
+        );
+        assert_eq!(result.approved_card_count, 0);
+        assert_eq!(result.missing_stages, vec!["outline".to_string(), "characters".to_string()]);
     }
 
     #[test]

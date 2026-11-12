@@ -41,6 +41,8 @@ pub struct CurrentPlanDataResult {
     pub approved_card_count: i64,
     pub approved_plan_count: i64,
     pub blockers: Vec<String>,
+    /// 还没有任何资料的基础阶段。资料卡按阶段独立采纳，缺阶段只影响创作基准的建立。
+    pub missing_stages: Vec<String>,
 }
 
 mod lifecycle;
@@ -253,7 +255,8 @@ impl AppState {
                     thinking_enabled INTEGER NOT NULL DEFAULT 0,
                     thinking_level TEXT NOT NULL DEFAULT 'off',
                     enabled_tool_keys TEXT NOT NULL DEFAULT '["search_story","search_story_facts","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]',
-                    allowed_skill_keys TEXT NOT NULL DEFAULT '["continuity_and_agency"]'
+                    allowed_skill_keys TEXT NOT NULL DEFAULT '["continuity_and_agency"]',
+                    prompt_customized INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS chapters (
@@ -374,6 +377,7 @@ impl AppState {
                     description TEXT NOT NULL DEFAULT '',
                     content TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    customized INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -1069,9 +1073,17 @@ impl AppState {
             return Err(AppError::Validation("Agent Prompt 不能为空".to_string()));
         }
         self.with_conn(|conn| {
+            let stage: String = conn
+                .query_row(
+                    "SELECT stage FROM agents WHERE id = ?1",
+                    params![agent_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("Agent 不存在".to_string()))?;
             let changed = conn.execute(
-                "UPDATE agents SET system_prompt = ?1 WHERE id = ?2",
-                params![prompt, agent_id],
+                "UPDATE agents SET system_prompt = ?1, prompt_customized = ?2 WHERE id = ?3",
+                params![prompt, agent_prompt_customized(&stage, prompt), agent_id],
             )?;
             if changed == 0 {
                 return Err(AppError::Validation("Agent 不存在".to_string()));
@@ -1090,7 +1102,7 @@ impl AppState {
             let current = conn
                 .query_row(
                     "SELECT name, role, system_prompt, temperature, thinking_enabled,
-                            thinking_level, enabled_tool_keys, allowed_skill_keys
+                            thinking_level, enabled_tool_keys, allowed_skill_keys, stage
                      FROM agents WHERE id = ?1",
                     params![input.agent_id],
                     |row| {
@@ -1103,6 +1115,7 @@ impl AppState {
                             row.get::<_, String>(5)?,
                             row.get::<_, String>(6)?,
                             row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
                         ))
                     },
                 )
@@ -1182,13 +1195,15 @@ impl AppState {
                 .as_deref()
                 .map(normalize_skill_keys)
                 .unwrap_or_else(|| parse_agent_keys(&current.7, false));
+            let prompt_customized = agent_prompt_customized(&current.8, &system_prompt);
 
             let changed = conn.execute(
                 "UPDATE agents
                  SET name = ?1, role = ?2, system_prompt = ?3, temperature = ?4,
                      provider_base_url = ?5, model = ?6, thinking_enabled = ?7,
-                     thinking_level = ?8, enabled_tool_keys = ?9, allowed_skill_keys = ?10
-                 WHERE id = ?11",
+                     thinking_level = ?8, enabled_tool_keys = ?9, allowed_skill_keys = ?10,
+                     prompt_customized = ?11
+                 WHERE id = ?12",
                 params![
                     name,
                     role,
@@ -1200,6 +1215,7 @@ impl AppState {
                     thinking_level,
                     serde_json::to_string(&enabled_tool_keys)?,
                     serde_json::to_string(&allowed_skill_keys)?,
+                    prompt_customized,
                     input.agent_id,
                 ],
             )?;
@@ -3340,17 +3356,25 @@ impl AppState {
                 if existing_key != skill_key {
                     return Err(AppError::Validation("技能标识不能修改".to_string()));
                 }
+                let customized = writing_skill_customized(
+                    skill_key,
+                    name,
+                    input.category.trim(),
+                    input.description.trim(),
+                    content,
+                );
                 conn.execute(
                     "UPDATE writing_skills
                      SET name = ?1, category = ?2, description = ?3, content = ?4,
-                         enabled = ?5, updated_at = ?6
-                     WHERE id = ?7",
+                         enabled = ?5, customized = ?6, updated_at = ?7
+                     WHERE id = ?8",
                     params![
                         name,
                         input.category.trim(),
                         input.description.trim(),
                         content,
                         if input.enabled { 1 } else { 0 },
+                        customized,
                         now,
                         id
                     ],
@@ -3365,14 +3389,15 @@ impl AppState {
             } else {
                 conn.execute(
                     "INSERT INTO writing_skills
-                        (skill_key, name, category, description, content, enabled, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                        (skill_key, name, category, description, content, enabled, customized, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
                      ON CONFLICT(skill_key) DO UPDATE SET
                         name = excluded.name,
                         category = excluded.category,
                         description = excluded.description,
                         content = excluded.content,
                         enabled = excluded.enabled,
+                        customized = excluded.customized,
                         updated_at = excluded.updated_at",
                     params![
                         skill_key,
@@ -3381,6 +3406,13 @@ impl AppState {
                         input.description.trim(),
                         content,
                         if input.enabled { 1 } else { 0 },
+                        writing_skill_customized(
+                            skill_key,
+                            name,
+                            input.category.trim(),
+                            input.description.trim(),
+                            content,
+                        ),
                         now
                     ],
                 )?;
@@ -3994,17 +4026,21 @@ impl AppState {
                 .ok_or_else(|| AppError::Validation("项目不存在".to_string()))?;
 
                 let mut blockers = Vec::new();
+                let mut missing_stages = Vec::new();
                 for stage in ["setting", "outline", "characters"] {
                     if !has_foundation_material_tx(conn, project_id, stage)? {
-                        blockers.push(format!("缺少{}基础资料", stage_label(stage)));
+                        missing_stages.push(stage.to_string());
+                        blockers.push(format!("缺少{}基础资料", foundation_stage_label(stage)));
                     }
                 }
-                if !blockers.is_empty() {
+                // 三个阶段都空：既没有可采纳的卡片，也没有可建立的创作基准。
+                if missing_stages.len() == 3 {
                     return Ok(CurrentPlanDataResult {
                         story_bible: None,
                         approved_card_count: 0,
                         approved_plan_count: 0,
                         blockers,
+                        missing_stages,
                     });
                 }
 
@@ -4047,12 +4083,22 @@ impl AppState {
                     params![project_id],
                     |row| row.get(0),
                 )?;
-                let data_changed = approved_card_count > 0 || approved_plan_count > 0 || !has_active_arc;
+                // 创作基准要求三类基础资料齐备：缺阶段时只采纳卡片，不建半成品基准。
+                let baseline_ready = missing_stages.is_empty();
+                let data_changed = approved_card_count > 0
+                    || approved_plan_count > 0
+                    || (baseline_ready && !has_active_arc);
                 let existing_bible = query_story_bible_by_project_tx(conn, project_id)?;
-                let bible_created = existing_bible.is_none();
+                let bible_created = baseline_ready && existing_bible.is_none();
 
                 match existing_bible {
                     Some(bible) if data_changed => {
+                        // 缺世界观资料时不要用空串覆盖已有基准。
+                        let reader_promise = if setting_content.trim().is_empty() {
+                            bible.reader_promise.clone()
+                        } else {
+                            setting_content.clone()
+                        };
                         conn.execute(
                             "UPDATE story_bibles
                              SET reader_promise = ?1, protagonist_engine = ?2,
@@ -4061,7 +4107,7 @@ impl AppState {
                                  updated_at = ?4
                              WHERE project_id = ?5",
                             params![
-                                setting_content,
+                                reader_promise,
                                 premise,
                                 setting_artifact.as_ref().map(|artifact| artifact.id),
                                 &timestamp,
@@ -4071,7 +4117,7 @@ impl AppState {
                         let _ = bible;
                     }
                     Some(_) => {}
-                    None => {
+                    None if baseline_ready => {
                         conn.execute(
                             "INSERT INTO story_bibles
                                 (project_id, reader_promise, protagonist_engine, core_conflict,
@@ -4087,9 +4133,10 @@ impl AppState {
                             ],
                         )?;
                     }
+                    None => {}
                 }
 
-                if !has_active_arc {
+                if baseline_ready && !has_active_arc {
                     let arc_no: i64 = conn.query_row(
                         "SELECT COALESCE(MAX(arc_no), 0) + 1
                          FROM story_arcs WHERE project_id = ?1",
@@ -4125,12 +4172,26 @@ impl AppState {
                          VALUES (?1, NULL, 'approval_note', ?2, ?3)",
                         params![
                             project_id,
-                            format!(
-                                "确认当前计划：本次确认 {} 张资料卡、{} 个章节计划。{}",
-                                approved_card_count,
-                                approved_plan_count,
-                                note.trim()
-                            ),
+                            if baseline_ready {
+                                format!(
+                                    "确认当前计划：本次确认 {} 张资料卡、{} 个章节计划。{}",
+                                    approved_card_count,
+                                    approved_plan_count,
+                                    note.trim()
+                                )
+                            } else {
+                                format!(
+                                    "确认资料卡：本次采纳 {} 张资料卡、{} 个章节计划；创作基准仍需补齐：{}。{}",
+                                    approved_card_count,
+                                    approved_plan_count,
+                                    missing_stages
+                                        .iter()
+                                        .map(|stage| foundation_stage_label(stage))
+                                        .collect::<Vec<_>>()
+                                        .join("、"),
+                                    note.trim()
+                                )
+                            },
                             &timestamp
                         ],
                     )?;
@@ -4140,7 +4201,8 @@ impl AppState {
                     story_bible: query_story_bible_by_project_tx(conn, project_id)?,
                     approved_card_count,
                     approved_plan_count,
-                    blockers: Vec::new(),
+                    blockers,
+                    missing_stages,
                 })
             })();
             match result {
@@ -4677,9 +4739,38 @@ fn get_setting(conn: &Connection, key: &str) -> AppResult<Option<String>> {
     .map_err(AppError::from)
 }
 
+/// 内置 Agent 的 prompt 是否被用户改过：与编译期内置模板一致视为未定制，
+/// 启动时允许用最新模板同步；不一致则保留用户版本。
+fn agent_prompt_customized(stage: &str, system_prompt: &str) -> bool {
+    crate::prompt_templates::default_prompt(stage)
+        .map(|default| default.trim() != system_prompt.trim())
+        .unwrap_or(true)
+}
+
+/// 内置写作 Skill 是否被用户改过：任一同步字段偏离内置模板即视为定制。
+fn writing_skill_customized(
+    skill_key: &str,
+    name: &str,
+    category: &str,
+    description: &str,
+    content: &str,
+) -> bool {
+    crate::genre_skill::default_writing_skills()
+        .into_iter()
+        .find(|skill| skill.skill_key == skill_key)
+        .map(|builtin| {
+            builtin.name != name
+                || builtin.category != category
+                || builtin.description != description
+                || builtin.content.trim() != content
+        })
+        .unwrap_or(true)
+}
+
 fn patch_default_writing_skills(conn: &Connection) -> AppResult<()> {
     let now = now();
 
+    // 旧版合并题材 Skill 已停用；只做一次性数据迁移，与内置模板同步无关。
     conn.execute(
         "UPDATE writing_skills
          SET name = '旧版都市异能/悬疑（已停用）',
@@ -4690,94 +4781,6 @@ fn patch_default_writing_skills(conn: &Connection) -> AppResult<()> {
          WHERE skill_key = 'urban_mystery' AND category = 'genre'",
         params![now],
     )?;
-
-    if let Some(existing) = conn
-        .query_row(
-            "SELECT content FROM writing_skills WHERE skill_key = 'general_serialized'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        let is_rigid_built_in = existing.contains("上一章抛出的最强钩子")
-            && existing.contains("章末必须留下更具体的下一步")
-            && existing.contains("大纲阶段：每章必须写清章节功能");
-        if is_rigid_built_in {
-            conn.execute(
-                "UPDATE writing_skills
-                 SET content = ?1, updated_at = ?2
-                 WHERE skill_key = 'general_serialized'",
-                params![
-                    crate::genre_skill::GenreSkillKind::GeneralSerialized.fallback_template(),
-                    now
-                ],
-            )?;
-        }
-    }
-
-    conn.execute(
-        "UPDATE writing_skills
-         SET content = replace(content, ?1, ?2), updated_at = ?3
-         WHERE skill_key = 'xianxia_power_fantasy' AND instr(content, ?1) > 0",
-        params![
-            "- 修订阶段：若章末钩子不足，优先补新的行动压力、外部变化、回收代价或更高层次的追查，不要只补一句“他决定继续变强”。",
-            "- 修订阶段：若结尾功能不足，优先把本章已有的成长结果、资源代价、关系变化、决定或下一步行动落稳；只有前文已经存在相应压力时才推进追查或威胁，不凭空补新危险。",
-            now
-        ],
-    )?;
-
-    if let Some(existing) = conn
-        .query_row(
-            "SELECT content FROM writing_skills WHERE skill_key = 'xianxia_power_fantasy'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        if existing.contains("## App Library Patch: continuity-and-agency")
-            || existing.contains("黑牌、碎片、布片、刻字、梦境、旁人口供")
-            || existing.contains("重要物件、禁制、令牌、炉门、阵眼、药物、伤势")
-            || (existing.contains("把“前期能拿到的第一口肉”")
-                && !existing.contains("代价必须可在故事现场被观察"))
-            || (existing.contains("代价必须可在故事现场被观察")
-                && !existing.contains("已批准设定是能力合同"))
-        {
-            conn.execute(
-                "UPDATE writing_skills
-                 SET content = ?1, updated_at = ?2
-                 WHERE skill_key = 'xianxia_power_fantasy'",
-                params![
-                    crate::genre_skill::GenreSkillKind::XianxiaPowerFantasy.fallback_template(),
-                    now
-                ],
-            )?;
-        }
-    }
-
-    if let Some(existing) = conn
-        .query_row(
-            "SELECT content FROM writing_skills WHERE skill_key = 'continuity_and_agency'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        if existing.trim().is_empty() {
-            conn.execute(
-                "UPDATE writing_skills
-                 SET content = ?1, updated_at = ?2
-                 WHERE skill_key = 'continuity_and_agency'",
-                params![
-                    crate::genre_skill::default_writing_skills()
-                        .into_iter()
-                        .find(|skill| skill.skill_key == "continuity_and_agency")
-                        .map(|skill| skill.content)
-                        .unwrap_or(""),
-                    now
-                ],
-            )?;
-        }
-    }
 
     Ok(())
 }
@@ -5591,6 +5594,16 @@ fn stage_label(stage: &str) -> &'static str {
     }
 }
 
+/// 当前计划的三类基础资料用工作台的叫法，避免同一处同时出现“设定”和“世界观”。
+fn foundation_stage_label(stage: &str) -> &'static str {
+    match stage {
+        "setting" => "世界观",
+        "outline" => "大纲",
+        "characters" => "角色",
+        _ => "资料",
+    }
+}
+
 fn dedupe_approvals(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         r#"
@@ -6272,55 +6285,18 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_xianxia_patch_into_generic_skills() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
-        state
-            .save_writing_skill(SaveWritingSkill {
-                id: None,
-                skill_key: "xianxia_power_fantasy".to_string(),
-                name: "男频修仙爽文".to_string(),
-                category: "genre".to_string(),
-                description: "用户版本".to_string(),
-                content: "# Xianxia Power Fantasy Skill\n\n## Always\n- 用户自定义规则\n\n## App Library Patch: continuity-and-agency\n- 正文阶段：同一个悬念最多用两件证据确认。不要用黑牌、碎片、布片、刻字、梦境、旁人口供连续确认同一个结论；第三个证据必须换成新的行动压力或直接删除。\n".to_string(),
-                enabled: true,
-            })
-            .unwrap();
-
-        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
-        let xianxia = state
-            .get_writing_skill_by_key("xianxia_power_fantasy")
-            .unwrap()
-            .unwrap();
-        let craft = state
-            .get_writing_skill_by_key("continuity_and_agency")
-            .unwrap()
-            .unwrap();
-
-        assert!(!xianxia
-            .content
-            .contains("App Library Patch: continuity-and-agency"));
-        assert!(xianxia.content.contains("每章要有可感知的进度增量"));
-        assert!(craft
-            .content
-            .contains("同一个悬念或结论，最多用两件证据确认"));
-    }
-
-    #[test]
-    fn migrates_rigid_builtin_serialized_skill_to_flexible_contract() {
+    fn stale_builtin_skill_content_syncs_to_template_when_not_customized() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
         let state = AppState::from_path(path.clone()).unwrap();
+        // 模拟旧版本数据库留下的过时内置 Skill 内容（未经用户定制）。
         state
-            .save_writing_skill(SaveWritingSkill {
-                id: None,
-                skill_key: "general_serialized".to_string(),
-                name: "通用连载写作".to_string(),
-                category: "genre".to_string(),
-                description: "旧内置模板".to_string(),
-                content: "# General Serialized Fiction Skill\n\n- 上一章抛出的最强钩子必须立即回应。\n- 章末必须留下更具体的下一步。\n- 大纲阶段：每章必须写清章节功能。\n"
-                    .to_string(),
-                enabled: true,
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE writing_skills SET content = ?1 WHERE skill_key = 'general_serialized'",
+                    params!["# General Serialized Fiction Skill\n\n- 上一章抛出的最强钩子必须立即回应。\n- 章末必须留下更具体的下一步。\n- 大纲阶段：每章必须写清章节功能。\n"],
+                )?;
+                Ok(())
             })
             .unwrap();
         drop(state);
@@ -6331,14 +6307,19 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(skill.content.contains("进入状态、章节模式、目标"));
+        // 同步目标就是模板当前内容，不是某一句固定措辞；模板演进时本断言不应失效。
+        let template = crate::genre_skill::default_writing_skills()
+            .into_iter()
+            .find(|item| item.skill_key == "general_serialized")
+            .unwrap()
+            .content;
+        assert_eq!(skill.content.trim(), template.trim());
         assert!(skill.content.contains("变化可以缓慢形成"));
-        assert!(!skill.content.contains("优先完成一个主要章节功能"));
         assert!(!skill.content.contains("章末必须留下更具体的下一步"));
     }
 
     #[test]
-    fn migrates_only_the_rigid_xianxia_ending_clause() {
+    fn customized_skill_content_survives_reopen() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
         let state = AppState::from_path(path.clone()).unwrap();
@@ -6349,7 +6330,7 @@ mod tests {
                 name: "男频修仙爽文".to_string(),
                 category: "genre".to_string(),
                 description: "用户扩展过的模板".to_string(),
-                content: "# Xianxia Power Fantasy Skill\n\n- 用户自定义：保留慢修章。\n- 修订阶段：若章末钩子不足，优先补新的行动压力、外部变化、回收代价或更高层次的追查，不要只补一句“他决定继续变强”。\n"
+                content: "# Xianxia Power Fantasy Skill\n\n- 用户自定义：保留慢修章。\n"
                     .to_string(),
                 enabled: true,
             })
@@ -6363,20 +6344,18 @@ mod tests {
             .unwrap();
 
         assert!(skill.content.contains("用户自定义：保留慢修章"));
-        assert!(skill.content.contains("若结尾功能不足"));
-        assert!(skill.content.contains("不凭空补新危险"));
-        assert!(!skill.content.contains("若章末钩子不足"));
+        assert!(!skill.content.contains("每章要有可感知的进度增量"));
     }
 
     #[test]
-    fn startup_does_not_rewrite_custom_agent_prompt_fragments() {
+    fn customized_agent_prompt_is_preserved_when_flagged() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
         let state = AppState::from_path(path.clone()).unwrap();
         state
             .with_conn(|conn| {
                 conn.execute(
-                    "UPDATE agents SET system_prompt = ?1 WHERE stage = 'draft'",
+                    "UPDATE agents SET system_prompt = ?1, prompt_customized = 1 WHERE stage = 'draft'",
                     params!["用户保留段落。开篇不要空转，应尽早给出异常、威胁、任务、瓶颈或正在发生的行动；结尾应落在具体新信息、变化、威胁或选择上，不能只写主角准备去做什么。"],
                 )?;
                 Ok(())
@@ -6395,6 +6374,37 @@ mod tests {
         assert_eq!(
             draft.system_prompt,
             "用户保留段落。开篇不要空转，应尽早给出异常、威胁、任务、瓶颈或正在发生的行动；结尾应落在具体新信息、变化、威胁或选择上，不能只写主角准备去做什么。"
+        );
+    }
+
+    #[test]
+    fn unmodified_agent_prompts_resync_to_builtin_template() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let state = AppState::from_path(path.clone()).unwrap();
+        // 模拟旧版本种子留下的过时内置 prompt（未定制）。
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agents SET system_prompt = '旧版提示词。' WHERE stage = 'draft'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(state);
+
+        let reopened = AppState::from_path(path).unwrap();
+        let draft = reopened
+            .list_agents()
+            .unwrap()
+            .into_iter()
+            .find(|agent| agent.stage == "draft")
+            .unwrap();
+
+        assert_eq!(
+            draft.system_prompt,
+            crate::prompt_templates::require_default_prompt("draft").unwrap()
         );
     }
 
@@ -7481,7 +7491,7 @@ mod tests {
     }
 
     #[test]
-    fn current_plan_confirmation_blocks_without_all_three_foundations() {
+    fn current_plan_confirmation_adopts_available_cards_when_a_stage_is_missing() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
         let project = state
@@ -7509,16 +7519,54 @@ mod tests {
         let result = state
             .confirm_current_plan_data_atomic(project.id, "")
             .unwrap();
-        assert_eq!(result.approved_card_count, 0);
+
+        // 已有阶段的资料卡照常被采纳：缺角色不该让世界观卡片一直停在待确认。
+        assert_eq!(result.approved_card_count, 2);
+        assert_eq!(result.missing_stages, vec!["characters".to_string()]);
+        // 创作基准仍是三阶段齐备才建立的东西，缺阶段时不建。
         assert!(result.story_bible.is_none());
-        assert!(result.blockers.iter().any(|item| item.contains("角色")));
         assert!(state.get_story_bible(project.id).unwrap().is_none());
         assert!(state.active_story_arc(project.id).unwrap().is_none());
         assert!(state
             .list_canon_entries(project.id)
             .unwrap()
             .iter()
-            .all(|card| card.status == "pending_human_approval"));
+            .all(|card| card.status == "approved"));
+    }
+
+    #[test]
+    fn current_plan_confirmation_reports_every_stage_when_nothing_is_available() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "空项目".to_string(),
+                genre: "奇幻".to_string(),
+                target_words: 100_000,
+                premise: "测试空项目".to_string(),
+            })
+            .unwrap();
+
+        let result = state
+            .confirm_current_plan_data_atomic(project.id, "")
+            .unwrap();
+
+        assert_eq!(result.approved_card_count, 0);
+        assert_eq!(
+            result.missing_stages,
+            vec![
+                "setting".to_string(),
+                "outline".to_string(),
+                "characters".to_string()
+            ]
+        );
+        assert!(result.blockers.iter().any(|item| item.contains("角色")));
+        assert!(result
+            .blockers
+            .iter()
+            .any(|item| item.contains("世界观") && !item.contains("设定")));
+        assert!(state.get_story_bible(project.id).unwrap().is_none());
+        assert!(state.active_story_arc(project.id).unwrap().is_none());
         assert!(state.list_messages(project.id).unwrap().is_empty());
     }
 

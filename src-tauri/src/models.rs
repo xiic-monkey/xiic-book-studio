@@ -708,12 +708,14 @@ pub struct ConfirmStoryBibleRequest {
     pub note: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CurrentPlanConfirmationStatus {
     Confirmed,
     AwaitingReviewConfirmation,
     Blocked,
+    /// 已有阶段的资料卡已采纳，但创作基准还缺阶段。
+    PartiallyConfirmed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -730,6 +732,8 @@ pub struct CurrentPlanConfirmationResult {
     pub story_bible: Option<StoryBible>,
     pub review: Option<StoryBibleReview>,
     pub blockers: Vec<String>,
+    /// 还没有资料的基础阶段（setting/outline/characters）。
+    pub missing_stages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1276,7 +1280,7 @@ pub struct RunEvent {
     pub stage: String,
     pub sequence: i64,
     #[ts(
-        type = "\"completed\" | \"failed\" | \"cancelled\" | \"started\" | \"output_delta\" | \"output_reset\" | \"thinking_start\" | \"thinking_delta\" | \"thinking_end\" | \"cancellation_requested\" | \"proposal_warning\" | \"tool_started\" | \"tool_completed\""
+        type = "\"completed\" | \"failed\" | \"cancelled\" | \"started\" | \"output_delta\" | \"output_reset\" | \"thinking_start\" | \"thinking_delta\" | \"thinking_end\" | \"cancellation_requested\" | \"proposal_warning\" | \"plan_updated\" | \"tool_started\" | \"tool_completed\""
     )]
     pub kind: String,
     pub delta: String,
