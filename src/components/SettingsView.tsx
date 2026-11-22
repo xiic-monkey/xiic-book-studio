@@ -22,7 +22,7 @@ import type {
   AiProvider,
   AiSettings,
   AgentToolDefinition,
-  GenreAgentProfile,
+  ProjectGenreSkill,
   ModelInfo,
   ProviderCapabilities,
   SaveAiProvider,
@@ -194,6 +194,15 @@ const categories: { id: SettingsCategory; label: string; icon: React.ReactNode }
   { id: "appearance", label: "外观", icon: <Palette size={16} /> },
 ];
 
+export function ProjectGenreSkillStatus({ selection, skills }: {
+  selection?: ProjectGenreSkill | null;
+  skills: ReadonlyArray<ProjectGenreSkill>;
+}) {
+  if (!selection) return null;
+  const skill = skills.find((record) => record.skill_key === selection.skill_key) ?? selection;
+  return <p className="settings-hint">项目题材 Skill：{skill.name} · {skill.enabled ? "已启用" : "未启用"}</p>;
+}
+
 interface SettingsViewProps {
   settings: AiSettings;
   providers: AiProvider[];
@@ -228,7 +237,7 @@ interface SettingsViewProps {
   onRebuildStorySearch: () => Promise<void>;
   agents: Agent[];
   agentTools: AgentToolDefinition[];
-  genreAgent?: GenreAgentProfile | null;
+  projectGenreSkill?: ProjectGenreSkill | null;
   writingSkills: WritingSkill[];
   onSaveWritingSkill: (input: SaveWritingSkill) => Promise<void>;
   onSaveCategory: (category: SettingsCategory) => Promise<void>;
@@ -258,7 +267,7 @@ export function SettingsView({
   onRebuildStorySearch,
   agents,
   agentTools,
-  genreAgent,
+  projectGenreSkill,
   writingSkills,
   onSaveWritingSkill,
   busy,
@@ -904,22 +913,6 @@ export function SettingsView({
       case "agents":
         return (
           <div className="settings-content wide">
-            {genreAgent && (
-              <section className="agent-prompt-card agent-profile-card">
-                <header>
-                  <div>
-                    <strong>{genreAgent.name}</strong>
-                    <span>{genreAgent.agent_key}</span>
-                  </div>
-                  <small>当前项目专属 Agent</small>
-                </header>
-                <p>{genreAgent.role}</p>
-                <label>主类型 Skill</label>
-                <p>{genreAgent.primary_skill_key}</p>
-                <label>Skill 白名单</label>
-                <p>{genreAgent.allowed_skill_keys.join(" · ")}</p>
-              </section>
-            )}
             {agentModelError && <p className="settings-error">{agentModelError}</p>}
             <div className="agent-settings-layout">
               <nav className="agent-list" aria-label="Agent 列表">
@@ -1136,7 +1129,7 @@ export function SettingsView({
                         <label>辅助 Skill</label>
                         <div className="agent-checkbox-list">
                           {writingSkills
-                            .filter((skill) => skill.enabled)
+                            .filter((skill) => skill.skill_key === "continuity_and_agency" && skill.category === "craft")
                             .map((skill) => (
                               <label className="checkbox-field" key={skill.skill_key}>
                                 <input
@@ -1218,6 +1211,7 @@ export function SettingsView({
           <div className="settings-content wide">
             <div className="settings-section">
               <h3>写作技能库</h3>
+              <ProjectGenreSkillStatus selection={projectGenreSkill} skills={writingSkills} />
               <div className="skill-editor-layout">
                 <div className="skill-list">
                   {writingSkills.map((skill) => (

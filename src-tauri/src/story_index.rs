@@ -121,7 +121,7 @@ async fn index_approved_chapter_impl(
     let source = state
         .latest_approved_chapter_body(project_id, chapter_id)?
         .ok_or_else(|| {
-            AppError::Validation("章节还没有已通过正文，不能建立资料索引".to_string())
+            AppError::Validation("章节暂无正文，不能建立资料索引".to_string())
         })?;
     let source_hash = source_text_hash(&source.content);
     if state.story_index_source_is_current(
@@ -143,7 +143,7 @@ async fn index_approved_chapter_impl(
     }
 
     let agent = state.get_agent("story_index")?;
-    let settings = deterministic_settings(agent.ai_settings());
+    let settings = crate::ai::deterministic_settings(agent.ai_settings());
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| {
@@ -277,7 +277,7 @@ fn build_index_prompt(title: &str, content: &str) -> String {
         r#"# 当前章节
 {title}
 
-# 已通过正式正文
+# 正文
 {content}"#,
     )
 }
@@ -407,11 +407,6 @@ fn valid_visibility(value: &str) -> bool {
 
 fn default_visibility() -> String {
     "world".to_string()
-}
-
-fn deterministic_settings(mut settings: crate::models::AiSettings) -> crate::models::AiSettings {
-    settings.thinking_enabled = false;
-    settings
 }
 
 #[cfg(test)]

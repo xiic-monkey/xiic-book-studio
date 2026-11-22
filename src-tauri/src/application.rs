@@ -93,8 +93,8 @@ impl ApplicationGateway {
     pub fn get_project_workspace(&self, project_id: i64) -> AppResult<ProjectWorkspace> {
         let project = self.state.get_project(project_id)?;
         Ok(ProjectWorkspace {
+            genre_skill: self.state.get_project_genre_skill(&project)?,
             project,
-            genre_agent: self.state.get_genre_agent_for_project(project_id)?,
             chapters: self.state.list_chapters(project_id)?,
             chapter_plans: self.state.list_chapter_plans(project_id)?,
             formal_char_count: self.state.formal_char_count(project_id)?,
@@ -239,11 +239,11 @@ mod tests {
             state.list_chapters(project.id).unwrap()[0]
                 .current_artifact_id
                 .is_none(),
-            "被拦下的产物不应成为章节正式稿"
+            "被拦下的产物不应成为正文"
         );
     }
 
-    /// 门禁作用域：只拦正文阶段的转正，项目级资料阶段照常审批。
+    /// 门禁作用域：只拦正文的采用，项目级资料阶段照常审批。
     ///
     /// 此处刻意复用上一用例里"含 Markdown 标题"的劣质内容——同样的内容
     /// 在 `setting` 阶段必须放行，证明拦截是"按阶段"而不是"按内容"。
@@ -429,7 +429,7 @@ mod tests {
             let chapters = state.list_chapters(project.id)?;
             conn.execute(
                 "INSERT INTO artifacts (project_id, chapter_id, stage, title, content, version, status, created_at)
-                 VALUES (?1, ?2, 'draft', '正式', '甲 乙\n丙', 1, 'approved', 't')",
+                 VALUES (?1, ?2, 'draft', '正文', '甲 乙\n丙', 1, 'approved', 't')",
                 params![project.id, chapters[0].id],
             )?;
             let approved_id = conn.last_insert_rowid();

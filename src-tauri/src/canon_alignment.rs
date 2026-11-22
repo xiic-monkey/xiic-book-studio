@@ -1,4 +1,4 @@
-//! 章节转正后的资料对齐：对照新正文，把该章来源的资料分为
+//! 正文更新后的资料对齐：对照正文，把该章来源的资料分为
 //! 需要更新（重置待确认）、已失效（自动归档，可人工恢复）、正文新增可沉淀
 //! 三类，另提取写作笔记（语气、母题、编号规律等写作约束）。
 //!
@@ -49,13 +49,7 @@ struct AlignmentReport {
     writing_notes: Vec<AlignmentWritingNote>,
 }
 
-fn deterministic_settings(mut settings: crate::models::AiSettings) -> crate::models::AiSettings {
-    // 对齐是机器可读的资料整理步骤，关闭深度思考换取稳定的 JSON 输出与低延迟。
-    settings.thinking_enabled = false;
-    settings
-}
-
-/// 章节转正后调用：对照新正文对齐该章来源的资料条目。
+/// 采用正文后调用：对照正文更新来源为该章的资料条目。
 pub async fn align_chapter_after_approval(
     state: &AppState,
     project_id: i64,
@@ -69,7 +63,7 @@ pub async fn align_chapter_after_approval(
         return Ok(());
     };
     let agent = state.get_agent("canon_align")?;
-    let settings = deterministic_settings(agent.ai_settings());
+    let settings = crate::ai::deterministic_settings(agent.ai_settings());
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| AppError::Validation("请先为资料对齐 Agent 配置 API Key".to_string()))?;
@@ -164,7 +158,7 @@ fn build_alignment_prompt(body: &str, entries: &[CanonEntry]) -> String {
             entry.id, entry.category, entry.status, entry.title, entry.content
         ));
     }
-    format!("# 定稿正文\n{body}\n\n# 待审视资料条目\n{entry_lines}")
+    format!("# 正文\n{body}\n\n# 待审视资料条目\n{entry_lines}")
 }
 
 fn parse_alignment_report(raw: &str, known_ids: &[i64]) -> AppResult<AlignmentReport> {

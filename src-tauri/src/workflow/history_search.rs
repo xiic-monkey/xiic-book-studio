@@ -236,9 +236,9 @@ pub(super) fn retrieve_history_snippets(
     use_embeddings: bool,
 ) -> AppResult<Vec<StoryContextSnippet>> {
     let search = if use_embeddings {
-        crate::story_search::search_story_context
+        crate::story_search::search_semantic_context
     } else {
-        crate::story_search::search_story_context_lexical
+        crate::story_search::search_semantic_context_lexical
     };
     let indexed = search(
         state,

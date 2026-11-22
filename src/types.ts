@@ -114,14 +114,7 @@ export interface Agent {
 
 export type ThinkingLevel = "off" | "low" | "medium" | "high";
 
-export interface GenreAgentProfile {
-  agent_key: string;
-  name: string;
-  role: string;
-  system_prompt: string;
-  primary_skill_key: string;
-  allowed_skill_keys: string[];
-}
+export type { ProjectGenreSkill } from "./generated/v2-contracts";
 
 export type StoryArchitectMode = "initialize" | "refine_canon" | "plan_current_arc" | "extend_next_arc" | "design_characters";
 
@@ -559,7 +552,7 @@ export interface ModelInfo {
 
 export interface ProjectDetail {
   project: Project;
-  genre_agent: GenreAgentProfile;
+  genre_skill: import("./generated/v2-contracts").ProjectGenreSkill;
   chapters: Chapter[];
   agents: Agent[];
   artifacts: Artifact[];

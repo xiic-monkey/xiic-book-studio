@@ -10,9 +10,9 @@ use crate::{
 
 const MIN_ACCEPTABLE_QUALITY: u8 = 72;
 
-/// 门禁结论 -> 转正裁决。
+/// 根据门禁结论判断能否采用为正文。
 ///
-/// 转正是**硬门禁**：`passed` 为假时一律拒绝，并把阻断项原样回报，
+/// `passed` 为假时一律拒绝采用，并把阻断项原样回报，
 /// 让"为什么不能通过"成为可读信息，而不是一次静默放行。
 ///
 /// 抽成独立函数是为了让"是否放行"这一决策可以脱离 AI 依赖被直接测试。
@@ -27,7 +27,7 @@ pub fn ensure_gate_allows_transition(report: &ChapterGateReport) -> AppResult<()
         .collect::<Vec<_>>()
         .join("；");
     Err(AppError::Validation(format!(
-        "质量门禁未通过，已阻止转正（质量分 {}，判定 {}）。{}",
+        "质量门禁未通过，无法采用（质量分 {}，判定 {}）。{}",
         report.quality.score,
         report.verdict,
         if blockers.is_empty() {

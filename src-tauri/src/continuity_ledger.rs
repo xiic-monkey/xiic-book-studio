@@ -139,7 +139,7 @@ pub async fn ensure_ledger_current(state: &AppState, project_id: i64) -> AppResu
     }
 
     let agent = state.get_agent("continuity_ledger")?;
-    let settings = deterministic_settings(agent.ai_settings());
+    let settings = crate::ai::deterministic_settings(agent.ai_settings());
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| AppError::Validation("请先为当前供应商保存 AI API Key".to_string()))?;
@@ -259,7 +259,7 @@ async fn extract_candidate_claims(
     active_states: &HashMap<(String, String), ContinuityLedgerEntry>,
 ) -> AppResult<String> {
     let agent = state.get_agent("continuity_check")?;
-    let settings = deterministic_settings(agent.ai_settings());
+    let settings = crate::ai::deterministic_settings(agent.ai_settings());
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
         .ok_or_else(|| AppError::Validation("请先为当前供应商保存 AI API Key".to_string()))?;
@@ -706,13 +706,6 @@ fn empty_report(project_id: i64, artifact_id: i64) -> LedgerContinuityReport {
                 .to_string(),
         issues: Vec::new(),
     }
-}
-
-fn deterministic_settings(mut settings: crate::models::AiSettings) -> crate::models::AiSettings {
-    // State extraction is a machine-readable indexing step. Provider thinking adds
-    // latency and can wrap the JSON without improving the evidence-bound result.
-    settings.thinking_enabled = false;
-    settings
 }
 
 fn required_label(value: &str) -> String {

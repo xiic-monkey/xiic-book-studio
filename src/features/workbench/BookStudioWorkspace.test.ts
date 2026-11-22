@@ -7,6 +7,8 @@ import {
   foundationStageReadiness,
   isFeedScrolledToBottom,
   isTopLevelStreamingRun,
+  parseReviewIssues,
+  parseReviewSummary,
   partialConfirmationNotice,
   scrollFeedToBottom,
   splitThinkingContent,
@@ -178,6 +180,44 @@ describe("partialConfirmationNotice", () => {
   });
 });
 
+describe("parseReviewIssues", () => {
+  it("reads the new summary+issues artifact shape", () => {
+    const issues = parseReviewIssues(JSON.stringify({
+      summary: "这一章的问题集中在事实越界。",
+      issues: [{ issue_type: "事实越界", severity: "major" }],
+    }));
+
+    expect(issues).toHaveLength(1);
+    expect(issues[0].issue_type).toBe("事实越界");
+  });
+
+  it("still reads legacy artifacts that are a bare array", () => {
+    const issues = parseReviewIssues(JSON.stringify([
+      { issue_type: "节奏拖沓", severity: "minor" },
+    ]));
+
+    expect(issues).toHaveLength(1);
+    expect(issues[0].issue_type).toBe("节奏拖沓");
+  });
+
+  it("returns no issues for content that is not review output", () => {
+    expect(parseReviewIssues("随便一段正文")).toEqual([]);
+  });
+});
+
+describe("parseReviewSummary", () => {
+  it("returns the human-readable verdict when present", () => {
+    expect(parseReviewSummary(JSON.stringify({
+      summary: "先改事实越界。",
+      issues: [],
+    }))).toBe("先改事实越界。");
+  });
+
+  it("returns an empty string for legacy array artifacts", () => {
+    expect(parseReviewSummary(JSON.stringify([]))).toBe("");
+  });
+});
+
 describe("formatReviewInstructions", () => {
   it("turns trial-reading issues into an agent revision prompt", () => {
     const prompt = formatReviewInstructions([{
@@ -199,7 +239,7 @@ describe("formatReviewInstructions", () => {
 describe("buildChapterAgentPrompt", () => {
   it("routes a new chapter version through the main Agent conversation", () => {
     expect(buildChapterAgentPrompt("潮痕档案", "第 1 章《雨夜入城》", "draft")).toBe(
-      "请由主 Agent 处理《潮痕档案》的第 1 章《雨夜入城》：生成一版新的章节候选版本。请先确认任务类型，再委托对应的专业 Agent 执行。结果必须作为候选版本放入工作区供我确认采用，不要直接替换正式正文。",
+      "请由主 Agent 处理《潮痕档案》的第 1 章《雨夜入城》：生成一版新的章节候选版本。请先确认任务类型，再委托对应的专业 Agent 执行。结果必须作为候选版本放入工作区供我确认采用，不要直接替换正文。",
     );
   });
 

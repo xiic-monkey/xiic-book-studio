@@ -160,7 +160,7 @@ export function ContinuityLibraryPanel({
                       </div>
                     )}
                     <blockquote>{event.source_quote}</blockquote>
-                    {chapter && <button className="timeline-source" onClick={() => onOpenChapter(chapter.id)}>查看正式正文</button>}
+                    {chapter && <button className="timeline-source" onClick={() => onOpenChapter(chapter.id)}>查看正文</button>}
                   </div>
                 </article>
               );
@@ -213,7 +213,7 @@ export function ContinuityLibraryPanel({
                             <strong>{entry.event.title}</strong>
                             <p>{entry.event.summary}</p>
                             <blockquote>{entry.event.source_quote}</blockquote>
-                            {chapter && <button className="timeline-source" onClick={() => onOpenChapter(chapter.id)}>查看正式正文</button>}
+                            {chapter && <button className="timeline-source" onClick={() => onOpenChapter(chapter.id)}>查看正文</button>}
                           </article>
                         );
                       }
@@ -223,7 +223,7 @@ export function ContinuityLibraryPanel({
                           <strong>{entry.fact.dimension}</strong>
                           <p>{entry.fact.value}</p>
                           <blockquote>{entry.fact.source_quote}</blockquote>
-                          {chapter && <button className="timeline-source" onClick={() => onOpenChapter(chapter.id)}>查看正式正文</button>}
+                          {chapter && <button className="timeline-source" onClick={() => onOpenChapter(chapter.id)}>查看正文</button>}
                         </article>
                       );
                     })}

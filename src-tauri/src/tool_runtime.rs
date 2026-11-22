@@ -14,11 +14,30 @@ use crate::{
     quality, workflow,
 };
 
-// The model decides when the tool loop is complete. This is only a circuit
-// breaker for a malfunctioning provider repeatedly requesting new calls.
+// The model decides when the tool loop is complete. These are circuit
+// breakers for a malfunctioning provider repeatedly requesting new calls.
+// Both breakers end the loop and let the run finish with the context that was
+// already collected; they must not fail the whole run, because the collected
+// context is still usable and the model can produce its final answer.
 const MAX_TOOL_CALLS: usize = 64;
+const MAX_TOOL_ROUNDS: usize = 4;
+
+/// 主调用的多轮 tool-calling 轮次上限。
+pub fn max_tool_rounds() -> usize {
+    MAX_TOOL_ROUNDS
+}
 const MAX_RENDERED_CONTEXT_CHARS: usize = 24_000;
 const CANCELLATION_POLL_MILLIS: u64 = 250;
+
+/// 本轮工具规划轮次是否已经用尽。
+fn tool_loop_round_exhausted(round: usize) -> bool {
+    round > MAX_TOOL_ROUNDS
+}
+
+/// 本次运行的工具调用预算是否已经用尽。
+fn tool_loop_call_budget_exhausted(total_calls: usize, pending_calls: usize) -> bool {
+    total_calls.saturating_add(pending_calls) > MAX_TOOL_CALLS
+}
 
 pub struct ToolExecutionContext<'a> {
     pub state: &'a AppState,
@@ -96,6 +115,10 @@ pub fn definitions_for_agent(
                             | agent_tools::PROPOSE_CANON_ENTRY
                             | agent_tools::PROPOSE_UPDATE_CANON_ENTRY
                     ))
+                // 试读阶段必须能把结构化问题交回运行时，否则就只能退回"把 JSON 写进
+                // 回复文本"的老做法。对所有试读 Agent 隐式提供，不要求用户改配置。
+                || (matches!(stage, Stage::Review)
+                    && definition.key == agent_tools::SUBMIT_REVIEW_ISSUES)
         })
         .filter(|definition| {
             definition
@@ -134,6 +157,11 @@ pub async fn prepare_tools(
     loop {
         ensure_run_active(&context)?;
         round += 1;
+        if tool_loop_round_exhausted(round) {
+            // 轮次上限：模型仍在要工具时收尾。已经收集到的结果足够支撑最终答复，
+            // 继续搜索只会放大噪声并拖长运行时间。
+            break;
+        }
         if let Some(run_id) = context.run_id {
             let _ = context.state.insert_run_event(
                 run_id,
@@ -213,10 +241,10 @@ pub async fn prepare_tools(
             }
             pending_calls.push((call, dedup_key));
         }
-        if total_calls.saturating_add(pending_calls.len()) > MAX_TOOL_CALLS {
-            return Err(AppError::Validation(format!(
-                "Agent 工具调用超过单次运行上限 {MAX_TOOL_CALLS}"
-            )));
+        if tool_loop_call_budget_exhausted(total_calls, pending_calls.len()) {
+            // 预算用尽：收尾而不是让整次运行失败。已经收集到的工具结果仍然可用，
+            // 交给模型产出最终答复即可（多搜一轮不会让结论更可靠）。
+            break;
         }
         for (call, _) in &pending_calls {
             if let Err(error) = validate_call(&context, &definitions, call) {
@@ -546,7 +574,7 @@ fn canonical_tool_key(tool_key: &str) -> &str {
     }
 }
 
-fn validate_call(
+pub(crate) fn validate_call(
     context: &ToolExecutionContext<'_>,
     definitions: &[AgentToolDefinition],
     call: &ToolCall,
@@ -659,7 +687,7 @@ fn validate_schema_value(schema: &Value, value: &Value, path: &str) -> AppResult
     Ok(())
 }
 
-async fn execute_call(
+pub(crate) async fn execute_call(
     context: &ToolExecutionContext<'_>,
     call: &ToolCall,
 ) -> AppResult<(Value, Vec<String>, bool, Option<ActionProposal>)> {
@@ -797,6 +825,25 @@ async fn execute_call(
             }
             Ok((
                 serde_json::to_value(quality::analyze_artifact(&artifact))?,
+                Vec::new(),
+                false,
+                None,
+            ))
+        }
+        agent_tools::SUBMIT_REVIEW_ISSUES => {
+            // 提交型工具：结构化数据走工具参数，不要求模型把 JSON 写进回复文本。
+            let raw = call
+                .arguments
+                .get("issues")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            let issues: Vec<crate::models::ReviewIssue> =
+                serde_json::from_value(raw).map_err(|error| {
+                    AppError::Validation(format!("提交的问题列表格式不正确：{error}"))
+                })?;
+            crate::ai::validate_review_issues(&issues)?;
+            Ok((
+                serde_json::json!({ "submitted": issues.len() }),
                 Vec::new(),
                 false,
                 None,
@@ -1194,6 +1241,18 @@ fn sample(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::models::Agent;
+
+    #[test]
+    fn tool_loop_ends_gracefully_when_rounds_or_calls_are_exhausted() {
+        assert!(!tool_loop_round_exhausted(1));
+        assert!(!tool_loop_round_exhausted(MAX_TOOL_ROUNDS));
+        assert!(tool_loop_round_exhausted(MAX_TOOL_ROUNDS + 1));
+
+        assert!(!tool_loop_call_budget_exhausted(0, MAX_TOOL_CALLS));
+        assert!(tool_loop_call_budget_exhausted(1, MAX_TOOL_CALLS));
+        assert!(tool_loop_call_budget_exhausted(MAX_TOOL_CALLS, 1));
+        assert!(!tool_loop_call_budget_exhausted(10, 10));
+    }
 
     fn agent(keys: &[&str]) -> Agent {
         Agent {

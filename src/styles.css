@@ -3761,6 +3761,24 @@ input:focus, textarea:focus, select:focus {
   margin-bottom: 0;
 }
 
+.review-summary {
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.review-summary .review-card-head {
+  margin-bottom: 6px;
+}
+
+.review-summary p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-primary);
+}
+
 .ledger-report {
   display: grid;
   gap: 10px;
@@ -4076,10 +4094,6 @@ input:focus, textarea:focus, select:focus {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg-card);
-}
-
-.agent-profile-card {
-  margin-bottom: 12px;
 }
 
 .agent-settings-note {

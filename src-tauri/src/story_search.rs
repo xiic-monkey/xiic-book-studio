@@ -360,23 +360,23 @@ pub async fn refresh_foreshadowing(
     Ok(())
 }
 
-pub fn search_story_context(
+pub fn search_semantic_context(
     state: &AppState,
     input: &StoryContextSearchInput,
 ) -> AppResult<Vec<StoryContextSnippet>> {
-    search_story_context_with_embeddings(state, input, true)
+    search_semantic_context_with_embeddings(state, input, true)
 }
 
 /// Rebuilds of derived continuity metadata should remain cheap during startup.
-/// Interactive searches use the semantic model through `search_story_context`.
-pub(crate) fn search_story_context_lexical(
+/// Interactive searches use the semantic model through `search_semantic_context`.
+pub(crate) fn search_semantic_context_lexical(
     state: &AppState,
     input: &StoryContextSearchInput,
 ) -> AppResult<Vec<StoryContextSnippet>> {
-    search_story_context_with_embeddings(state, input, false)
+    search_semantic_context_with_embeddings(state, input, false)
 }
 
-fn search_story_context_with_embeddings(
+fn search_semantic_context_with_embeddings(
     state: &AppState,
     input: &StoryContextSearchInput,
     use_embeddings: bool,
@@ -622,7 +622,7 @@ fn replace_source(
                     )?;
                 if current_artifact_id != payload.source_artifact_id {
                     return Err(AppError::Validation(
-                        "章节正式正文已切换，丢弃旧的搜索索引".to_string(),
+                        "章节正文已切换，丢弃旧的搜索索引".to_string(),
                     ));
                 }
             }
@@ -1609,7 +1609,7 @@ mod tests {
 
     use super::{
         cache_is_fresh, cached_runtime_from, chunk_text, get_story_search_status,
-        invalidate_chapters_from, lock_model_cache, model_signature, search_story_context,
+        invalidate_chapters_from, lock_model_cache, model_signature, search_semantic_context,
         EmbeddingRuntime, ModelCache, NORMALIZATION_VERSION,
     };
     use crate::{db::AppState, models::StoryContextSearchInput};
@@ -1776,7 +1776,7 @@ mod tests {
             102,
             "宁烬把玄铁令交给了林月。",
         );
-        let rows = search_story_context(
+        let rows = search_semantic_context(
             &state,
             &StoryContextSearchInput {
                 project_id,
@@ -2055,7 +2055,7 @@ mod tests {
     #[test]
     fn local_search_rejects_an_unknown_chapter_id() {
         let (_dir, state, project_id, _) = seeded_state();
-        let error = search_story_context(
+        let error = search_semantic_context(
             &state,
             &StoryContextSearchInput {
                 project_id,

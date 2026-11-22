@@ -170,7 +170,7 @@ pub async fn rebuild_chapter_memory(
         .ok_or_else(|| AppError::Validation("章节不存在".to_string()))?;
     let source = state
         .latest_approved_chapter_body(project_id, chapter_id)?
-        .ok_or_else(|| AppError::Validation("章节缺少已通过正文".to_string()))?;
+        .ok_or_else(|| AppError::Validation("章节暂无正文".to_string()))?;
     let expected_hash = source_text_hash(&source.content);
 
     let prompt = build_extraction_prompt(
@@ -244,7 +244,7 @@ fn build_extraction_prompt(chapter_title: &str, chapter_plan: &str, chapter_text
 # 原章节计划
 {chapter_plan}
 
-# 完整正式正文
+# 正文全文
 {chapter_text}"#
     )
 }
@@ -397,7 +397,7 @@ impl ChapterMemoryPayload {
 pub fn render_memory_context(record: &ChapterMemoryRecord) -> AppResult<String> {
     let payload: ChapterMemoryPayload = serde_json::from_str(&record.content)?;
     let mut lines = vec![format!(
-        "来源：正式正文 artifact {} / SHA-256 {} / {}",
+        "来源：正文 artifact {} / SHA-256 {} / {}",
         record.source_artifact_id,
         &record.source_text_hash[..record.source_text_hash.len().min(12)],
         record.normalization_version

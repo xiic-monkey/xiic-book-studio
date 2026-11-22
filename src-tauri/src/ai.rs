@@ -9,10 +9,74 @@ use crate::{
     models::{AgentToolDefinition, AiSettings, ModelInfo, ModelsResponse, ReviewIssue, ToolCall},
 };
 
+/// 资料整理/索引这类机器可读步骤统一关闭深度思考，换取稳定的 JSON 输出与低延迟。
+pub fn deterministic_settings(mut settings: AiSettings) -> AiSettings {
+    settings.thinking_enabled = false;
+    settings
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(
+        default,
+        deserialize_with = "null_to_empty_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub content: String,
+    /// assistant 回合带的工具调用（多轮 tool-calling 用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<AssistantToolCall>>,
+    /// tool 消息回填时指向被调用的那次调用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// 流式响应里解析出的一次工具调用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamToolCall {
+    pub id: String,
+    pub name: String,
+    /// 原始 JSON 文本（模型分片拼接后）。
+    pub arguments: String,
+}
+
+/// 一次流式响应的结果：正文增量与工具调用。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamChunk {
+    pub content: String,
+    pub tool_calls: Vec<StreamToolCall>,
+}
+
+/// 多轮 tool-calling 的最终结果：正文是模型收尾时的人话总结，
+/// tool_calls 是整轮里提交过的工具调用。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamingOutcome {
+    pub content: String,
+    pub tool_calls: Vec<StreamToolCall>,
+}
+
+/// assistant 回合声明的工具调用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AssistantToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: AssistantToolCallFunction,
+}
+
+/// 供应商可能把 content 回成 null（纯工具调用回合）。
+fn null_to_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AssistantToolCallFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -30,6 +94,9 @@ pub struct ChatCompletionRequest {
     pub reasoning_split: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
+    /// 下发给模型的工具目录（OpenAI 兼容的 function calling 形状）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,6 +125,8 @@ const MAX_AI_RETRIES: usize = 10;
 const AI_REQUEST_TIMEOUT_SECONDS: u64 = 240;
 const AI_ORCHESTRATOR_TIMEOUT_SECONDS: u64 = 60;
 const AI_STREAM_MAX_ATTEMPTS: usize = 2;
+/// 工具规划调用的尝试次数。上游偶发「连上了但不返回」，重试一次通常就能拿到结果。
+const AI_PLAN_MAX_ATTEMPTS: usize = 3;
 const AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: u64 = 30;
 const AI_RETRY_DELAY_MILLIS: u64 = 1_000;
 
@@ -114,14 +183,19 @@ pub fn build_chat_request(
         thinking: provider_thinking_config(&settings.base_url, thinking_enabled),
         reasoning_split: provider_reasoning_split(&settings.base_url, thinking_enabled),
         response_format: None,
+        tools: None,
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
                 content: system_prompt.to_string(),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: user_prompt.to_string(),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ],
     }
@@ -184,6 +258,32 @@ pub async fn complete_json_chat_for_orchestrator(
 }
 
 pub async fn plan_tool_calls_native(
+    settings: &AiSettings,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    tools: &[AgentToolDefinition],
+) -> Result<(Vec<ToolCall>, Option<String>), ToolPlanningError> {
+    let mut last_error: Option<ToolPlanningError> = None;
+    for attempt in 1..=AI_PLAN_MAX_ATTEMPTS {
+        match plan_tool_calls_native_once(settings, api_key, system_prompt, user_prompt, tools).await {
+            Ok(result) => return Ok(result),
+            // 供应商不支持原生工具调用是确定性结论，重试没有意义。
+            Err(error @ ToolPlanningError::Unsupported(_)) => return Err(error),
+            Err(error) => {
+                last_error = Some(error);
+                if should_retry(attempt, AI_PLAN_MAX_ATTEMPTS) {
+                    sleep(Duration::from_millis(AI_RETRY_DELAY_MILLIS)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AppError::Validation("工具规划请求失败".to_string()).into()
+    }))
+}
+
+async fn plan_tool_calls_native_once(
     settings: &AiSettings,
     api_key: &str,
     system_prompt: &str,
@@ -256,7 +356,7 @@ pub async fn plan_tool_calls_native(
     .map_err(ToolPlanningError::Other)?;
 
     let status = response.status();
-    let body = read_response_text(response)
+    let body = read_response_text_bounded(response)
         .await
         .map_err(ToolPlanningError::Other)?;
     if !status.is_success() {
@@ -548,7 +648,7 @@ async fn complete_chat_with_format_options(
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = read_response_text(response).await.unwrap_or_default();
+            let body = read_response_text_bounded(response).await.unwrap_or_default();
             last_error = Some(AppError::Validation(format!(
                 "AI 请求失败：HTTP {status} {}",
                 compact_error_body(&body)
@@ -560,7 +660,7 @@ async fn complete_chat_with_format_options(
             break;
         }
 
-        let body = match read_response_text(response).await {
+        let body = match read_response_text_bounded(response).await {
             Ok(body) => body,
             Err(error) => {
                 last_error = Some(error);
@@ -573,7 +673,7 @@ async fn complete_chat_with_format_options(
         };
 
         match parse_chat_completion(&body) {
-            Ok(content) => return Ok(content),
+            Ok(chunk) => return Ok(chunk.content),
             Err(error) => {
                 last_error = Some(AppError::Validation(format!(
                     "{}；原始响应片段：{}",
@@ -607,6 +707,44 @@ pub async fn complete_chat_streaming<F>(
 where
     F: FnMut(&str, &str) -> AppResult<()>,
 {
+    let mut request = build_chat_request(settings, system_prompt, user_prompt, temperature);
+    request.stream = Some(true);
+    let chunk = stream_completion(settings, api_key, request, &mut on_update).await?;
+    Ok(chunk.content)
+}
+
+/// 发一轮带工具目录的流式请求，返回本轮的正文与工具调用。
+///
+/// 多轮 tool-calling 的循环由调用方驱动（它需要拿到工具执行能力与运行上下文），
+/// 这里只负责协议：拼请求、发流、归并 tool_calls 分片。
+pub async fn stream_chat_turn<F>(
+    settings: &AiSettings,
+    api_key: &str,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<Value>>,
+    temperature: f64,
+    on_update: &mut F,
+) -> AppResult<StreamChunk>
+where
+    F: FnMut(&str, &str) -> AppResult<()>,
+{
+    let mut request = build_chat_request(settings, "", "", temperature);
+    request.messages = messages;
+    request.tools = tools;
+    request.stream = Some(true);
+    stream_completion(settings, api_key, request, on_update).await
+}
+
+/// 发一次流式请求并读完整个流（含重试与超时窗口）。
+async fn stream_completion<F>(
+    settings: &AiSettings,
+    api_key: &str,
+    request: ChatCompletionRequest,
+    on_update: &mut F,
+) -> AppResult<StreamChunk>
+where
+    F: FnMut(&str, &str) -> AppResult<()>,
+{
     let normalized_base_url = normalize_base_url(&settings.base_url);
     if normalized_base_url.is_empty() {
         return Err(AppError::Validation("请先设置 API Base URL".to_string()));
@@ -614,9 +752,6 @@ where
     if settings.model.trim().is_empty() {
         return Err(AppError::Validation("请先设置模型名称".to_string()));
     }
-
-    let mut request = build_chat_request(settings, system_prompt, user_prompt, temperature);
-    request.stream = Some(true);
     let url = format!("{}/chat/completions", normalized_base_url);
     let client = build_client()?;
     let max_attempts = AI_STREAM_MAX_ATTEMPTS;
@@ -651,7 +786,7 @@ where
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = read_response_text(response).await.unwrap_or_default();
+            let body = read_response_text_bounded(response).await.unwrap_or_default();
             last_error = Some(AppError::Validation(format!(
                 "AI 请求失败：HTTP {status} {}",
                 compact_error_body(&body)
@@ -665,7 +800,7 @@ where
 
         let stream_result = match timeout(
             Duration::from_secs(AI_REQUEST_TIMEOUT_SECONDS),
-            read_stream_completion(response, &mut on_update),
+            read_stream_completion(response, on_update),
         )
         .await
         {
@@ -677,7 +812,7 @@ where
         };
 
         match stream_result {
-            Ok(content) => return Ok(content),
+            Ok(chunk) => return Ok(chunk),
             Err(error) => {
                 last_error = Some(error);
                 if should_retry(attempt, max_attempts) {
@@ -719,7 +854,7 @@ pub async fn list_models(settings: &AiSettings, api_key: &str) -> AppResult<Vec<
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = read_response_text(response).await.unwrap_or_default();
+            let body = read_response_text_bounded(response).await.unwrap_or_default();
             last_error = Some(AppError::Validation(format!(
                 "获取模型列表失败：HTTP {status} {}",
                 compact_error_body(&body)
@@ -731,7 +866,7 @@ pub async fn list_models(settings: &AiSettings, api_key: &str) -> AppResult<Vec<
             break;
         }
 
-        let body = match read_response_text(response).await {
+        let body = match read_response_text_bounded(response).await {
             Ok(body) => body,
             Err(error) => {
                 last_error = Some(error);
@@ -772,7 +907,16 @@ pub fn parse_review_issues(raw: &str) -> AppResult<Vec<ReviewIssue>> {
             "试读 Agent 返回的 JSON 不是严格的问题数组：{error}"
         ))
     })?;
-    for issue in &issues {
+    validate_review_issues(&issues)?;
+    Ok(issues)
+}
+
+/// 校验试读问题的字段完整性。
+///
+/// JSON 数组解析与 `submit_review_issues` 工具参数两条路径共用同一套规则：
+/// 字段不能空、severity 必须是三档之一、引文必须是 8-80 字连续片段。
+pub fn validate_review_issues(issues: &[ReviewIssue]) -> AppResult<()> {
+    for issue in issues {
         if issue.issue_type.trim().is_empty()
             || issue.location.trim().is_empty()
             || issue.reason.trim().is_empty()
@@ -797,7 +941,7 @@ pub fn parse_review_issues(raw: &str) -> AppResult<Vec<ReviewIssue>> {
             ));
         }
     }
-    Ok(issues)
+    Ok(())
 }
 
 fn build_client() -> AppResult<reqwest::Client> {
@@ -824,10 +968,28 @@ async fn read_response_text(response: reqwest::Response) -> AppResult<String> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+/// 带上限地读取响应体。
+///
+/// 客户端级超时只覆盖到响应头；上游若在正文中途停住（例如代理把连接挂死），
+/// 这里必须再兜一层，否则整轮 Agent 运行会无限等待。
+async fn read_response_text_bounded(response: reqwest::Response) -> AppResult<String> {
+    timeout(
+        Duration::from_secs(AI_REQUEST_TIMEOUT_SECONDS),
+        read_response_text(response),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Validation(format!(
+            "响应体读取超过 {} 秒仍未完成",
+            AI_REQUEST_TIMEOUT_SECONDS
+        ))
+    })?
+}
+
 async fn read_stream_completion<F>(
     mut response: reqwest::Response,
     on_update: &mut F,
-) -> AppResult<String>
+) -> AppResult<StreamChunk>
 where
     F: FnMut(&str, &str) -> AppResult<()>,
 {
@@ -835,6 +997,10 @@ where
     let mut raw_response = String::new();
     let mut content = String::new();
     let mut reasoning = String::new();
+    // 工具调用按 index 归并：首片带 id/name，后续片只带 arguments 片段。
+    let mut tool_call_ids: Vec<String> = Vec::new();
+    let mut tool_call_names: Vec<String> = Vec::new();
+    let mut tool_call_arguments: Vec<String> = Vec::new();
     let mut saw_sse_event = false;
     let mut saw_terminal_event = false;
 
@@ -884,6 +1050,12 @@ where
             if let Some(delta) = extract_stream_delta_content(&value) {
                 content.push_str(&delta);
             }
+            collect_stream_delta_tool_calls(
+                &value,
+                &mut tool_call_ids,
+                &mut tool_call_names,
+                &mut tool_call_arguments,
+            );
             if !content.is_empty() || !reasoning.is_empty() {
                 on_update(&content, &reasoning)?;
             }
@@ -910,26 +1082,101 @@ where
             "AI 流式响应未正常结束，已自动重试以避免保存半截正文".to_string(),
         ));
     }
+    let tool_calls = assemble_stream_tool_calls(
+        &tool_call_ids,
+        &tool_call_names,
+        &tool_call_arguments,
+    );
     let normalized = strip_think_blocks(&content);
-    if normalized.trim().is_empty() {
+    if normalized.trim().is_empty() && tool_calls.is_empty() {
         return Err(AppError::Validation("AI 没有返回可用内容".to_string()));
     }
     on_update(&normalized, &reasoning)?;
-    Ok(normalized)
+    Ok(StreamChunk {
+        content: normalized,
+        tool_calls,
+    })
 }
 
-fn parse_chat_completion(raw: &str) -> AppResult<String> {
+/// 归并流式分片里的工具调用：按 index 累积 id、name 与 arguments 片段。
+fn collect_stream_delta_tool_calls(
+    value: &Value,
+    ids: &mut Vec<String>,
+    names: &mut Vec<String>,
+    arguments: &mut Vec<String>,
+) {
+    let Some(calls) = value
+        .pointer("/choices/0/delta/tool_calls")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for call in calls {
+        let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        while ids.len() <= index {
+            ids.push(String::new());
+            names.push(String::new());
+            arguments.push(String::new());
+        }
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                ids[index] = id.to_string();
+            }
+        }
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                names[index] = name.to_string();
+            }
+        }
+        if let Some(chunk) = call.pointer("/function/arguments").and_then(Value::as_str) {
+            arguments[index].push_str(chunk);
+        }
+    }
+}
+
+fn assemble_stream_tool_calls(
+    ids: &[String],
+    names: &[String],
+    arguments: &[String],
+) -> Vec<StreamToolCall> {
+    let mut calls = Vec::new();
+    for index in 0..names.len() {
+        let name = names[index].trim();
+        if name.is_empty() {
+            continue;
+        }
+        calls.push(StreamToolCall {
+            id: if ids[index].trim().is_empty() {
+                format!("call_{index}")
+            } else {
+                ids[index].clone()
+            },
+            name: name.to_string(),
+            arguments: arguments[index].clone(),
+        });
+    }
+    calls
+}
+
+fn parse_chat_completion(raw: &str) -> AppResult<StreamChunk> {
     let trimmed = trim_code_fence(raw);
 
     if let Ok(completion) = serde_json::from_str::<ChatCompletionResponse>(trimmed) {
-        if let Some(content) = completion
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.content)
-            .filter(|content| !content.trim().is_empty())
-        {
-            return Ok(strip_think_blocks(&content));
+        if let Some(choice) = completion.choices.into_iter().next() {
+            let tool_calls = extract_tool_calls_from_message(&choice.message);
+            let content = strip_think_blocks(&choice.message.content);
+            if !content.trim().is_empty() {
+                return Ok(StreamChunk {
+                    content,
+                    tool_calls,
+                });
+            }
+            if !tool_calls.is_empty() {
+                return Ok(StreamChunk {
+                    content: String::new(),
+                    tool_calls,
+                });
+            }
         }
     }
 
@@ -938,6 +1185,10 @@ fn parse_chat_completion(raw: &str) -> AppResult<String> {
         return Err(AppError::Validation(format!("AI 返回错误：{message}")));
     }
 
+    let tool_calls = value
+        .pointer("/choices/0/message")
+        .map(extract_message_tool_calls)
+        .unwrap_or_default();
     let content = value
         .get("choices")
         .and_then(Value::as_array)
@@ -945,13 +1196,60 @@ fn parse_chat_completion(raw: &str) -> AppResult<String> {
         .and_then(|choice| choice.get("message"))
         .and_then(|message| message.get("content"))
         .and_then(extract_message_content)
-        .ok_or_else(|| AppError::Validation("AI 没有返回可用内容".to_string()))?;
+        .unwrap_or_default();
 
-    if content.trim().is_empty() {
+    if content.trim().is_empty() && tool_calls.is_empty() {
         return Err(AppError::Validation("AI 没有返回可用内容".to_string()));
     }
 
-    Ok(strip_think_blocks(&content))
+    Ok(StreamChunk {
+        content: strip_think_blocks(&content),
+        tool_calls,
+    })
+}
+
+/// 从一条 assistant message 里取出工具调用（非流式兜底路径用）。
+fn extract_tool_calls_from_message(message: &ChatMessage) -> Vec<StreamToolCall> {
+    let Some(calls) = message.tool_calls.as_ref() else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter(|call| !call.function.name.trim().is_empty())
+        .map(|call| StreamToolCall {
+            id: call.id.clone(),
+            name: call.function.name.clone(),
+            arguments: call.function.arguments.clone(),
+        })
+        .collect()
+}
+
+/// 从原始 JSON 里取出 assistant message 的工具调用（非流式兜底路径用）。
+fn extract_message_tool_calls(message: &Value) -> Vec<StreamToolCall> {
+    let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    let mut names = Vec::new();
+    let mut arguments = Vec::new();
+    for call in calls {
+        let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        while ids.len() <= index {
+            ids.push(String::new());
+            names.push(String::new());
+            arguments.push(String::new());
+        }
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            ids[index] = id.to_string();
+        }
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            names[index] = name.to_string();
+        }
+        if let Some(raw) = call.pointer("/function/arguments").and_then(Value::as_str) {
+            arguments[index] = raw.to_string();
+        }
+    }
+    assemble_stream_tool_calls(&ids, &names, &arguments)
 }
 
 fn provider_max_completion_tokens(base_url: &str) -> Option<u32> {
@@ -973,6 +1271,14 @@ fn provider_thinking_config(base_url: &str, enabled: bool) -> Option<ThinkingCon
     if normalized.contains("minimaxi") {
         return Some(ThinkingConfig {
             kind: if enabled { "adaptive" } else { "disabled" }.to_string(),
+        });
+    }
+    if normalized.contains("xiaomimimo") {
+        // MiMO 默认开启深度思考，且只有显式下发 type=disabled 才会关闭。
+        // 不下发时大提示词请求（例如带工具规划的试读）会在客户端超时窗口内无法返回，
+        // 所以这里必须把「关闭思考」真正传下去，而不是退回供应商默认值。
+        return Some(ThinkingConfig {
+            kind: if enabled { "enabled" } else { "disabled" }.to_string(),
         });
     }
     None
@@ -1198,15 +1504,53 @@ mod tests {
     }
 
     #[test]
+    fn maps_mimo_thinking_switch_to_explicit_type() {
+        let disabled = AiSettings {
+            base_url: "https://api.xiaomimimo.com/v1".to_string(),
+            model: "mimo-v2.6-flash".to_string(),
+            temperature: 0.35,
+            thinking_enabled: false,
+            thinking_level: "off".to_string(),
+            has_api_key: true,
+        };
+        let request = build_chat_request(&disabled, "sys", "user", 0.35);
+        assert_eq!(
+            request.thinking,
+            Some(ThinkingConfig {
+                kind: "disabled".to_string()
+            })
+        );
+
+        let enabled = AiSettings {
+            thinking_enabled: true,
+            thinking_level: "medium".to_string(),
+            ..disabled
+        };
+        let request = build_chat_request(&enabled, "sys", "user", 0.35);
+        assert_eq!(
+            request.thinking,
+            Some(ThinkingConfig {
+                kind: "enabled".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_providers_keep_default_thinking_behavior() {
+        assert!(provider_thinking_config("https://example.test/v1", false).is_none());
+        assert!(provider_thinking_config("https://example.test/v1", true).is_none());
+    }
+
+    #[test]
     fn parses_chat_completion_with_string_content() {
         let raw = r#"{"choices":[{"message":{"role":"assistant","content":"你好"}}]}"#;
-        assert_eq!(parse_chat_completion(raw).unwrap(), "你好");
+        assert_eq!(parse_chat_completion(raw).unwrap().content, "你好");
     }
 
     #[test]
     fn strips_think_blocks_from_chat_completion() {
         let raw = r#"{"choices":[{"message":{"role":"assistant","content":"<think>hidden</think>\n正文"}}]}"#;
-        assert_eq!(parse_chat_completion(raw).unwrap(), "正文");
+        assert_eq!(parse_chat_completion(raw).unwrap().content, "正文");
     }
 
     #[test]
@@ -1219,7 +1563,7 @@ mod tests {
                 }
             }]
         }"#;
-        assert_eq!(parse_chat_completion(raw).unwrap(), "第一段\n第二段");
+        assert_eq!(parse_chat_completion(raw).unwrap().content, "第一段\n第二段");
     }
 
     #[test]
@@ -1330,6 +1674,60 @@ mod tests {
             500,
             r#"{"error":{"message":"unknown field `tools`"}}"#
         ));
+    }
+
+    /// 流式分片里的工具调用必须按 index 归并：首片带 id/name，后续片只带参数片段。
+    #[test]
+    fn assembles_stream_tool_calls_from_deltas() {
+        let mut ids = Vec::new();
+        let mut names = Vec::new();
+        let mut arguments = Vec::new();
+        let first = serde_json::json!({
+            "choices": [{ "delta": { "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "submit_review_issues", "arguments": "" }
+            }] } }]
+        });
+        collect_stream_delta_tool_calls(&first, &mut ids, &mut names, &mut arguments);
+        let second = serde_json::json!({
+            "choices": [{ "delta": { "tool_calls": [{
+                "index": 0,
+                "id": null,
+                "function": { "name": null, "arguments": "{\"issues\":[]}" }
+            }] } }]
+        });
+        collect_stream_delta_tool_calls(&second, &mut ids, &mut names, &mut arguments);
+
+        let calls = assemble_stream_tool_calls(&ids, &names, &arguments);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "submit_review_issues");
+        assert_eq!(calls[0].arguments, "{\"issues\":[]}");
+    }
+
+    /// 提交型工具的参数必须过与 JSON 数组路径同一套校验。
+    #[test]
+    fn validate_review_issues_rejects_incomplete_or_unverifiable_findings() {
+        let good = ReviewIssue {
+            issue_type: "事实越界".to_string(),
+            severity: "major".to_string(),
+            location: "第 1 段".to_string(),
+            reason: "凭空新增".to_string(),
+            suggestion: "删掉".to_string(),
+            evidence_quote: "这是一段可回查的原文片段".to_string(),
+            action_evidence_quote: String::new(),
+        };
+        assert!(validate_review_issues(&[good.clone()]).is_ok());
+
+        let mut bad_severity = good.clone();
+        bad_severity.severity = "严重".to_string();
+        assert!(validate_review_issues(&[bad_severity]).is_err());
+
+        let mut short_quote = good;
+        short_quote.evidence_quote = "太短".to_string();
+        assert!(validate_review_issues(&[short_quote]).is_err());
     }
 
     #[test]

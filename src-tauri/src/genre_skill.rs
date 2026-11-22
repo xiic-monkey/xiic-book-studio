@@ -1,5 +1,10 @@
-use crate::models::Stage;
-use std::{env, fs, path::PathBuf};
+use crate::{
+    db::AppState,
+    error::AppResult,
+    models::{Project, Stage},
+};
+
+const CRAFT_KEY: &str = "continuity_and_agency";
 
 const GENERAL_SERIALIZED_FALLBACK: &str = include_str!("../skills/genres/general_serialized.md");
 const URBAN_SUPERNATURAL_FALLBACK: &str = include_str!("../skills/genres/urban_supernatural.md");
@@ -35,6 +40,15 @@ impl GenreSkillKind {
             GenreSkillKind::XianxiaPowerFantasy => XIANXIA_POWER_FANTASY_FALLBACK,
         }
     }
+
+    pub fn default_name(self) -> &'static str {
+        match self {
+            Self::GeneralSerialized => "通用连载写法",
+            Self::UrbanSupernatural => "都市异能",
+            Self::Mystery => "悬疑",
+            Self::XianxiaPowerFantasy => "男频修仙爽文",
+        }
+    }
 }
 
 pub fn detect_genre_skill(genre: &str) -> GenreSkillKind {
@@ -57,14 +71,59 @@ pub fn detect_genre_skill(genre: &str) -> GenreSkillKind {
     }
 }
 
-pub fn genre_skill_for_id(skill_id: &str) -> Option<GenreSkillKind> {
-    match skill_id {
-        "general_serialized" => Some(GenreSkillKind::GeneralSerialized),
-        "urban_supernatural" => Some(GenreSkillKind::UrbanSupernatural),
-        "mystery" => Some(GenreSkillKind::Mystery),
-        "xianxia_power_fantasy" => Some(GenreSkillKind::XianxiaPowerFantasy),
-        _ => None,
+#[derive(serde::Serialize)]
+pub(crate) struct StageSkillContext {
+    pub selected_genre_key: &'static str,
+    pub genre_rules: String,
+    pub craft_rules: String,
+}
+
+impl StageSkillContext {
+    pub fn append_to(&self, prompt: &mut String) {
+        prompt.push_str(&self.genre_rules);
+        prompt.push_str(&self.craft_rules);
     }
+}
+
+pub(crate) fn load_stage_skills(
+    state: &AppState,
+    project: &Project,
+    stage: &Stage,
+    allowed_skill_keys: &[String],
+) -> AppResult<StageSkillContext> {
+    let skill = detect_genre_skill(&project.genre);
+    let selected_genre_key = skill.skill_id();
+    let genre_rules = state
+        .effective_genre_skill_content(skill)?
+        .map(|template| {
+            render_genre_skill_from_template(&project.genre, stage, selected_genre_key, &template)
+        })
+        .unwrap_or_default();
+    let craft_rules = if allowed_skill_keys.iter().any(|key| key == CRAFT_KEY) {
+        state
+            .get_writing_skill_by_key(CRAFT_KEY)?
+            .filter(|record| record.enabled && record.category == "craft")
+            .map(|record| {
+                render_stage_scoped_skill(
+                    "写作 Craft Skill",
+                    CRAFT_KEY,
+                    &format!(
+                        "技能名称：{}。以下是跨题材复用的写作工艺约束。",
+                        record.name
+                    ),
+                    stage,
+                    &record.content,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    Ok(StageSkillContext {
+        selected_genre_key,
+        genre_rules,
+        craft_rules,
+    })
 }
 
 pub struct DefaultWritingSkill {
@@ -79,34 +138,34 @@ pub fn default_writing_skills() -> Vec<DefaultWritingSkill> {
     vec![
         DefaultWritingSkill {
             skill_key: GenreSkillKind::GeneralSerialized.skill_id(),
-            name: "通用连载写法",
+            name: GenreSkillKind::GeneralSerialized.default_name(),
             category: "genre",
             description: "适用于未细分题材的连载节奏、章节功能和修订原则。",
             content: GENERAL_SERIALIZED_FALLBACK,
         },
         DefaultWritingSkill {
             skill_key: GenreSkillKind::UrbanSupernatural.skill_id(),
-            name: "都市异能",
+            name: GenreSkillKind::UrbanSupernatural.default_name(),
             category: "genre",
             description: "强调异能边界、现代社会反馈、身份变化和能力成长。",
             content: URBAN_SUPERNATURAL_FALLBACK,
         },
         DefaultWritingSkill {
             skill_key: GenreSkillKind::Mystery.skill_id(),
-            name: "悬疑",
+            name: GenreSkillKind::Mystery.default_name(),
             category: "genre",
             description: "强调谜面、证据链、知情边界、解释竞争和公平性。",
             content: MYSTERY_FALLBACK,
         },
         DefaultWritingSkill {
             skill_key: GenreSkillKind::XianxiaPowerFantasy.skill_id(),
-            name: "男频修仙爽文",
+            name: GenreSkillKind::XianxiaPowerFantasy.default_name(),
             category: "genre",
             description: "强调升级流长线发育、资源收益、压迫链和不同章节模式。",
             content: XIANXIA_POWER_FANTASY_FALLBACK,
         },
         DefaultWritingSkill {
-            skill_key: "continuity_and_agency",
+            skill_key: CRAFT_KEY,
             name: "长篇连续性与主动性",
             category: "craft",
             description: "跨题材补充旧角色已知信息、物件状态、主角主动选择和探索章控密度。",
@@ -115,20 +174,15 @@ pub fn default_writing_skills() -> Vec<DefaultWritingSkill> {
     ]
 }
 
-pub fn render_genre_skill_from_template(
+fn render_genre_skill_from_template(
     genre: &str,
     stage: &Stage,
     skill_id: &str,
     template: &str,
 ) -> String {
-    let skill = detect_genre_skill(genre);
     render_stage_scoped_skill(
         "题材 Skill",
-        if skill_id.trim().is_empty() {
-            skill.skill_id()
-        } else {
-            skill_id.trim()
-        },
+        skill_id,
         &format!(
             "当前项目题材：{}。以下不是具体某本书的设定，而是这一类题材在当前阶段必须兑现的写法约束。",
             genre.trim()
@@ -136,40 +190,6 @@ pub fn render_genre_skill_from_template(
         stage,
         template,
     )
-}
-
-pub fn render_genre_skill(genre: &str, stage: &Stage) -> String {
-    let skill = detect_genre_skill(genre);
-    let template = load_skill_template(skill);
-    render_genre_skill_from_template(genre, stage, skill.skill_id(), &template)
-}
-
-fn load_skill_template(skill: GenreSkillKind) -> String {
-    read_runtime_skill(skill).unwrap_or_else(|| skill.fallback_template().to_string())
-}
-
-fn read_runtime_skill(skill: GenreSkillKind) -> Option<String> {
-    runtime_skill_candidates(skill)
-        .into_iter()
-        .find_map(|path| fs::read_to_string(path).ok())
-}
-
-fn runtime_skill_candidates(skill: GenreSkillKind) -> Vec<PathBuf> {
-    let filename = format!("{}.md", skill.skill_id());
-    let mut dirs = Vec::new();
-
-    if let Ok(dir) = env::var("XIIC_BOOK_STUDIO_SKILLS_DIR") {
-        dirs.push(PathBuf::from(dir).join("genres"));
-    }
-    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        dirs.push(PathBuf::from(manifest_dir).join("skills").join("genres"));
-    }
-    if let Ok(current_dir) = env::current_dir() {
-        dirs.push(current_dir.join("src-tauri").join("skills").join("genres"));
-        dirs.push(current_dir.join("skills").join("genres"));
-    }
-
-    dirs.into_iter().map(|dir| dir.join(&filename)).collect()
 }
 
 fn section(template: &str, heading: &str) -> String {
@@ -208,6 +228,9 @@ pub fn render_stage_scoped_skill(
 ) -> String {
     let always = section(template, "Always");
     let stage_rules = section(template, &format!("Stage: {}", stage.as_str()));
+    if always.is_empty() && stage_rules.is_empty() {
+        return String::new();
+    }
 
     let mut output = format!(
         "\n\n# {}\nSkill 来源：应用内写作资料库 / {}\n{}",
@@ -276,15 +299,81 @@ mod tests {
 
     #[test]
     fn renders_stage_specific_xianxia_guidance() {
-        let text = render_genre_skill("男频修仙爽文", &Stage::Draft);
+        let text = render_genre_skill_from_template(
+            "男频修仙爽文",
+            &Stage::Draft,
+            GenreSkillKind::XianxiaPowerFantasy.skill_id(),
+            XIANXIA_POWER_FANTASY_FALLBACK,
+        );
         assert!(text.contains("应用内写作资料库 / xianxia_power_fantasy"));
         assert!(text.contains("男频修仙/升级流"));
         assert!(text.contains("发育修炼章"));
         assert!(text.contains("不要连续堆谜团而不给进度"));
     }
 
-    /// section() 对标题做整行精确匹配，段落缺失会被静默丢弃；此守卫测试
-    /// 确保每个内置 skill 模板始终覆盖 Always 与全部六个阶段。
+    #[test]
+    fn stage_skills_render_only_nonempty_matching_sections() {
+        let render = |template| {
+            render_stage_scoped_skill(
+                "题材 Skill",
+                "mystery",
+                "题材规则",
+                &Stage::Review,
+                template,
+            )
+        };
+        assert!(render("").is_empty());
+        assert!(render("## Always\n \n## Stage: draft\n仅写作使用").is_empty());
+        assert!(render("## Always\n通用标记").contains("通用标记"));
+        let stage_only = render("## Stage: review\n试读标记\n## Stage: revision\n修订标记");
+        assert!(stage_only.contains("试读标记"));
+        assert!(!stage_only.contains("修订标记"));
+        assert!(!stage_only.contains("## 通用规则"));
+    }
+
+    #[test]
+    fn stage_skills_respect_craft_enablement_and_genre_empty_content() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(database.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(crate::models::NewProject {
+                title: "题材与 Craft 开关".to_string(),
+                genre: "悬疑".to_string(),
+                target_words: 100_000,
+                premise: "验证独立开关".to_string(),
+            })
+            .unwrap();
+        let allowed = [CRAFT_KEY.to_string()];
+        let load = || load_stage_skills(&state, &project, &Stage::Review, &allowed).unwrap();
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE writing_skills SET content = ' ' WHERE skill_key = 'mystery'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE writing_skills SET content = ?1 WHERE skill_key = ?2",
+                    ("## Stage: review\n自定义 Craft 规则", CRAFT_KEY),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let skills = load();
+        assert_eq!(skills.selected_genre_key, "mystery");
+        assert!(skills.genre_rules.is_empty());
+        assert!(skills.craft_rules.contains("自定义 Craft 规则"));
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE writing_skills SET enabled = 0 WHERE skill_key = ?1",
+                    [CRAFT_KEY],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(load().craft_rules.is_empty());
+    }
+
     #[test]
     fn every_skill_template_covers_all_stages() {
         let templates = [

@@ -181,6 +181,9 @@ pub enum ToolKind {
     Read,
     Delegate,
     Proposal,
+    /// 提交型工具：Agent 通过调用它把结构化结果交回运行时，而不是把 JSON
+    /// 写进最终回复文本。
+    Submit,
 }
 
 impl ToolKind {
@@ -189,6 +192,8 @@ impl ToolKind {
             Self::Proposal
         } else if value == "delegate" {
             Self::Delegate
+        } else if value == "submit" {
+            Self::Submit
         } else {
             Self::Read
         }
@@ -235,13 +240,10 @@ impl ToolProtocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-pub struct GenreAgentProfile {
-    pub agent_key: String,
+pub struct ProjectGenreSkill {
+    pub skill_key: String,
     pub name: String,
-    pub role: String,
-    pub system_prompt: String,
-    pub primary_skill_key: String,
-    pub allowed_skill_keys: Vec<String>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -839,7 +841,7 @@ pub struct SaveWritingSkill {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDetail {
     pub project: Project,
-    pub genre_agent: GenreAgentProfile,
+    pub genre_skill: ProjectGenreSkill,
     pub chapters: Vec<Chapter>,
     pub chapter_plans: Vec<ChapterPlan>,
     pub agents: Vec<Agent>,
@@ -870,7 +872,7 @@ pub struct ProjectDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ProjectWorkspace {
     pub project: Project,
-    pub genre_agent: GenreAgentProfile,
+    pub genre_skill: ProjectGenreSkill,
     pub chapters: Vec<Chapter>,
     pub chapter_plans: Vec<ChapterPlan>,
     pub formal_char_count: i64,

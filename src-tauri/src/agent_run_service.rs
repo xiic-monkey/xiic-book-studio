@@ -6,8 +6,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     db::AppState,
     error::{AppError, AppResult},
+    genre_skill,
     models::{
-        AgentRunRequest, AgentRunSummary, Artifact, ContextSegment, OrchestratorTask,
+        Agent, AgentRunRequest, AgentRunSummary, Artifact, ContextSegment, OrchestratorTask,
         OrchestratorTurnRequest, OrchestratorTurnResponse, PreparedContext, RevisionRequest,
         RunAgentRequest, RunStoryArchitectRequest, Stage, StoryArchitectMode, WorkflowRun,
     },
@@ -19,7 +20,8 @@ pub async fn preview_agent_run(
     state: &AppState,
     request: AgentRunRequest,
 ) -> AppResult<PreparedContext> {
-    prepare_context(state, &request, true).await
+    let (prepared, _) = prepare_context(state, &request, true).await?;
+    Ok(prepared)
 }
 
 pub async fn start_agent_run(
@@ -36,13 +38,14 @@ async fn start_agent_run_internal(
     task_title: Option<&str>,
     allow_concurrent: bool,
 ) -> AppResult<AgentRunSummary> {
-    let prepared = if let Some(id) = request.prepared_context_id {
+    let (prepared, mut agent) = if let Some(id) = request.prepared_context_id {
         let prepared = state.get_prepared_context(id)?;
-        validate_prepared_context(state, &request, &prepared)?;
-        prepared
+        let agent = validate_prepared_context(state, &request, &prepared)?;
+        (prepared, agent)
     } else {
         prepare_context(state, &request, true).await?
     };
+    agent.system_prompt.clone_from(&prepared.system_prompt);
     request.prepared_context_id = Some(prepared.id);
     if !allow_concurrent && state.get_active_agent_run(request.project_id)?.is_some() {
         return Err(AppError::Validation(
@@ -86,6 +89,7 @@ async fn start_agent_run_internal(
             &worker_state,
             worker_request.clone(),
             worker_run.clone(),
+            agent,
         )
         .await
         {
@@ -172,7 +176,7 @@ async fn prepare_proposals_after_run(
     request: &RunAgentRequest,
     result: &crate::models::AgentStepResult,
 ) -> AppResult<()> {
-    let agent = state.get_agent_for_project_stage(request.project_id, request.stage.as_str())?;
+    let agent = state.get_execution_agent(request.stage.as_str())?;
     let mut proposal_agent = agent.clone();
     let foundation_mode = matches!(
         request.stage,
@@ -256,7 +260,7 @@ async fn start_story_architect_run_internal(
             "当前项目已有 Agent 任务正在运行".to_string(),
         ));
     }
-    let agent = state.get_agent_for_project_stage(request.project_id, "story_architect")?;
+    let agent = state.get_execution_agent("story_architect")?;
     let prompt = direct_story_architect_prompt(state, &request, &agent)?;
     let run = state.insert_workflow_run_with_meta(
         request.project_id,
@@ -419,7 +423,7 @@ fn direct_story_architect_prompt(
             ));
         }
     }
-    Ok(workflow::enforce_workflow_prompt_budget(prompt))
+    Ok(workflow::apply_workflow_prompt_budget(prompt))
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,7 +469,7 @@ pub async fn start_orchestrator_turn(
         return Err(AppError::Validation("消息不能为空".to_string()));
     }
     state.insert_message(input.project_id, input.chapter_id, "user", message)?;
-    let agent = state.get_agent_for_project_stage(input.project_id, "orchestrator")?;
+    let agent = state.get_execution_agent("orchestrator")?;
     let run = state.insert_workflow_run_with_meta(
         input.project_id,
         input.chapter_id,
@@ -1499,11 +1503,14 @@ async fn prepare_context(
     state: &AppState,
     request: &AgentRunRequest,
     preview: bool,
-) -> AppResult<PreparedContext> {
+) -> AppResult<(PreparedContext, Agent)> {
     state.purge_expired_prepared_contexts()?;
     let source = validate_request(state, request)?;
-    let agent = state.get_agent_for_project_stage(request.project_id, request.stage.as_str())?;
-    let mut prompt = workflow::build_prompt_for_agent(
+    let agent = state.get_execution_agent(request.stage.as_str())?;
+    let project = state.get_project(request.project_id)?;
+    let skills = genre_skill::load_stage_skills(state, &project, &request.stage, &agent.allowed_skill_keys)?;
+    let fingerprint = context_fingerprint(state, request, &agent, source.as_ref(), &project, &skills)?;
+    let mut prompt = workflow::build_prompt_for_agent_with_skills(
         state,
         request.project_id,
         &request.stage,
@@ -1512,6 +1519,7 @@ async fn prepare_context(
         source.as_ref(),
         None,
         &agent,
+        &skills,
     )?;
     let preparation = tool_runtime::prepare_tools(
         ToolExecutionContext {
@@ -1533,10 +1541,9 @@ async fn prepare_context(
         prompt.push_str("\n\n");
         prompt.push_str(tool_context);
     }
-    prompt = workflow::enforce_workflow_prompt_budget(prompt);
-    let fingerprint = context_fingerprint(state, request, &agent, source.as_ref())?;
+    prompt = workflow::apply_workflow_prompt_budget(prompt);
     let segments = split_segments(&prompt);
-    state.insert_prepared_context(
+    let prepared = state.insert_prepared_context(
         request.project_id,
         request.chapter_id,
         request.stage.as_str(),
@@ -1545,7 +1552,8 @@ async fn prepare_context(
         &prompt,
         &segments,
         &preparation.invocation_ids,
-    )
+    )?;
+    Ok((prepared, agent))
 }
 
 fn validate_request(state: &AppState, request: &AgentRunRequest) -> AppResult<Option<Artifact>> {
@@ -1606,7 +1614,7 @@ fn validate_prepared_context(
     state: &AppState,
     request: &AgentRunRequest,
     prepared: &PreparedContext,
-) -> AppResult<()> {
+) -> AppResult<Agent> {
     if prepared.project_id != request.project_id
         || prepared.chapter_id != request.chapter_id
         || prepared.stage != request.stage.as_str()
@@ -1623,24 +1631,30 @@ fn validate_prepared_context(
         ));
     }
     let source = validate_request(state, request)?;
-    let agent = state.get_agent_for_project_stage(request.project_id, request.stage.as_str())?;
-    let current = context_fingerprint(state, request, &agent, source.as_ref())?;
+    let agent = state.get_execution_agent(request.stage.as_str())?;
+    let project = state.get_project(request.project_id)?;
+    let skills = genre_skill::load_stage_skills(state, &project, &request.stage, &agent.allowed_skill_keys)?;
+    let current = context_fingerprint(state, request, &agent, source.as_ref(), &project, &skills)?;
     if current != prepared.fingerprint {
         return Err(AppError::Validation(
-            "项目资料、章节、候选稿、Prompt 或工具配置已变化，请重新预览".to_string(),
+            "项目资料、章节、候选稿、Prompt、Skill 或工具配置已变化，请重新预览".to_string(),
         ));
     }
-    Ok(())
+    Ok(agent)
 }
 
 fn context_fingerprint(
     state: &AppState,
     request: &AgentRunRequest,
-    agent: &crate::models::Agent,
+    agent: &Agent,
     source: Option<&Artifact>,
+    project: &crate::models::Project,
+    skills: &genre_skill::StageSkillContext,
 ) -> AppResult<String> {
     #[derive(Serialize)]
     struct Fingerprint<'a> {
+        version: u8,
+        skills: &'a genre_skill::StageSkillContext,
         project_updated_at: &'a str,
         canonical_fingerprint: String,
         chapter_id: Option<i64>,
@@ -1656,10 +1670,12 @@ fn context_fingerprint(
         allowed_skill_keys: &'a [String],
         provider_base_url: &'a str,
         model: &'a str,
+        temperature: f64,
+        thinking_enabled: bool,
+        thinking_level: &'a str,
         tool_protocol: &'a str,
         reference_fingerprint: String,
     }
-    let project = state.get_project(request.project_id)?;
     let chapter_updated_at = request.chapter_id.and_then(|id| {
         state
             .ensure_chapter(request.project_id, Some(id))
@@ -1668,6 +1684,8 @@ fn context_fingerprint(
             .map(|chapter| chapter.updated_at)
     });
     let value = Fingerprint {
+        version: 3,
+        skills,
         project_updated_at: &project.updated_at,
         canonical_fingerprint: crate::story_architecture::canonical_fingerprint(
             state,
@@ -1686,6 +1704,9 @@ fn context_fingerprint(
         allowed_skill_keys: &agent.allowed_skill_keys,
         provider_base_url: &agent.provider_base_url,
         model: &agent.model,
+        temperature: agent.temperature,
+        thinking_enabled: agent.thinking_enabled,
+        thinking_level: &agent.thinking_level,
         tool_protocol: state
             .provider_capabilities(&agent.provider_base_url)?
             .configured_protocol
@@ -1802,12 +1823,16 @@ mod tests {
     #[derive(Clone)]
     struct MockAiState {
         chunk_delay: Duration,
+        requests: Option<mpsc::UnboundedSender<Value>>,
     }
 
     async fn mock_chat_completions(
         State(state): State<MockAiState>,
         Json(request): Json<Value>,
     ) -> Response {
+        if let Some(requests) = state.requests.as_ref() {
+            requests.send(request.clone()).unwrap();
+        }
         if request.get("stream").and_then(Value::as_bool) != Some(true) {
             return Json(json!({
                 "choices": [{"message": {"role": "assistant", "content": "Mock completion"}}]
@@ -1838,12 +1863,19 @@ mod tests {
     }
 
     async fn start_mock_ai_server() -> String {
+        start_mock_ai_server_with_requests(None).await
+    }
+
+    async fn start_mock_ai_server_with_requests(
+        requests: Option<mpsc::UnboundedSender<Value>>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
             .route("/v1/chat/completions", post(mock_chat_completions))
             .with_state(MockAiState {
                 chunk_delay: Duration::from_millis(120),
+                requests,
             });
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -1902,6 +1934,224 @@ mod tests {
             reference_selection: None,
             prepared_context_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_context_rejects_changed_effective_skill() {
+        let base_url = start_mock_ai_server().await;
+        let (_temp, state, project) = test_state(&base_url);
+        let request = setting_request(project.id);
+        let prepared = preview_agent_run(&state, request.clone()).await.unwrap();
+        assert!(validate_prepared_context(&state, &request, &prepared).is_ok());
+
+        state.with_conn(|conn| {
+            conn.execute(
+                "UPDATE writing_skills SET content = content || '\n## Test\n' WHERE skill_key = 'mystery'",
+                [],
+            )?;
+            Ok(())
+        }).unwrap();
+        assert!(validate_prepared_context(&state, &request, &prepared).is_ok());
+
+        state.with_conn(|conn| {
+            conn.execute(
+                "UPDATE writing_skills SET content = replace(content, '## Stage: review', '## Stage: review' || char(10) || 'UNRELATED_REVIEW_RULE') WHERE skill_key = 'general_serialized'",
+                [],
+            )?;
+            Ok(())
+        }).unwrap();
+        assert!(validate_prepared_context(&state, &request, &prepared).is_ok());
+
+        state.with_conn(|conn| {
+            conn.execute(
+                "UPDATE writing_skills SET content = '## Always' || char(10) || 'NEW_RULE' WHERE skill_key = 'general_serialized'",
+                [],
+            )?;
+            Ok(())
+        }).unwrap();
+        let error = validate_prepared_context(&state, &request, &prepared).unwrap_err();
+        assert!(error.to_string().contains("请重新预览"));
+
+        let updated = preview_agent_run(&state, request.clone()).await.unwrap();
+        state.with_conn(|conn| {
+            conn.execute("UPDATE writing_skills SET enabled = 0 WHERE skill_key = 'general_serialized'", [])?;
+            Ok(())
+        }).unwrap();
+        let error = validate_prepared_context(&state, &request, &updated).unwrap_err();
+        assert!(error.to_string().contains("请重新预览"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_context_freezes_agent_after_start_validation() {
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        let base_url = start_mock_ai_server_with_requests(Some(sender)).await;
+        let (_temp, state, project) = test_state(&base_url);
+        let architect = state.get_agent("story_architect").unwrap();
+        let request = setting_request(project.id);
+        let old_preview = preview_agent_run(&state, request.clone()).await.unwrap();
+        state.replace_agent_prompt(architect.id, "预览中的 Agent Prompt").unwrap();
+
+        let mut request = request;
+        request.prepared_context_id = Some(old_preview.id);
+        let error = start_agent_run(&state, request.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("请重新预览"));
+
+        request.prepared_context_id = None;
+        let preview = preview_agent_run(&state, request.clone()).await.unwrap();
+        request.prepared_context_id = Some(preview.id);
+        let started = start_agent_run(&state, request).await.unwrap();
+        state.replace_agent_prompt(architect.id, "启动后修改的 Agent Prompt").unwrap();
+        state
+            .save_ai_settings(SaveAiSettings {
+                base_url,
+                model: "modified-model".to_string(),
+                temperature: 0.2,
+                thinking_enabled: false,
+                thinking_level: "off".to_string(),
+                api_key: Some("mock-key".to_string()),
+            })
+            .unwrap();
+
+        let result = wait_for_terminal_run(&state, started.run.id).await;
+        assert_eq!(result.run.status, "success", "{:?}", result.run);
+        let sent = requests.try_recv().unwrap();
+        assert_eq!(sent["messages"][0]["content"], preview.system_prompt);
+        assert_eq!(sent["model"], "mock-model");
+    }
+
+    #[tokio::test]
+    async fn revision_feedback_request_uses_revision_skill_rules() {
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        let base_url = start_mock_ai_server_with_requests(Some(sender)).await;
+        let (_temp, state, project) = test_state(&base_url);
+        let chapter = state.list_chapters(project.id).unwrap().remove(0);
+        let draft = state
+            .insert_artifact(project.id, Some(chapter.id), "draft", "初稿", "候选片段内容", None)
+            .unwrap();
+        state.with_conn(|conn| {
+            conn.execute("UPDATE agents SET enabled_tool_keys = '[]' WHERE stage = 'revision'", [])?;
+            conn.execute(
+                "UPDATE writing_skills SET content = ?1 WHERE skill_key = 'general_serialized'",
+                ["## Always\n共享规则标记\n## Stage: draft\n写作规则标记\n## Stage: revision\n修订规则标记"],
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let started = start_revision_run(&state, RevisionRequest {
+            project_id: project.id,
+            artifact_id: draft.id,
+            feedback: "补出人物退让的理由".to_string(),
+            reference_selection: None,
+        }).await.unwrap();
+        let result = wait_for_terminal_run(&state, started.run.id).await;
+        assert_eq!(result.run.status, "success", "{:?}", result.run);
+        let sent = requests.try_recv().unwrap();
+        let prompt = sent["messages"][1]["content"].as_str().unwrap();
+        assert!(prompt.contains("共享规则标记") && prompt.contains("修订规则标记"));
+        assert!(prompt.contains("候选片段内容") && prompt.contains("补出人物退让的理由"));
+        assert!(!prompt.contains("写作规则标记"));
+    }
+
+    #[tokio::test]
+    async fn preview_keeps_skill_snapshot_across_async_tool_preparation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (_temp, state, project) = test_state(&format!("http://{address}/v1"));
+        let architect = state.get_agent("story_architect").unwrap();
+        state
+            .save_agent_settings(SaveAgentSettings {
+                agent_id: architect.id,
+                provider_base_url: String::new(),
+                model: String::new(),
+                name: None,
+                role: None,
+                system_prompt: None,
+                temperature: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                uses_global_runtime_settings: Some(true),
+                enabled_tool_keys: Some(vec![crate::agent_tools::REFERENCE_MATERIALS.to_string()]),
+                allowed_skill_keys: Some(vec!["continuity_and_agency".to_string()]),
+            })
+            .unwrap();
+        let update_rule = |state: &AppState, key: &str, rule: &str| {
+            state.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE writing_skills SET content = ?1 WHERE skill_key = ?2",
+                    (format!("## Always\n{rule}"), key),
+                )?;
+                Ok(())
+            }).unwrap();
+        };
+        update_rule(&state, "general_serialized", "OLD_GENRE_RULE");
+        update_rule(&state, "continuity_and_agency", "OLD_CRAFT_RULE");
+        let tool_state = state.clone();
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(request): Json<Value>| {
+                let tool_state = tool_state.clone();
+                async move {
+                    let prompt = request["messages"][1]["content"].as_str().unwrap();
+                    assert!(prompt.contains("OLD_GENRE_RULE") && prompt.contains("OLD_CRAFT_RULE"));
+                    update_rule(&tool_state, "continuity_and_agency", "NEW_CRAFT_RULE");
+                    Json(json!({"choices": [{"message": {"content": "无需工具"}}]}))
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let mut request = setting_request(project.id);
+        let preview = preview_agent_run(&state, request.clone()).await.unwrap();
+        assert!(preview.prompt.contains("OLD_CRAFT_RULE"));
+        assert!(!preview.prompt.contains("NEW_CRAFT_RULE"));
+        request.prepared_context_id = Some(preview.id);
+        let error = start_agent_run(&state, request).await.unwrap_err();
+        assert!(error.to_string().contains("请重新预览"));
+        assert!(state.list_workflow_runs(project.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_request_has_genre_label_without_skill_rules() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(request): Json<Value>| {
+                let sender = sender.clone();
+                async move {
+                    sender.send(request).unwrap();
+                    Json(json!({
+                        "choices": [{"message": {"content": r#"{"kind":"answer","answer":"无需委托"}"#}}]
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (_temp, state, project) = test_state(&format!("http://{address}/v1"));
+        let response = start_orchestrator_turn(
+            &state,
+            OrchestratorTurnRequest {
+                project_id: project.id,
+                chapter_id: None,
+                message: "告诉我当前项目的类型".to_string(),
+                stage: None,
+                source_artifact_id: None,
+                story_architect_mode: None,
+                reference_selection: None,
+            },
+        )
+        .await
+        .unwrap();
+        let run = wait_for_terminal_run(&state, response.parent_run.unwrap().id).await;
+        assert_eq!(run.run.status, "success", "{:?}", run.run);
+        let request = requests.try_recv().unwrap();
+        let system = request["messages"][0]["content"].as_str().unwrap();
+        let prompt = request["messages"][1]["content"].as_str().unwrap();
+        assert!(prompt.contains("类型：奇幻"));
+        assert!(!prompt.contains("Skill 来源："));
+        assert!(!system.contains("题材专属 Agent"));
+        assert!(!system.contains("其规则正文会随本轮上下文注入"));
     }
 
     async fn wait_for_terminal_run(state: &AppState, run_id: i64) -> AgentRunSummary {

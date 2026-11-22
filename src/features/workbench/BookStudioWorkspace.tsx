@@ -136,13 +136,33 @@ type ChapterFlow = {
   reviewIssueCount: number;
 };
 
-function parseReviewIssues(content: string): ReviewIssue[] {
+export function parseReviewIssues(content: string): ReviewIssue[] {
   try {
     const parsed: unknown = JSON.parse(content);
-    return Array.isArray(parsed) ? parsed as ReviewIssue[] : [];
+    if (Array.isArray(parsed)) return parsed as ReviewIssue[];
+    // 新契约：产物是 { summary, issues }；旧产物是裸数组，两者都要能读。
+    if (parsed && typeof parsed === "object") {
+      const issues = (parsed as { issues?: unknown }).issues;
+      if (Array.isArray(issues)) return issues as ReviewIssue[];
+    }
+    return [];
   } catch {
     return [];
   }
+}
+
+/** 试读产物里的人话总结（新契约才有；旧产物没有总结）。 */
+export function parseReviewSummary(content: string): string {
+  try {
+    const parsed: unknown = JSON.parse(content);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const summary = (parsed as { summary?: unknown }).summary;
+      if (typeof summary === "string") return summary.trim();
+    }
+  } catch {
+    // 旧产物是裸数组，取不到总结。
+  }
+  return "";
 }
 
 export function formatReviewInstructions(issues: ReviewIssue[]): string {
@@ -160,7 +180,7 @@ export function formatReviewInstructions(issues: ReviewIssue[]): string {
   });
   return [
     "请根据当前候选稿的试读建议进行修订。",
-    "优先处理以下问题，其他内容尽量保持不变。请生成新的候选稿，不要直接替换正式正文。",
+    "优先处理以下问题，其他内容尽量保持不变。请生成新的候选稿，不要直接替换正文。",
     "",
     details.join("\n\n"),
   ].join("\n");
@@ -177,7 +197,7 @@ export function buildChapterAgentPrompt(
     : stage === "revision"
       ? "生成一版章节修订候选稿"
       : "生成一版新的章节候选版本";
-  const prompt = `请由主 Agent 处理《${projectTitle}》的${chapterLabel}：${action}。请先确认任务类型，再委托对应的专业 Agent 执行。结果必须作为候选版本放入工作区供我确认采用，不要直接替换正式正文。`;
+  const prompt = `请由主 Agent 处理《${projectTitle}》的${chapterLabel}：${action}。请先确认任务类型，再委托对应的专业 Agent 执行。结果必须作为候选版本放入工作区供我确认采用，不要直接替换正文。`;
   const hint = extraInstruction.trim();
   return hint ? `${prompt}\n\n补充要求：${hint}` : prompt;
 }
@@ -666,7 +686,7 @@ export function BookStudioWorkspace() {
       setMainSurface("workbench");
       return;
     }
-    // 从“正式正文”进入时必须回到章节正文工作台，不能沿用资料页
+    // 从正文进入时，不沿用上次打开的资料页。
     // 上一次的 setting/outline/characters 选择，否则会把旧的 Markdown
     // 基础资料误当成当前工作区内容。
     const chapterBody = resolveChapterBody(detail, selectedChapter);
@@ -1258,6 +1278,11 @@ export function BookStudioWorkspace() {
     return parseReviewIssues(selectedArtifact.content);
   }, [selectedArtifact]);
 
+  const selectedReviewSummary = useMemo(() => {
+    if (!selectedArtifact || selectedArtifact.stage !== "review") return "";
+    return parseReviewSummary(selectedArtifact.content);
+  }, [selectedArtifact]);
+
   const selectedArtifactIsCurrentBody =
     Boolean(selectedChapter?.current_artifact_id && selectedArtifact) &&
     selectedChapter?.current_artifact_id === selectedArtifact?.id;
@@ -1265,7 +1290,7 @@ export function BookStudioWorkspace() {
   const selectedArtifactDeleteBlockReason = useMemo(() => {
     if (!selectedArtifact) return "未选择版本";
     if (selectedArtifact.chapter_id != null) {
-      return selectedArtifactIsCurrentBody ? "当前正式正文不能删除" : null;
+      return selectedArtifactIsCurrentBody ? "当前正文不能删除" : null;
     }
     return null;
   }, [selectedArtifact, selectedArtifactIsCurrentBody]);
@@ -3049,7 +3074,7 @@ export function BookStudioWorkspace() {
   async function clearSelectedChapterHistory() {
     if (!detail || !selectedChapter) return;
     const confirmed = window.confirm(
-      `确定清理《${selectedChapter.title}》的历史版本吗？\n会保留正式正文和当前选中的版本，其余章节草稿/试读/修订版本会被删除。`
+      `确定清理《${selectedChapter.title}》的历史版本吗？\n保留正文和选中的版本，删除其余草稿、试读报告和修订稿。`
     );
     if (!confirmed) return;
     await runTask("清理历史", async () => {
@@ -3357,7 +3382,7 @@ export function BookStudioWorkspace() {
         onRebuildStorySearch={rebuildStorySearchIndex}
         agents={agentCatalog}
         agentTools={agentTools}
-        genreAgent={detail?.genre_agent}
+        projectGenreSkill={detail?.genre_skill}
         writingSkills={writingSkills}
         onSaveWritingSkill={handleSaveWritingSkill}
         onSaveCategory={handleSaveCategory}
@@ -3515,7 +3540,7 @@ export function BookStudioWorkspace() {
                 className={currentContentSurface() === "official" ? "active" : ""}
                 onClick={() => switchContentSurface("official")}
               >
-                <BookOpen size={14} /> 正式内容
+                <BookOpen size={14} /> 正文与资料
               </button>
               <button
                 className={currentContentSurface() === "workbench" ? "active" : ""}
@@ -3684,7 +3709,7 @@ export function BookStudioWorkspace() {
               <div className="editor-toolbar">
                 <div>
                   <div className="editor-title-line">
-                    <h2>正式正文</h2>
+                    <h2>正文</h2>
                   <span className="workspace-mode-badge official">{adoptedStatusLabel} · 只读</span>
                   </div>
                   <p>{selectedChapter ? selectedChapter.title : "选择章节"}</p>
@@ -3709,11 +3734,11 @@ export function BookStudioWorkspace() {
                   ) : currentChapterBodySummary && currentChapterBodyQuery.isFetching ? (
                     <div className="official-empty">
                       <Loader2 size={18} className="spin" />
-                      <span>正在加载正式正文…</span>
+                      <span>正在加载正文…</span>
                     </div>
                   ) : (
                     <div className="official-empty">
-                      <strong>暂无正式正文</strong>
+                      <strong>暂无正文</strong>
                       <button onClick={enterWorkbench}>
                         <Sparkles size={14} /> 去工作台
                       </button>
@@ -4261,6 +4286,9 @@ export function BookStudioWorkspace() {
                   )}
                   {selectedArtifact.stage === "review" && reviewSourceArtifact ? (
                     <pre className="review-source-content">{reviewSourceArtifact.content}</pre>
+                  ) : selectedArtifact.stage === "review" &&
+                    (selectedReviewIssues.length > 0 || selectedReviewSummary) ? (
+                    <div className="empty-inline">试读结论见下方</div>
                   ) : (
                     <pre>{selectedArtifact.content}</pre>
                   )}
@@ -4278,6 +4306,14 @@ export function BookStudioWorkspace() {
 
             {selectedArtifact?.stage === "review" && (
             <div className="review-board">
+              {selectedReviewSummary && (
+                <section className="review-summary">
+                  <div className="review-card-head">
+                    <strong>试读结论</strong>
+                  </div>
+                  <p>{selectedReviewSummary}</p>
+                </section>
+              )}
               {selectedReviewIssues.length > 0 ? selectedReviewIssues.map((issue, index) => (
                 <section className="review-card" key={`${issue.location}-${index}`}>
                   <div className="review-card-head">

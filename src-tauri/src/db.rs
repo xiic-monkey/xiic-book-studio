@@ -20,12 +20,12 @@ use crate::{
     agent_tools,
     crypto::{is_encrypted, ApiKeyCipher},
     error::{AppError, AppResult},
-    genre_agent, genre_skill,
+    genre_skill,
     models::{
         Agent, AiProvider, AiSettings, Approval, Artifact, ArtifactFilters, Chapter,
         ChapterMemoryRecord, ChapterPlan, ChapterUpdate, ContinuityLedgerEntry, DerivedIndexJob,
-        Foreshadowing, GenreAgentProfile, ImportReferenceTextRequest, CanonEntry, Message,
-        NewChapter, NewProject, Project, ProjectDetail, ProjectUpdate, ReferenceMaterial, RunEvent,
+        Foreshadowing, ImportReferenceTextRequest, CanonEntry, Message,
+        NewChapter, NewProject, Project, ProjectDetail, ProjectGenreSkill, ProjectUpdate, ReferenceMaterial, RunEvent,
         SaveAgentSettings, SaveAiProvider, SaveAiSettings, SaveChapterPlan, SaveForeshadowing,
         SaveCanonEntry, SaveWritingSkill, StoryArc, StoryBible, StoryBibleReview, StoryEntity,
         StoryEvent, StoryEventParticipant, StoryFact, StoryIndexSource, StorySearchSource,
@@ -49,7 +49,10 @@ mod lifecycle;
 
 // Every AI-capable role resolves to one row. Empty per-agent values inherit the
 // global settings, which keeps existing databases and projects working.
-const AGENT_SELECT_SQL: &str = r#"SELECT a.id, a.stage, a.name, a.role, a.system_prompt, a.temperature,
+fn agent_select_sql() -> String {
+    // fallback 的工具键从 default_keys() 派生，避免与工具定义两处维护而漂移。
+    format!(
+        r#"SELECT a.id, a.stage, a.name, a.role, a.system_prompt, a.temperature,
     COALESCE(NULLIF(a.provider_base_url, ''), (SELECT value FROM settings WHERE key = 'ai.base_url'), '') AS provider_base_url,
     COALESCE(NULLIF(a.model, ''), (SELECT value FROM settings WHERE key = 'ai.model'), '') AS model,
     CASE
@@ -68,9 +71,12 @@ const AGENT_SELECT_SQL: &str = r#"SELECT a.id, a.stage, a.name, a.role, a.system
         WHEN NULLIF(a.provider_base_url, '') IS NULL AND NULLIF(a.model, '') IS NULL THEN 1
         ELSE 0
     END AS uses_global_runtime_settings,
-    COALESCE(NULLIF(a.enabled_tool_keys, ''), '["search_story","search_story_facts","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]') AS enabled_tool_keys,
+    COALESCE(NULLIF(a.enabled_tool_keys, ''), '{default_keys}') AS enabled_tool_keys,
     COALESCE(NULLIF(a.allowed_skill_keys, ''), '["continuity_and_agency"]') AS allowed_skill_keys
-    FROM agents a"#;
+    FROM agents a"#,
+        default_keys = crate::agent_tools::default_keys_json()
+    )
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -254,7 +260,7 @@ impl AppState {
                     model TEXT NOT NULL DEFAULT '',
                     thinking_enabled INTEGER NOT NULL DEFAULT 0,
                     thinking_level TEXT NOT NULL DEFAULT 'off',
-                    enabled_tool_keys TEXT NOT NULL DEFAULT '["search_story","search_story_facts","reference_materials","chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]',
+                    enabled_tool_keys TEXT NOT NULL DEFAULT '["search_story","search_story_facts","reference_materials","chapter_memory","request_chapter_memory","continuity_check","quality_analysis","chapter_split","web_search"]',
                     allowed_skill_keys TEXT NOT NULL DEFAULT '["continuity_and_agency"]',
                     prompt_customized INTEGER NOT NULL DEFAULT 0
                 );
@@ -779,8 +785,6 @@ impl AppState {
                     params![stage, name, role, prompt, temperature],
                 )?;
             }
-            backfill_project_genre_agents(conn)?;
-
             set_default_setting(conn, "ai.base_url", "https://api.deepseek.com")?;
             set_default_setting(conn, "ai.model", "deepseek-v4-pro")?;
             set_default_setting(conn, "ai.temperature", "0.75")?;
@@ -859,12 +863,6 @@ impl AppState {
                     ],
                 )?;
                 let project_id = conn.last_insert_rowid();
-                let genre_agent = genre_agent::detect_genre_agent(input.genre.trim())?;
-                conn.execute(
-                    "INSERT INTO project_genre_agents (project_id, agent_key, assigned_at)
-                     VALUES (?1, ?2, ?3)",
-                    params![project_id, genre_agent.agent_key, &now],
-                )?;
                 conn.execute(
                     "INSERT INTO chapters (project_id, chapter_no, title, status, created_at, updated_at)
                      VALUES (?1, 1, '第 1 章', 'planning', ?2, ?2)",
@@ -1000,12 +998,13 @@ impl AppState {
     }
 
     pub fn get_detail(&self, project_id: i64) -> AppResult<ProjectDetail> {
+        let project = self.get_project(project_id)?;
         Ok(ProjectDetail {
-            project: self.get_project(project_id)?,
-            genre_agent: self.get_genre_agent_for_project(project_id)?,
+            genre_skill: self.get_project_genre_skill(&project)?,
+            project,
             chapters: self.list_chapters(project_id)?,
             chapter_plans: self.list_chapter_plans(project_id)?,
-            agents: self.list_agents_for_project(project_id)?,
+            agents: self.list_agents()?,
             artifacts: self.list_artifacts(ArtifactFilters {
                 project_id,
                 stage: None,
@@ -1037,7 +1036,7 @@ impl AppState {
 
     pub fn list_agents(&self) -> AppResult<Vec<Agent>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(AGENT_SELECT_SQL)?;
+            let mut stmt = conn.prepare(&agent_select_sql())?;
             let rows = stmt.query_map([], map_agent)?;
             collect_rows(rows)
         })
@@ -1046,7 +1045,7 @@ impl AppState {
     pub fn get_agent(&self, stage: &str) -> AppResult<Agent> {
         self.with_conn(|conn| {
             conn.query_row(
-                &format!("{} WHERE a.stage = ?1", AGENT_SELECT_SQL),
+                &format!("{} WHERE a.stage = ?1", agent_select_sql()),
                 params![stage],
                 map_agent,
             )
@@ -1058,7 +1057,7 @@ impl AppState {
     pub fn get_agent_by_id(&self, agent_id: i64) -> AppResult<Agent> {
         self.with_conn(|conn| {
             conn.query_row(
-                &format!("{} WHERE a.id = ?1", AGENT_SELECT_SQL),
+                &format!("{} WHERE a.id = ?1", agent_select_sql()),
                 params![agent_id],
                 map_agent,
             )
@@ -1089,7 +1088,7 @@ impl AppState {
                 return Err(AppError::Validation("Agent 不存在".to_string()));
             }
             conn.query_row(
-                &format!("{} WHERE a.id = ?1", AGENT_SELECT_SQL),
+                &format!("{} WHERE a.id = ?1", agent_select_sql()),
                 params![agent_id],
                 map_agent,
             )
@@ -1195,6 +1194,9 @@ impl AppState {
                 .as_deref()
                 .map(normalize_skill_keys)
                 .unwrap_or_else(|| parse_agent_keys(&current.7, false));
+            // 题材类 Skill 永远不会被当作「辅助 Skill」注入（注入路径按 category 跳过），
+            // 允许它留在许可集合里只会让 system prompt 声明出不会被注入的 key。保存时丢弃。
+            let allowed_skill_keys = filter_auxiliary_skill_keys(conn, &allowed_skill_keys)?;
             let prompt_customized = agent_prompt_customized(&current.8, &system_prompt);
 
             let changed = conn.execute(
@@ -1223,7 +1225,7 @@ impl AppState {
                 return Err(AppError::Validation("Agent 不存在".to_string()));
             }
             conn.query_row(
-                &format!("{} WHERE a.id = ?1", AGENT_SELECT_SQL),
+                &format!("{} WHERE a.id = ?1", agent_select_sql()),
                 params![input.agent_id],
                 map_agent,
             )
@@ -1476,25 +1478,41 @@ impl AppState {
         Ok(())
     }
 
-    pub fn get_genre_agent_for_project(&self, project_id: i64) -> AppResult<GenreAgentProfile> {
-        self.with_conn(|conn| resolve_project_genre_agent(conn, project_id))
+    pub fn get_project_genre_skill(&self, project: &Project) -> AppResult<ProjectGenreSkill> {
+        let skill = genre_skill::detect_genre_skill(&project.genre);
+        let skill_key = skill.skill_id();
+        let (name, enabled) = self
+            .get_writing_skill_by_key(skill_key)?
+            .map(|record| (record.name, record.enabled))
+            .unwrap_or_else(|| (skill.default_name().to_string(), true));
+        Ok(ProjectGenreSkill {
+            skill_key: skill_key.to_string(),
+            name,
+            enabled,
+        })
     }
 
-    pub fn list_agents_for_project(&self, project_id: i64) -> AppResult<Vec<Agent>> {
-        let profile = self.get_genre_agent_for_project(project_id)?;
-        Ok(self
-            .list_agents()?
-            .into_iter()
-            .map(|agent| genre_agent::compose_stage_agent(agent, &profile))
-            .collect())
+    /// 题材 Skill 的生效内容。
+    ///
+    /// - DB 行不存在（全新安装 / 尚未同步的库）：用编译期内置模板，视为会注入；
+    /// - DB 行存在且 `enabled = 0`：不注入（用户禁用即禁用，不再静默回落到内置模板）；
+    /// - DB 行存在且 `enabled = 1` 但内容为空：同样不注入，与 craft Skill 语义一致。
+    pub fn effective_genre_skill_content(
+        &self,
+        skill: genre_skill::GenreSkillKind,
+    ) -> AppResult<Option<String>> {
+        Ok(match self.get_writing_skill_by_key(skill.skill_id())? {
+            Some(record) if record.enabled && !record.content.trim().is_empty() => {
+                Some(record.content)
+            }
+            Some(_) => None,
+            None => Some(skill.fallback_template().to_string()),
+        })
     }
 
-    pub fn get_agent_for_project_stage(&self, project_id: i64, stage: &str) -> AppResult<Agent> {
-        let profile = self.get_genre_agent_for_project(project_id)?;
-        Ok(genre_agent::compose_stage_agent(
-            self.get_agent_for_stage(stage)?,
-            &profile,
-        ))
+    pub(crate) fn get_execution_agent(&self, stage: &str) -> AppResult<Agent> {
+        self.get_agent_for_stage(stage)
+            .map(crate::stage_agent::apply_stage_protocol)
     }
 
     pub fn list_chapters(&self, project_id: i64) -> AppResult<Vec<Chapter>> {
@@ -2231,7 +2249,7 @@ impl AppState {
                 )
                 .optional()?;
             let Some(current_content) = current_content else {
-                return Err(AppError::Validation("章节正式正文已切换，丢弃旧的连续性账本".to_string()));
+                return Err(AppError::Validation("章节正文已切换，丢弃旧的连续性账本".to_string()));
             };
             if crate::chapter_memory::source_text_hash(&current_content) != source_text_hash {
                 return Err(AppError::Validation("章节正文已变化，丢弃旧的连续性账本".to_string()));
@@ -2336,7 +2354,7 @@ impl AppState {
                 )
                 .optional()?;
             let Some(current_content) = current_content else {
-                return Err(AppError::Validation("章节正式正文已切换，丢弃旧的资料索引".to_string()));
+                return Err(AppError::Validation("章节正文已切换，丢弃旧的资料索引".to_string()));
             };
             if crate::chapter_memory::source_text_hash(&current_content) != source_text_hash {
                 return Err(AppError::Validation("章节正文已变化，丢弃旧的资料索引".to_string()));
@@ -2538,7 +2556,7 @@ impl AppState {
                 .optional()?;
             let Some(current_content) = current_content else {
                 return Err(AppError::Validation(
-                    "章节正式正文已切换，丢弃旧的交接记忆".to_string(),
+                    "章节正文已切换，丢弃旧的交接记忆".to_string(),
                 ));
             };
             if crate::chapter_memory::source_text_hash(&current_content) != source_text_hash {
@@ -2844,7 +2862,7 @@ impl AppState {
                 .ensure_chapter(artifact.project_id, Some(chapter_id))?
                 .ok_or_else(|| AppError::Validation("章节不存在".to_string()))?;
             if chapter.current_artifact_id == Some(artifact.id) {
-                return Ok(Some("当前正式正文不能删除".to_string()));
+                return Ok(Some("当前正文不能删除".to_string()));
             }
             return Ok(None);
         }
@@ -4473,74 +4491,6 @@ impl AppState {
     }
 }
 
-fn backfill_project_genre_agents(conn: &Connection) -> AppResult<()> {
-    let projects = {
-        let mut stmt = conn.prepare("SELECT id, genre FROM projects")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
-    let assigned_at = now();
-
-    for (project_id, genre) in projects {
-        let Ok(profile) = genre_agent::detect_genre_agent(&genre) else {
-            continue;
-        };
-        let assigned_key = conn
-            .query_row(
-                "SELECT agent_key FROM project_genre_agents WHERE project_id = ?1",
-                params![project_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if assigned_key.as_deref() == Some("urban_mystery") {
-            conn.execute(
-                "UPDATE project_genre_agents
-                 SET agent_key = ?1, assigned_at = ?2
-                 WHERE project_id = ?3",
-                params![profile.agent_key, assigned_at, project_id],
-            )?;
-        } else if assigned_key.is_none() {
-            conn.execute(
-                "INSERT INTO project_genre_agents (project_id, agent_key, assigned_at)
-                 VALUES (?1, ?2, ?3)",
-                params![project_id, profile.agent_key, assigned_at],
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn resolve_project_genre_agent(conn: &Connection, project_id: i64) -> AppResult<GenreAgentProfile> {
-    let project = query_project_by_id(conn, project_id)?;
-    let assigned_key = conn
-        .query_row(
-            "SELECT agent_key FROM project_genre_agents WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-
-    if let Some(profile) = assigned_key
-        .as_deref()
-        .and_then(genre_agent::profile_for_key)
-    {
-        return Ok(profile);
-    }
-
-    let profile = genre_agent::detect_genre_agent(&project.genre)?;
-    conn.execute(
-        "INSERT INTO project_genre_agents (project_id, agent_key, assigned_at)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(project_id) DO UPDATE SET
-            agent_key = excluded.agent_key,
-            assigned_at = excluded.assigned_at",
-        params![project_id, profile.agent_key, now()],
-    )?;
-    Ok(profile)
-}
-
 fn ai_provider_label(base_url: &str) -> String {
     let normalized = base_url.to_ascii_lowercase();
     if normalized.contains("deepseek") {
@@ -5205,6 +5155,28 @@ fn normalize_skill_keys(keys: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// 过滤掉不能作为「辅助 Skill」的 key。
+///
+/// 题材类（`category = 'genre'`）与历史遗留（`legacy`）的 Skill 不会被注入；
+/// 库里不存在的 key 同样不可注入。只保留这些之外的合法辅助 Skill。
+fn filter_auxiliary_skill_keys(conn: &Connection, keys: &[String]) -> AppResult<Vec<String>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT skill_key FROM writing_skills
+         WHERE category <> 'genre' AND category <> 'legacy'",
+    )?;
+    let allowed = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<HashSet<String>, _>>()?;
+    Ok(keys
+        .iter()
+        .filter(|key| allowed.contains(*key))
+        .cloned()
+        .collect())
+}
+
 fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
@@ -5729,12 +5701,11 @@ mod tests {
             saved_agent.enabled_tool_keys,
             vec![agent_tools::CHAPTER_SPLIT.to_string()]
         );
+        // Skill key 与工具 key 同规则：未知 key 直接丢弃。题材类 Skill 永远不会被
+        // 作为辅助 Skill 注入。
         assert_eq!(
             saved_agent.allowed_skill_keys,
-            vec![
-                "continuity_and_agency".to_string(),
-                "unknown_skill".to_string()
-            ]
+            vec!["continuity_and_agency".to_string()]
         );
         assert!(skills
             .iter()
@@ -5933,44 +5904,52 @@ mod tests {
     }
 
     #[test]
-    fn project_keeps_its_assigned_genre_agent_when_metadata_changes() {
+    fn execution_agent_is_independent_of_project_genre() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
-        let project = state
-            .create_project(NewProject {
-                title: "专属 Agent 绑定".to_string(),
-                genre: "悬疑".to_string(),
-                target_words: 120000,
-                premise: "测试项目绑定".to_string(),
-            })
-            .unwrap();
-
-        assert_eq!(
+        let review_agent = |genre: &str| {
             state
-                .get_genre_agent_for_project(project.id)
-                .unwrap()
-                .agent_key,
-            "mystery"
-        );
-
-        state
-            .update_project(ProjectUpdate {
-                id: project.id,
-                title: project.title,
-                genre: "男频修仙".to_string(),
-                target_words: project.target_words,
-                premise: project.premise,
-                status: project.status,
-            })
-            .unwrap();
-
-        assert_eq!(
-            state
-                .get_genre_agent_for_project(project.id)
-                .unwrap()
-                .agent_key,
-            "mystery"
-        );
+                .create_project(NewProject {
+                    title: genre.to_string(),
+                    genre: genre.to_string(),
+                    target_words: 100_000,
+                    premise: "试读".to_string(),
+                })
+                .unwrap();
+            state.get_execution_agent("review").unwrap()
+        };
+        let mystery = review_agent("悬疑");
+        let xianxia = review_agent("仙侠");
+        assert_eq!(mystery.id, xianxia.id);
+        assert_eq!(mystery.system_prompt, xianxia.system_prompt);
+        assert_eq!(mystery.role, xianxia.role);
+        assert_eq!(mystery.enabled_tool_keys, xianxia.enabled_tool_keys);
+        assert_eq!(mystery.model, xianxia.model);
+        assert!(!mystery.system_prompt.contains("题材专属 Agent"));
+        assert!(mystery.system_prompt.contains("不能替人工确认"));
+        for key in crate::prompt_templates::BUILTIN_AGENT_KEYS {
+            let stored = state.get_agent(key).unwrap();
+            let runtime = state.get_execution_agent(key).unwrap();
+            assert_eq!(runtime.editable_system_prompt, stored.editable_system_prompt);
+            assert_eq!(runtime.editable_role, stored.editable_role);
+            assert_eq!(runtime.role, stored.role);
+            if matches!(
+                *key,
+                "story_architect" | "draft" | "review" | "revision" | "orchestrator"
+            ) {
+                let protocol = runtime
+                    .system_prompt
+                    .strip_prefix(&stored.system_prompt)
+                    .unwrap();
+                assert_eq!(protocol.matches("# 共享工作协议").count(), 1, "{key}");
+            } else {
+                assert_eq!(runtime.system_prompt, stored.system_prompt, "{key}");
+            }
+        }
+        let architect = state.get_execution_agent("story_architect").unwrap();
+        for stage in ["setting", "outline", "characters"] {
+            assert_eq!(state.get_execution_agent(stage).unwrap().id, architect.id);
+        }
     }
 
     #[test]
@@ -6037,7 +6016,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_the_legacy_combined_agent_by_project_genre() {
+    fn project_genre_skill_ignores_legacy_binding() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
         let state = AppState::from_path(path.clone()).unwrap();
@@ -6059,10 +6038,19 @@ mod tests {
             .unwrap();
         state
             .with_conn(|conn| {
-                conn.execute(
-                    "UPDATE project_genre_agents SET agent_key = 'urban_mystery'",
+                let binding_count = conn.query_row(
+                    "SELECT COUNT(*) FROM project_genre_agents",
                     [],
+                    |row| row.get::<_, i64>(0),
                 )?;
+                assert_eq!(binding_count, 0);
+                for project_id in [urban_project.id, mystery_project.id] {
+                    conn.execute(
+                        "INSERT INTO project_genre_agents (project_id, agent_key, assigned_at)
+                         VALUES (?1, 'urban_mystery', 'old-binding')",
+                        [project_id],
+                    )?;
+                }
                 Ok(())
             })
             .unwrap();
@@ -6082,16 +6070,16 @@ mod tests {
         let migrated = AppState::from_path(path).unwrap();
         assert_eq!(
             migrated
-                .get_genre_agent_for_project(urban_project.id)
+                .get_project_genre_skill(&urban_project)
                 .unwrap()
-                .agent_key,
+                .skill_key,
             "urban_supernatural"
         );
         assert_eq!(
             migrated
-                .get_genre_agent_for_project(mystery_project.id)
+                .get_project_genre_skill(&mystery_project)
                 .unwrap()
-                .agent_key,
+                .skill_key,
             "mystery"
         );
         let legacy = migrated
@@ -6105,6 +6093,46 @@ mod tests {
             .unwrap()
             .iter()
             .any(|skill| skill.skill_key == "urban_mystery"));
+
+        migrated
+            .save_writing_skill(SaveWritingSkill {
+                id: None,
+                skill_key: "mystery".to_string(),
+                name: "自定义推理".to_string(),
+                category: "genre".to_string(),
+                description: String::new(),
+                content: "## Always\n自定义规则".to_string(),
+                enabled: false,
+            })
+            .unwrap();
+        let agent_id = migrated.get_execution_agent("review").unwrap().id;
+        let changed = migrated
+            .update_project(ProjectUpdate {
+                id: urban_project.id,
+                title: urban_project.title,
+                genre: "悬疑".to_string(),
+                target_words: urban_project.target_words,
+                premise: urban_project.premise,
+                status: urban_project.status,
+            })
+            .unwrap();
+        let selected = migrated.get_project_genre_skill(&changed).unwrap();
+        assert_eq!(selected.skill_key, "mystery");
+        assert_eq!(selected.name, "自定义推理");
+        assert!(!selected.enabled);
+        assert_eq!(migrated.get_execution_agent("review").unwrap().id, agent_id);
+        migrated
+            .with_conn(|conn| {
+                let unchanged_rows = conn.query_row(
+                    "SELECT COUNT(*) FROM project_genre_agents
+                     WHERE agent_key = 'urban_mystery' AND assigned_at = 'old-binding'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                assert_eq!(unchanged_rows, 2);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -6601,7 +6629,7 @@ mod tests {
             .delete_artifact(project.id, artifact.id)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("当前正式正文"));
+        assert!(err.contains("当前正文不能删除"));
     }
 
     #[test]
@@ -6743,7 +6771,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(error.contains("正式正文已切换"));
+        assert!(error.contains("章节正文已切换"));
     }
 
     #[test]
@@ -6909,7 +6937,7 @@ mod tests {
             )
             .unwrap();
         state
-            .approve_stage(project.id, "revision", second.id, "替换正式稿")
+            .approve_stage(project.id, "revision", second.id, "替换正文")
             .unwrap();
 
         let detail = state.get_detail(project.id).unwrap();
@@ -7679,6 +7707,94 @@ mod tests {
         assert_eq!(
             state.list_chapter_plans(project.id).unwrap()[0].chapter_id,
             Some(chapter.id)
+        );
+    }
+
+    /// 保存 Agent 配置时，题材类与不存在的 skill key 必须被丢弃：
+    /// 它们永远不会被注入，留在许可集合里只会让 system prompt 声明出假的白名单。
+    #[test]
+    fn skill_key_filter_rejects_genre_category_on_save() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let draft_agent = state
+            .list_agents()
+            .unwrap()
+            .into_iter()
+            .find(|agent| agent.stage == "draft")
+            .unwrap();
+
+        let saved = state
+            .save_agent_settings(SaveAgentSettings {
+                agent_id: draft_agent.id,
+                provider_base_url: draft_agent.provider_base_url.clone(),
+                model: draft_agent.model.clone(),
+                name: None,
+                role: None,
+                system_prompt: None,
+                temperature: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                uses_global_runtime_settings: Some(true),
+                enabled_tool_keys: None,
+                allowed_skill_keys: Some(vec![
+                    "mystery".to_string(),
+                    "continuity_and_agency".to_string(),
+                    "并不存在的技能".to_string(),
+                ]),
+            })
+            .unwrap();
+
+        assert_eq!(saved.allowed_skill_keys, vec!["continuity_and_agency".to_string()]);
+        assert!(!saved.allowed_skill_keys.contains(&"mystery".to_string()));
+    }
+
+    #[test]
+    fn genre_change_only_changes_selected_skill() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let project = state
+            .create_project(NewProject {
+                title: "题材重路由".to_string(),
+                genre: "悬疑".to_string(),
+                target_words: 100_000,
+                premise: "测试题材切换".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            state.get_detail(project.id).unwrap().genre_skill.skill_key,
+            "mystery"
+        );
+
+        // 改其它字段不触发重路由。
+        state
+            .update_project(ProjectUpdate {
+                id: project.id,
+                title: "改了标题".to_string(),
+                genre: "悬疑".to_string(),
+                target_words: 120_000,
+                premise: "换了简介".to_string(),
+                status: "active".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            state.get_detail(project.id).unwrap().genre_skill.skill_key,
+            "mystery"
+        );
+
+        // 改题材必须重新路由。
+        state
+            .update_project(ProjectUpdate {
+                id: project.id,
+                title: "改了标题".to_string(),
+                genre: "男频修仙爽文".to_string(),
+                target_words: 120_000,
+                premise: "换了简介".to_string(),
+                status: "active".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            state.get_detail(project.id).unwrap().genre_skill.skill_key,
+            "xianxia_power_fantasy"
         );
     }
 }

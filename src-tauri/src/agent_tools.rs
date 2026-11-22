@@ -11,6 +11,7 @@ pub const CHAPTER_MEMORY: &str = "chapter_memory";
 pub const REQUEST_CHAPTER_MEMORY: &str = "request_chapter_memory";
 pub const CONTINUITY_CHECK: &str = "continuity_check";
 pub const QUALITY_ANALYSIS: &str = "quality_analysis";
+pub const SUBMIT_REVIEW_ISSUES: &str = "submit_review_issues";
 pub const CHAPTER_SPLIT: &str = "chapter_split";
 pub const WEB_SEARCH: &str = "web_search";
 pub const PROPOSE_CREATE_CHAPTER: &str = "propose_create_chapter";
@@ -170,6 +171,40 @@ pub fn definitions() -> Vec<AgentToolDefinition> {
                 "type": "object",
                 "properties": {"artifact_id": {"type": "integer", "minimum": 1}},
                 "required": ["artifact_id"],
+                "additionalProperties": false
+            }),
+        ),
+        definition(
+            SUBMIT_REVIEW_ISSUES,
+            "提交试读问题",
+            "提交本次试读发现的问题清单。完成审读后调用一次，参数里的每条问题都要能在候选稿或已批准资料中回查。提交完成后用自然语言给出一句总结即可，不要再输出 JSON。",
+            "审校",
+            "submit",
+            &["review"],
+            false,
+            json!({
+                "type": "object",
+                "properties": {
+                    "issues": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "issue_type": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["minor", "moderate", "major"]},
+                                "location": {"type": "string"},
+                                "reason": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "evidence_quote": {"type": "string"},
+                                "action_evidence_quote": {"type": "string"}
+                            },
+                            "required": ["issue_type", "severity", "location", "reason", "suggestion", "evidence_quote"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["issues"],
                 "additionalProperties": false
             }),
         ),
@@ -515,6 +550,12 @@ pub fn default_keys() -> Vec<String> {
         .collect()
 }
 
+/// 默认启用工具键的 JSON 文本。数据库读取查询的 fallback 与建库种子都从这里派生，
+/// 避免与 `default_keys()` 两处维护同一份事实而漂移。
+pub fn default_keys_json() -> String {
+    serde_json::to_string(&default_keys()).unwrap_or_else(|_| "[]".to_string())
+}
+
 pub fn normalize_keys(keys: &[String]) -> Vec<String> {
     let selected = keys.iter().map(|key| key.trim()).collect::<HashSet<_>>();
     definitions()
@@ -554,5 +595,56 @@ mod tests {
     fn empty_allowlist_is_a_real_disable_state() {
         assert!(!has_tool(&[], HISTORY_CONTEXT));
         assert!(normalize_keys(&[]).is_empty());
+    }
+
+    /// 试读阶段必须有一个提交型工具，结构化问题靠它交回运行时。
+    #[test]
+    fn submit_review_issues_is_registered_for_review_only() {
+        let definition = definitions()
+            .into_iter()
+            .find(|item| item.key == SUBMIT_REVIEW_ISSUES)
+            .expect("提交型工具必须注册");
+        assert_eq!(definition.kind, ToolKind::Submit);
+        assert_eq!(definition.supported_stages, vec!["review".to_string()]);
+        assert!(!definition.previewable);
+        assert!(definition
+            .description
+            .contains("submit_review_issues") || definition.description.contains("提交"));
+    }
+
+    /// 提交型工具的 schema 必须要求 issues 数组，且每条问题带齐可校验字段。
+    #[test]
+    fn submit_review_issues_schema_requires_issues_with_evidence() {
+        let definition = definitions()
+            .into_iter()
+            .find(|item| item.key == SUBMIT_REVIEW_ISSUES)
+            .expect("提交型工具必须注册");
+        let items = definition
+            .parameters_schema
+            .pointer("/properties/issues/items")
+            .expect("issues 必须是数组");
+        let required = items
+            .get("required")
+            .and_then(|value| value.as_array())
+            .expect("每条问题必须声明必填字段");
+        for field in ["issue_type", "severity", "location", "reason", "suggestion", "evidence_quote"] {
+            assert!(
+                required.iter().any(|value| value.as_str() == Some(field)),
+                "缺少必填字段 {field}"
+            );
+        }
+        // 契约里的 action_evidence_quote 是可选字段：schema 必须放行，
+        // 但不能升级成必填，否则模型只写删改类建议时会被供应商侧挡住。
+        let properties = items
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("每条问题必须声明字段");
+        assert!(
+            properties.contains_key("action_evidence_quote"),
+            "缺少可选字段 action_evidence_quote"
+        );
+        assert!(!required
+            .iter()
+            .any(|value| value.as_str() == Some("action_evidence_quote")));
     }
 }

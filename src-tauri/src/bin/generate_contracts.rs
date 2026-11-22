@@ -16,7 +16,7 @@ fn render() -> String {
     output.push_str(&declaration::<ReferenceTag>());
     output.push_str(&declaration::<ReferenceSelection>());
     output.push_str(&declaration::<Project>());
-    output.push_str(&declaration::<GenreAgentProfile>());
+    output.push_str(&declaration::<ProjectGenreSkill>());
     output.push_str(&declaration::<Chapter>());
     output.push_str(&declaration::<ChapterPlan>());
     output.push_str(&declaration::<Artifact>());

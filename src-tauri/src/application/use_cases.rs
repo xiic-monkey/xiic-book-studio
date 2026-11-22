@@ -285,11 +285,11 @@ impl ApplicationGateway {
 
     /// 审批通过。
     ///
-    /// 正文阶段（`draft` / `revision`）转正是**不可绕过**的决策点：必须先从质量与
-    /// 连续性门禁拿到 `passed = true` 才允许写入正式稿；门禁未通过时一律拒绝，
+    /// 草稿或修订稿（`draft` / `revision`）必须通过质量与连续性门禁
+    /// （`passed = true`）才能采用为正文；门禁未通过时一律拒绝，
     /// 并回报具体 blocker。
     ///
-    /// 门禁本身无法完成时同样拒绝（fail-closed）——无法证明达标，即不予转正。
+    /// 门禁本身无法完成时同样拒绝（fail-closed）。
     /// 门禁编排放在这里而非 `db.rs`，是因为 `gate::analyze_chapter_gate` 需要
     /// `.await`，而 `db.rs` 的 `with_conn` 闭包无法在持连接期间 await。
     pub async fn approve_stage(
@@ -315,7 +315,7 @@ impl ApplicationGateway {
             .await
             .map_err(|error| {
                 AppError::Validation(format!(
-                    "质量门禁无法完成，已阻止转正（fail-closed）：{error}"
+                    "质量门禁无法完成，暂不能采用：{error}"
                 ))
             })?;
             gate::ensure_gate_allows_transition(&report)?;

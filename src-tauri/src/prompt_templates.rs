@@ -118,7 +118,7 @@ mod tests {
             (
                 "review",
                 &[
-                    "只输出 JSON 数组",
+                    "submit_review_issues",
                     "issue_type",
                     "evidence_quote",
                     "severity",

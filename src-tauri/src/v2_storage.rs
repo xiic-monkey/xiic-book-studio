@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-const V2_SCHEMA_VERSION: i64 = 11;
+const V2_SCHEMA_VERSION: i64 = 12;
 
 pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
@@ -71,9 +71,38 @@ pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
             apply_migration(conn, 11, migrate_v11)?;
             current = 11;
         }
+        if current < 12 {
+            apply_migration(conn, 12, migrate_v12)?;
+            current = 12;
+        }
         debug_assert!(V2_SCHEMA_VERSION >= current);
         Ok(())
     })
+}
+
+/// v12：内置题材 Skill 的启用状态恢复为默认可用。
+///
+/// 早期版本里题材 Skill 的 `enabled` 开关在注入路径上被忽略——禁用后仍静默回落到
+/// 编译期内置模板——因此历史库里可能残留 `enabled = 0` 的内置题材 Skill 行。
+/// 开关语义修正后这些行会真的让题材 Skill 不再注入，故在此一次性恢复为 1。
+///
+/// 只动内置题材 Skill：`legacy` 行、用户自建 skill、craft skill 一律不碰。
+/// 这是一次性迁移，不会在用户日后主动禁用后被启动流程还原。
+fn migrate_v12(conn: &Connection) -> AppResult<()> {
+    let genre_keys = crate::genre_skill::default_writing_skills()
+        .into_iter()
+        .filter(|skill| skill.category == "genre")
+        .map(|skill| skill.skill_key)
+        .collect::<Vec<_>>();
+    let now = Utc::now().to_rfc3339();
+    for key in genre_keys {
+        conn.execute(
+            "UPDATE writing_skills SET enabled = 1, updated_at = ?1
+             WHERE skill_key = ?2 AND category = 'genre' AND enabled = 0",
+            params![now, key],
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_v5(conn: &Connection) -> AppResult<()> {
@@ -144,7 +173,7 @@ fn migrate_v10(conn: &Connection) -> AppResult<()> {
     let prompt = crate::prompt_templates::require_default_prompt("canon_align")?;
     conn.execute(
         "INSERT INTO agents (stage, name, role, system_prompt, temperature)
-         VALUES ('canon_align', '资料对齐 Agent', '章节转正后对照定稿正文修订、归档、补充资料条目，并提炼写作约束', ?1, 0.0)
+         VALUES ('canon_align', '资料对齐 Agent', '正文更新后修订、归档、补充资料条目，并从正文提炼写作约束', ?1, 0.0)
          ON CONFLICT(stage) DO NOTHING",
         params![prompt],
     )?;
@@ -1718,6 +1747,112 @@ fn json_sql_error(error: serde_json::Error) -> rusqlite::Error {
 mod tests {
     use super::*;
     use crate::models::{NewChapter, NewProject, SaveCanonEntry};
+
+    /// v12：内置题材 Skill 的 enabled 一次性恢复为 1。
+    /// legacy 行、用户自建 skill、craft skill 一律不碰。
+    #[test]
+    fn migrate_v12_restores_builtin_genre_skills_to_enabled() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+
+        // 初始化时迁移链已经跑过，版本 12 已登记。
+        let version = state
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT version FROM v2_schema_migrations WHERE version = 12",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(version, 12);
+
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE writing_skills SET enabled = 0 WHERE skill_key = 'xianxia_power_fantasy'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE writing_skills SET enabled = 0 WHERE skill_key = 'continuity_and_agency'",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO writing_skills
+                        (skill_key, name, category, description, content, enabled, customized, created_at, updated_at)
+                     VALUES ('user_made_skill', '用户技能', 'genre', '用户自建', '## Always\n- 规则', 0, 0, 'now', 'now')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 直接执行迁移：内置题材 Skill 恢复为启用。
+        state
+            .with_conn(|conn| {
+                migrate_v12(conn)?;
+                Ok(())
+            })
+            .unwrap();
+
+        state
+            .with_conn(|conn| {
+                let enabled = |key: &str| -> i64 {
+                    conn.query_row(
+                        "SELECT enabled FROM writing_skills WHERE skill_key = ?1",
+                        [key],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                };
+                // 内置题材 Skill 恢复为启用。
+                assert_eq!(enabled("xianxia_power_fantasy"), 1);
+                assert_eq!(enabled("mystery"), 1);
+                assert_eq!(enabled("urban_supernatural"), 1);
+                assert_eq!(enabled("general_serialized"), 1);
+                // craft skill 与用户自建 skill 不受影响。
+                assert_eq!(enabled("continuity_and_agency"), 0);
+                assert_eq!(enabled("user_made_skill"), 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 迁移链只跑一次：版本已登记后再次启动不会重放 v12，
+    /// 用户日后主动禁用题材 Skill 不会被启动流程还原。
+    #[test]
+    fn migration_chain_does_not_replay_v12() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE writing_skills SET enabled = 0 WHERE skill_key = 'mystery'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 再跑一次完整迁移链。
+        migrate(&state).unwrap();
+
+        let enabled = state
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT enabled FROM writing_skills WHERE skill_key = 'mystery'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(enabled, 0);
+    }
 
     #[test]
     fn proposal_does_not_mutate_until_applied() {

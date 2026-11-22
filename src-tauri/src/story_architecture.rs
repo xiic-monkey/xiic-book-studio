@@ -229,7 +229,7 @@ async fn generate_story_bible_review(
 ) -> AppResult<StoryBibleReview> {
     let snapshot = canonical_snapshot(state, project_id)?;
     let fingerprint = source_text_hash(&snapshot);
-    let agent = state.get_agent_for_project_stage(project_id, "story_architect")?;
+    let agent = state.get_execution_agent("story_architect")?;
     let settings = agent.ai_settings();
     let api_key = state
         .get_api_key_for_base_url(&settings.base_url)?
@@ -475,8 +475,8 @@ fn mode_contract(mode: &crate::models::StoryArchitectMode) -> &'static str {
     match mode {
         crate::models::StoryArchitectMode::Initialize => "建立基础世界模型、少量核心角色基础和故事方向，但按资料类别分流写入：世界观只描述世界长期如何运行，角色只写角色资料，故事方向只保留高层路标。禁止在世界观资料中写第一章、主角下一步、压迫链、资源循环、首次收益、升级路线或章节任务。远期方向只保留路标，禁止伪造完整章节细节。对需要沉淀的资料必须逐条调用资料写入工具（save_canon_entry / update_canon_entry）；不要把 Markdown 作为主要交付物。",
         crate::models::StoryArchitectMode::RefineCanon => "只补充当前 Canon 真正需要的长期世界规则、势力、地点、物件或边界。压迫链、资源循环、阶段目标和章节任务属于大纲，不属于世界观；角色变化属于角色资料。每项必须说明其稳定定义，并逐条调用资料写入工具（save_canon_entry / update_canon_entry）；不要把 Markdown 作为主要交付物。",
-        crate::models::StoryArchitectMode::PlanCurrentArc => "细化当前故事阶段：目标、进入局面、核心冲突、退出变化、相关角色和近期章节计划。已通过正式章节只能作为已发生事实被总结，必须从第一章尚无正式正文的章节继续规划；不得回写、改名或用规划版本替代已写内容。对每个近期章节逐条调用创建章节计划或更新章节计划，提供 chapter_no、标题、目标、主要阻力、关键行动、必须发生的变化和离开状态；章节计划一律走章节计划工具，不要混入资料条目。为当前阶段补充读者主要期待、推进证据、局部回报、尚未兑现项和对下一阶段形成的新条件；回报可以是理解、情绪、关系、能力、资源或目标变化，不规定固定章数和爽点频率。不要把更远阶段写死。",
-        crate::models::StoryArchitectMode::ExtendNextArc => "基于当前阶段结局、正式章节、活跃伏笔与角色状态，提出下一故事阶段的候选方向；已通过正式章节和已经形成的阶段结果不可重写。每个候选阶段说明读者主要期待、可验证的推进证据、局部回报、继续保留的未兑现项和阶段结束后的新条件；不按目标字数平均切块，也不规定固定回报频率。新要素必须说明从何而来。",
+        crate::models::StoryArchitectMode::PlanCurrentArc => "细化当前故事阶段：目标、进入局面、核心冲突、退出变化、相关角色和近期章节计划。已有正文的章节只能总结已发生的事实，必须从第一个没有正文的章节继续规划；不得回写、改名或用规划版本替代已写内容。对每个近期章节逐条调用创建章节计划或更新章节计划，提供 chapter_no、标题、目标、主要阻力、关键行动、必须发生的变化和离开状态；章节计划一律走章节计划工具，不要混入资料条目。为当前阶段补充读者主要期待、推进证据、局部回报、尚未兑现项和对下一阶段形成的新条件；回报可以是理解、情绪、关系、能力、资源或目标变化，不规定固定章数和爽点频率。不要把更远阶段写死。",
+        crate::models::StoryArchitectMode::ExtendNextArc => "基于当前阶段结局、正文、活跃伏笔与角色状态，提出下一故事阶段的候选方向；正文和已经形成的阶段结果不可重写。每个候选阶段说明读者主要期待、可验证的推进证据、局部回报、继续保留的未兑现项和阶段结束后的新条件；不按目标字数平均切块，也不规定固定回报频率。新要素必须说明从何而来。",
         crate::models::StoryArchitectMode::DesignCharacters => "只补充或修订角色信息。角色必须有自身身份、目标、限制、已知信息、关系和长期变化条件；不要把世界规则、压迫链或章节任务写进角色资料。",
     }
 }
@@ -638,7 +638,7 @@ mod tests {
     fn arc_planning_contract_protects_written_chapters_and_tracks_reader_returns() {
         let contract = mode_contract(&crate::models::StoryArchitectMode::PlanCurrentArc);
 
-        assert!(contract.contains("第一章尚无正式正文的章节"));
+        assert!(contract.contains("第一个没有正文的章节"));
         assert!(contract.contains("不得回写、改名"));
         assert!(contract.contains("读者主要期待、推进证据、局部回报、尚未兑现项"));
         assert!(contract.contains("不规定固定章数和爽点频率"));
