@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
@@ -12,7 +14,7 @@ use crate::{
     },
 };
 
-const V2_SCHEMA_VERSION: i64 = 12;
+const V2_SCHEMA_VERSION: i64 = 13;
 
 pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
     state.with_conn(|conn| {
@@ -75,9 +77,96 @@ pub(crate) fn migrate(state: &AppState) -> AppResult<()> {
             apply_migration(conn, 12, migrate_v12)?;
             current = 12;
         }
+        if current < 13 {
+            apply_migration(conn, 13, migrate_v13)?;
+            current = 13;
+        }
         debug_assert!(V2_SCHEMA_VERSION >= current);
         Ok(())
     })
+}
+
+/// v13：Agent 的工具键与辅助 Skill 许可对齐运行时实际支持范围。
+///
+/// - `request_chapter_memory` 是新增的委托型工具。老库的 agents 行在建库时就写死了
+///   旧的默认工具键，不会自动拿到新工具，运行时也不会下发它。
+/// - 辅助 Skill 目前只支持 `continuity_and_agency`。旧版设置页允许勾选所有启用的
+///   写作 Skill，老库里可能残留其它 key：它们不会被注入，却仍占着许可，
+///   新版设置页也不再列出它们，用户既看不到也取消不掉。
+fn migrate_v13(conn: &Connection) -> AppResult<()> {
+    let rows = {
+        let mut stmt =
+            conn.prepare("SELECT id, enabled_tool_keys, allowed_skill_keys FROM agents")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let legacy_defaults = legacy_default_tool_keys();
+    let supported_skills = crate::genre_skill::supported_auxiliary_skill_keys();
+    for (agent_id, tool_keys, skill_keys) in rows {
+        if let Some(updated) = upgrade_default_tool_keys(&tool_keys, &legacy_defaults) {
+            conn.execute(
+                "UPDATE agents SET enabled_tool_keys = ?1 WHERE id = ?2",
+                params![updated, agent_id],
+            )?;
+        }
+        if let Some(raw) = skill_keys {
+            if let Some(updated) = filter_unsupported_skill_keys(&raw, supported_skills) {
+                conn.execute(
+                    "UPDATE agents SET allowed_skill_keys = ?1 WHERE id = ?2",
+                    params![updated, agent_id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 老库种子里写入的默认工具键集合（不含后来新增的委托型工具）。
+fn legacy_default_tool_keys() -> Vec<String> {
+    crate::agent_tools::default_keys()
+        .into_iter()
+        .filter(|key| key != crate::agent_tools::REQUEST_CHAPTER_MEMORY)
+        .collect()
+}
+
+/// 只给「仍然是老库默认」的行补上新工具键。
+///
+/// 用户自己改过工具集合的行不动——迁移不能替用户做主。空数组视为用户显式
+/// 清空，也不补。
+fn upgrade_default_tool_keys(raw: &str, legacy_defaults: &[String]) -> Option<String> {
+    let parsed: Vec<String> = serde_json::from_str(raw).ok()?;
+    if parsed.is_empty() {
+        return None;
+    }
+    let mut remaining: HashSet<&String> = legacy_defaults.iter().collect();
+    let is_legacy_default =
+        parsed.len() == legacy_defaults.len() && parsed.iter().all(|key| remaining.remove(key));
+    if !is_legacy_default {
+        return None;
+    }
+    let mut updated = parsed;
+    updated.push(crate::agent_tools::REQUEST_CHAPTER_MEMORY.to_string());
+    serde_json::to_string(&updated).ok()
+}
+
+/// 剔除运行时不会注入的辅助 Skill 许可。
+fn filter_unsupported_skill_keys(raw: &str, supported: &[&str]) -> Option<String> {
+    let parsed: Vec<String> = serde_json::from_str(raw).ok()?;
+    let kept: Vec<String> = parsed
+        .iter()
+        .filter(|key| supported.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    if kept.len() == parsed.len() {
+        return None;
+    }
+    serde_json::to_string(&kept).ok()
 }
 
 /// v12：内置题材 Skill 的启用状态恢复为默认可用。
@@ -1852,6 +1941,112 @@ mod tests {
             })
             .unwrap();
         assert_eq!(enabled, 0);
+    }
+
+    /// v13：仍然是老库默认工具键的行补上新增的委托型工具；
+    /// 用户自己改过的工具集合不动。
+    #[test]
+    fn migrate_v13_upgrades_only_legacy_default_tool_keys() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let legacy_defaults = legacy_default_tool_keys();
+        let legacy_json = serde_json::to_string(&legacy_defaults).unwrap();
+        let custom_json = serde_json::to_string(&vec!["search_story".to_string()]).unwrap();
+        let empty_json = serde_json::to_string(&Vec::<String>::new()).unwrap();
+
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agents SET enabled_tool_keys = ?1 WHERE stage = 'review'",
+                    [&legacy_json],
+                )?;
+                conn.execute(
+                    "UPDATE agents SET enabled_tool_keys = ?1 WHERE stage = 'draft'",
+                    [&custom_json],
+                )?;
+                conn.execute(
+                    "UPDATE agents SET enabled_tool_keys = ?1 WHERE stage = 'revision'",
+                    [&empty_json],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        state
+            .with_conn(|conn| {
+                migrate_v13(conn)?;
+                Ok(())
+            })
+            .unwrap();
+
+        state
+            .with_conn(|conn| {
+                let keys = |stage: &str| -> Vec<String> {
+                    let raw: String = conn
+                        .query_row(
+                            "SELECT enabled_tool_keys FROM agents WHERE stage = ?1",
+                            [stage],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    serde_json::from_str(&raw).unwrap()
+                };
+                // 老库默认：补上新工具。
+                let review = keys("review");
+                assert!(review.contains(&crate::agent_tools::REQUEST_CHAPTER_MEMORY.to_string()));
+                // 用户改过：不动。
+                assert_eq!(keys("draft"), vec!["search_story".to_string()]);
+                // 用户显式清空：不替他加回来。
+                assert!(keys("revision").is_empty());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// v13：运行时不会注入的辅助 Skill 许可要清掉，
+    /// 否则界面上留着实际不生效的白名单，用户既看不到也取消不掉。
+    #[test]
+    fn migrate_v13_drops_unsupported_auxiliary_skill_keys() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::from_path(file.path().to_path_buf()).unwrap();
+        let raw = serde_json::to_string(&vec![
+            "continuity_and_agency".to_string(),
+            "mystery".to_string(),
+            "romance_craft".to_string(),
+        ])
+        .unwrap();
+
+        state
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agents SET allowed_skill_keys = ?1 WHERE stage = 'review'",
+                    [&raw],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        state
+            .with_conn(|conn| {
+                migrate_v13(conn)?;
+                Ok(())
+            })
+            .unwrap();
+
+        state
+            .with_conn(|conn| {
+                let value: String = conn
+                    .query_row(
+                        "SELECT allowed_skill_keys FROM agents WHERE stage = 'review'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let keys: Vec<String> = serde_json::from_str(&value).unwrap();
+                assert_eq!(keys, vec!["continuity_and_agency".to_string()]);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

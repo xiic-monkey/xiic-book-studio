@@ -25,7 +25,7 @@ use crate::{
         Agent, AgentStepResult, AiSpanRevisionRequest, Artifact, ChapterSplitPlan,
         ChapterSplitPlanRequest, ContinuityIssue, ContinuityReport, ContinuityReviewRequest,
         Project, ReviewIssue, RunAgentRequest, SpanReplacementRequest, Stage,
-        StoryContextSearchInput, StoryContextSnippet, WorkflowRun,
+        StoryContextSearchInput, StoryContextSnippet, ToolProtocol, WorkflowRun,
     },
     quality, story_architecture,
 };
@@ -125,6 +125,57 @@ fn review_tool_schemas(agent: &Agent, stage: &Stage) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// 试读阶段是否走原生工具协议提交问题。
+///
+/// 供应商的工具协议是用户显式配置或运行时探测出来的结论，试读阶段不能无视它：
+/// 不支持原生工具调用的供应商会直接拒绝带 `tools` 的请求，而配置成
+/// structured 的用户会被强行换成另一套协议。
+pub(crate) fn review_uses_tool_protocol(state: &AppState, base_url: &str) -> AppResult<bool> {
+    let capabilities = state.provider_capabilities(base_url)?;
+    Ok(match capabilities.configured_protocol {
+        ToolProtocol::Native => true,
+        ToolProtocol::Structured => false,
+        // Auto 下已经探测出不支持原生工具的供应商，直接走 JSON 输出，
+        // 不再每次先撞一次墙再回退。
+        ToolProtocol::Auto => !matches!(
+            capabilities.detected_protocol,
+            Some(ToolProtocol::Structured)
+        ),
+    })
+}
+
+/// 试读工具循环最多发几轮：提交、纠错、收尾。
+const MAX_REVIEW_TOOL_ROUNDS: usize = 3;
+
+/// 多轮循环累计发送的字符上限。
+///
+/// 候选稿正文每一轮都会被重复发送，所以这里给总发送量封顶，避免长篇项目
+/// 在多轮里把模型上下文窗口撑爆。
+const MAX_REVIEW_TOOL_MESSAGES_CHARS: usize = 3 * MAX_WORKFLOW_PROMPT_CHARS;
+
+/// 已准备发送的消息总字符数。
+fn messages_chars(messages: &[ai::ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            message.content.chars().count()
+                + message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .map(|call| {
+                                call.function.arguments.chars().count()
+                                    + call.function.name.chars().count()
+                            })
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+        })
+        .sum()
+}
+
 /// 试读阶段的多轮 tool-calling 循环。
 ///
 /// 模型先自由判断该查什么、要提交什么；运行时执行提交型工具后把结果回填，
@@ -156,9 +207,15 @@ async fn run_review_tool_loop(
     ];
     let mut collected: Vec<ai::StreamToolCall> = Vec::new();
     let mut last_content = String::new();
-    let rounds = crate::tool_runtime::max_tool_rounds();
+    // 收尾用的总结：优先保留模型说过的最后一段自然语言，避免最后一轮只有
+    // 工具调用时把总结丢掉。
+    let mut last_summary = String::new();
 
-    for _ in 0..rounds {
+    for _ in 0..MAX_REVIEW_TOOL_ROUNDS {
+        // 候选稿正文每轮都会重发，累计超预算就收尾，不再多跑一轮。
+        if messages_chars(&messages) > MAX_REVIEW_TOOL_MESSAGES_CHARS {
+            break;
+        }
         let chunk = ai::stream_chat_turn(
             settings,
             api_key,
@@ -169,6 +226,9 @@ async fn run_review_tool_loop(
         )
         .await?;
         last_content = chunk.content.clone();
+        if !chunk.content.trim().is_empty() {
+            last_summary = chunk.content.clone();
+        }
         if chunk.tool_calls.is_empty() {
             return Ok(ai::StreamingOutcome {
                 content: chunk.content,
@@ -210,7 +270,11 @@ async fn run_review_tool_loop(
 
     // 轮次用尽：模型没机会收尾了，把最后一轮正文作为总结返回。
     Ok(ai::StreamingOutcome {
-        content: last_content,
+        content: if last_summary.trim().is_empty() {
+            last_content
+        } else {
+            last_summary
+        },
         tool_calls: collected,
     })
 }
@@ -244,6 +308,38 @@ async fn execute_review_tool_call(
         run_id: Some(run_id),
         preview: false,
     };
+    // 提交型工具的参数必须先过 schema 校验。缺 issues、字段类型不对这类问题
+    // 必须在执行前就退回给模型，不能当成"提交了 0 条"成功。
+    let definitions = crate::tool_runtime::definitions_for_agent(agent, &input.stage, false);
+    if let Err(error) = crate::tool_runtime::validate_call(&context, &definitions, &tool_call) {
+        let message = error.to_string();
+        let result = serde_json::json!({
+            "call_id": tool_call.call_id,
+            "tool_key": tool_call.tool_key,
+            "status": "failed",
+            "data": serde_json::json!({}),
+            "error": message,
+            "elapsed_ms": 0,
+            "truncated": false,
+        });
+        state.insert_tool_invocation(
+            Some(run_id),
+            None,
+            input.project_id,
+            input.chapter_id,
+            input.stage.as_str(),
+            &tool_call.tool_key,
+            &tool_call.protocol,
+            &tool_call.arguments,
+            &result,
+            "failed",
+            Some(&message),
+            0,
+        )?;
+        return Ok(format!(
+            "提交失败：{message}。请按工具要求补齐参数后重新提交。"
+        ));
+    }
     let started = Instant::now();
     let execution = crate::tool_runtime::execute_call(&context, &tool_call).await;
     let elapsed_ms = started.elapsed().as_millis() as i64;
@@ -345,13 +441,14 @@ fn review_issues_from_outcome(
 fn parse_submitted_review_issues(arguments: &str) -> AppResult<Vec<ReviewIssue>> {
     let arguments: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|error| AppError::Validation(format!("提交的问题参数不是合法 JSON：{error}")))?;
-    let issues: Vec<ReviewIssue> = serde_json::from_value(
-        arguments
-            .get("issues")
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
-    )
-    .map_err(|error| AppError::Validation(format!("提交的问题列表格式不正确：{error}")))?;
+    // 与工具执行保持同一条判据：没有 issues 字段就是没按契约提交，
+    // 不能当成「没有问题」。
+    let raw = arguments
+        .get("issues")
+        .cloned()
+        .ok_or_else(|| AppError::Validation("提交的问题缺少 issues 数组".to_string()))?;
+    let issues: Vec<ReviewIssue> = serde_json::from_value(raw)
+        .map_err(|error| AppError::Validation(format!("提交的问题列表格式不正确：{error}")))?;
     ai::validate_review_issues(&issues)?;
     Ok(issues)
 }
@@ -584,6 +681,15 @@ async fn run_agent_step_impl(
         .ok_or_else(|| {
             AppError::Validation("请先在设置里为当前供应商保存 AI API Key".to_string())
         })?;
+    // 试读阶段的两套输出协议由供应商工具能力决定：只有支持原生工具调用才下发
+    // 提交型工具，否则退回 JSON 数组输出。
+    let review_use_tool_protocol = matches!(input.stage, Stage::Review)
+        && review_uses_tool_protocol(state, &settings.base_url)?;
+    let agent = if matches!(input.stage, Stage::Review) {
+        crate::stage_agent::apply_review_protocol(agent, review_use_tool_protocol)
+    } else {
+        agent
+    };
     if prepared_context.is_none()
         && has_chapter_memory
         && chapter_memory::is_enabled()
@@ -906,12 +1012,13 @@ async fn run_agent_step_impl(
                 Ok(())
             });
     // 试读阶段：结构化问题通过提交型工具交回运行时，模型只用自然语言收尾。
-    let review_tool_schemas = if matches!(input.stage, Stage::Review) {
+    // 供应商不支持原生工具调用时不下发工具，改走 JSON 数组输出。
+    let review_tool_schemas = if review_use_tool_protocol {
         review_tool_schemas(&agent, &input.stage)
     } else {
         Vec::new()
     };
-    match await_run_result(state, run.id, async {
+    let stream_result = await_run_result(state, run.id, async {
         if review_tool_schemas.is_empty() {
             ai::complete_chat_streaming(
                 &settings,
@@ -941,113 +1048,199 @@ async fn run_agent_step_impl(
             .await
         }
     })
-    .await
-    {
-        Ok(outcome) => {
-            let output = outcome.content.clone();
-            let normalized_output = if matches!(input.stage, Stage::Review) {
-                let (summary, mut issues) = review_issues_from_outcome(&outcome)?;
-                // Item/resource/injury state is checked by the App ledger against
-                // both exact source quotes. Do not let a prose model overrule that
-                // deterministic result with an unsupported "hard" conflict.
-                issues.retain(|issue| !model_issue_duplicates_ledger_check(issue));
-                issues.extend(ledger_review_issues(ledger_report.as_ref()));
-                let constrained = constrain_review_issues(issues, &review_evidence);
-                // 产物同时保留人话总结与结构化问题：人话给读者看，结构化给修订阶段用。
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "summary": summary,
-                    "issues": constrained,
-                }))?
-            } else if matches!(input.stage, Stage::Draft | Stage::Revision) {
-                normalize_story_body_output(&output)
-            } else {
-                output.clone()
-            };
-            let artifact = state.insert_artifact(
-                input.project_id,
-                input.chapter_id,
-                input.stage.as_str(),
-                &artifact_title(&input.stage, chapter.as_ref().map(|c| c.chapter_no)),
-                &normalized_output,
-                // A trial-reading report must retain the exact candidate it reviewed.
-                // That lets the revision flow work before either artifact is approved.
-                if matches!(input.stage, Stage::Review) {
-                    source_artifact.as_ref().map(|artifact| artifact.id)
-                } else {
-                    parent_for_stage(state, input.project_id, &input.stage, input.chapter_id)?
-                },
-            )?;
-            if has_reference_materials {
-                if let Some(warning) = crate::reference::overlap_warning(
-                    state,
-                    input.project_id,
-                    input.reference_selection.as_ref(),
-                    &normalized_output,
-                ) {
-                    state.insert_message(
-                        input.project_id,
-                        input.chapter_id,
-                        "reference_overlap_warning",
-                        &warning,
-                    )?;
-                }
-            }
-            run = state.update_workflow_run(
-                run.id,
-                &normalized_output,
-                "success",
-                None,
-                started.elapsed().as_millis() as i64,
-            )?;
-            state.link_run_artifact(run.id, artifact.id)?;
-            sync_story_threads_after_generation(state, &artifact)?;
-            state.insert_message(
-                input.project_id,
-                input.chapter_id,
-                "agent_result",
-                &format!(
-                    "{} 生成 v{}：{}",
-                    input.stage.title(),
-                    artifact.version,
-                    artifact.title
-                ),
-            )?;
-            if emit_completion {
+    .await;
+    let outcome = match stream_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // 供应商不支持原生工具调用：退回 JSON 数组输出重试一次，
+            // 而不是让整次试读失败。
+            if !(review_use_tool_protocol && ai::is_unsupported_tools_error(&error)) {
+                let message = error.to_string();
+                let cancelled = state.run_cancellation_requested(run.id)?;
+                let final_status = if cancelled { "cancelled" } else { "failed" };
+                state.update_workflow_run(
+                    run.id,
+                    &latest_output,
+                    final_status,
+                    Some(&message),
+                    started.elapsed().as_millis() as i64,
+                )?;
                 state.insert_run_event(
                     run.id,
                     input.project_id,
                     input.chapter_id,
-                    "completed",
+                    final_status,
                     "",
-                    "success",
-                    None,
+                    final_status,
+                    Some(&message),
                 )?;
+                return Err(AppError::Validation(message));
             }
-            Ok(AgentStepResult { artifact, run })
-        }
-        Err(err) => {
-            let message = err.to_string();
-            let cancelled = state.run_cancellation_requested(run.id)?;
-            let final_status = if cancelled { "cancelled" } else { "failed" };
-            state.update_workflow_run(
-                run.id,
-                &latest_output,
-                final_status,
-                Some(&message),
-                started.elapsed().as_millis() as i64,
-            )?;
             state.insert_run_event(
                 run.id,
                 input.project_id,
                 input.chapter_id,
-                final_status,
-                "",
-                final_status,
-                Some(&message),
+                "output_reset",
+                "供应商不支持原生工具调用，改为 JSON 输出重试",
+                "streaming",
+                None,
             )?;
-            Err(AppError::Validation(message))
+            // 回退要用未切分的原文重新选协议段：此刻 agent 里已经是工具版，
+            // 直接再切一次不会生效。
+            let original_agent = state.get_agent(&agent.stage)?;
+            let json_agent = crate::stage_agent::apply_review_protocol(original_agent, false);
+            let mut fallback_last_chars = 0usize;
+            let mut fallback_on_update = |partial: &str, _thinking: &str| -> AppResult<()> {
+                latest_output = partial.to_string();
+                let chars = partial.chars().count();
+                let delta = if chars >= fallback_last_chars {
+                    partial
+                        .chars()
+                        .skip(fallback_last_chars)
+                        .collect::<String>()
+                } else {
+                    partial.to_string()
+                };
+                if !delta.is_empty() {
+                    state.insert_run_event(
+                        run.id,
+                        input.project_id,
+                        input.chapter_id,
+                        "output_delta",
+                        &delta,
+                        "streaming",
+                        None,
+                    )?;
+                }
+                fallback_last_chars = chars;
+                let _ = state.update_workflow_run(
+                    run.id,
+                    partial,
+                    "streaming",
+                    None,
+                    started.elapsed().as_millis() as i64,
+                )?;
+                Ok(())
+            };
+            match ai::complete_chat_streaming(
+                &settings,
+                &api_key,
+                &json_agent.system_prompt,
+                &prompt,
+                agent.temperature,
+                &mut fallback_on_update,
+            )
+            .await
+            {
+                Ok(content) => ai::StreamingOutcome {
+                    content,
+                    tool_calls: Vec::new(),
+                },
+                Err(fallback_error) => {
+                    let message = fallback_error.to_string();
+                    let cancelled = state.run_cancellation_requested(run.id)?;
+                    let final_status = if cancelled { "cancelled" } else { "failed" };
+                    state.update_workflow_run(
+                        run.id,
+                        &latest_output,
+                        final_status,
+                        Some(&message),
+                        started.elapsed().as_millis() as i64,
+                    )?;
+                    state.insert_run_event(
+                        run.id,
+                        input.project_id,
+                        input.chapter_id,
+                        final_status,
+                        "",
+                        final_status,
+                        Some(&message),
+                    )?;
+                    return Err(AppError::Validation(message));
+                }
+            }
+        }
+    };
+    let output = outcome.content.clone();
+    let normalized_output = if matches!(input.stage, Stage::Review) {
+        let (summary, mut issues) = review_issues_from_outcome(&outcome)?;
+        // Item/resource/injury state is checked by the App ledger against
+        // both exact source quotes. Do not let a prose model overrule that
+        // deterministic result with an unsupported "hard" conflict.
+        issues.retain(|issue| !model_issue_duplicates_ledger_check(issue));
+        issues.extend(ledger_review_issues(ledger_report.as_ref()));
+        let constrained = constrain_review_issues(issues, &review_evidence);
+        // 产物同时保留人话总结与结构化问题：人话给读者看，结构化给修订阶段用。
+        serde_json::to_string_pretty(&serde_json::json!({
+            "summary": summary,
+            "issues": constrained,
+        }))?
+    } else if matches!(input.stage, Stage::Draft | Stage::Revision) {
+        normalize_story_body_output(&output)
+    } else {
+        output.clone()
+    };
+    let artifact = state.insert_artifact(
+        input.project_id,
+        input.chapter_id,
+        input.stage.as_str(),
+        &artifact_title(&input.stage, chapter.as_ref().map(|c| c.chapter_no)),
+        &normalized_output,
+        // A trial-reading report must retain the exact candidate it reviewed.
+        // That lets the revision flow work before either artifact is approved.
+        if matches!(input.stage, Stage::Review) {
+            source_artifact.as_ref().map(|artifact| artifact.id)
+        } else {
+            parent_for_stage(state, input.project_id, &input.stage, input.chapter_id)?
+        },
+    )?;
+    if has_reference_materials {
+        if let Some(warning) = crate::reference::overlap_warning(
+            state,
+            input.project_id,
+            input.reference_selection.as_ref(),
+            &normalized_output,
+        ) {
+            state.insert_message(
+                input.project_id,
+                input.chapter_id,
+                "reference_overlap_warning",
+                &warning,
+            )?;
         }
     }
+    run = state.update_workflow_run(
+        run.id,
+        &normalized_output,
+        "success",
+        None,
+        started.elapsed().as_millis() as i64,
+    )?;
+    state.link_run_artifact(run.id, artifact.id)?;
+    sync_story_threads_after_generation(state, &artifact)?;
+    state.insert_message(
+        input.project_id,
+        input.chapter_id,
+        "agent_result",
+        &format!(
+            "{} 生成 v{}：{}",
+            input.stage.title(),
+            artifact.version,
+            artifact.title
+        ),
+    )?;
+    if emit_completion {
+        state.insert_run_event(
+            run.id,
+            input.project_id,
+            input.chapter_id,
+            "completed",
+            "",
+            "success",
+            None,
+        )?;
+    }
+    Ok(AgentStepResult { artifact, run })
 }
 
 // Agent context is persisted as PreparedContext and read through the background-run API.
@@ -5557,6 +5750,75 @@ mod tests {
         };
 
         assert!(review_issues_from_outcome(&outcome).is_err());
+    }
+
+    /// 提交型工具的调用里没有 issues 字段：不能当成「没有问题」的空提交。
+    #[test]
+    fn review_submission_without_issues_field_fails() {
+        let outcome = ai::StreamingOutcome {
+            content: "总结".to_string(),
+            tool_calls: vec![ai::StreamToolCall {
+                id: "call_1".to_string(),
+                name: crate::agent_tools::SUBMIT_REVIEW_ISSUES.to_string(),
+                arguments: serde_json::json!({ "note": "忘了填 issues" }).to_string(),
+            }],
+        };
+
+        assert!(review_issues_from_outcome(&outcome).is_err());
+    }
+
+    /// 空列表是合法的「没有问题」，与「没有 issues 字段」必须区分开。
+    #[test]
+    fn review_submission_with_empty_issues_list_is_accepted() {
+        let outcome = ai::StreamingOutcome {
+            content: "总结".to_string(),
+            tool_calls: vec![ai::StreamToolCall {
+                id: "call_1".to_string(),
+                name: crate::agent_tools::SUBMIT_REVIEW_ISSUES.to_string(),
+                arguments: serde_json::json!({ "issues": [] }).to_string(),
+            }],
+        };
+
+        let (summary, issues) = review_issues_from_outcome(&outcome).unwrap();
+        assert_eq!(summary, "总结");
+        assert!(issues.is_empty());
+    }
+
+    /// 试读阶段必须尊重供应商的工具协议设置：
+    /// 明确配置成 structured 的供应商走 JSON 输出，不下发原生工具。
+    #[test]
+    fn review_tool_protocol_follows_provider_capabilities() {
+        let temp = NamedTempFile::new().unwrap();
+        let state = AppState::from_path(temp.path().to_path_buf()).unwrap();
+        let base_url = "https://api.example.test/v1".to_string();
+        state
+            .save_ai_provider(crate::models::SaveAiProvider {
+                id: None,
+                label: "示例供应商".to_string(),
+                base_url: base_url.clone(),
+                model: "demo".to_string(),
+                temperature: 0.7,
+                thinking_enabled: false,
+                thinking_level: "off".to_string(),
+                tool_protocol: crate::models::ToolProtocol::Structured,
+            })
+            .unwrap();
+
+        assert!(!review_uses_tool_protocol(&state, &base_url).unwrap());
+
+        state
+            .save_ai_provider(crate::models::SaveAiProvider {
+                id: None,
+                label: "示例供应商".to_string(),
+                base_url: base_url.clone(),
+                model: "demo".to_string(),
+                temperature: 0.7,
+                thinking_enabled: false,
+                thinking_level: "off".to_string(),
+                tool_protocol: crate::models::ToolProtocol::Native,
+            })
+            .unwrap();
+        assert!(review_uses_tool_protocol(&state, &base_url).unwrap());
     }
 
     #[test]

@@ -6,6 +6,14 @@ use crate::{
 
 const CRAFT_KEY: &str = "continuity_and_agency";
 
+/// 运行时真正会注入的辅助 Skill key。
+///
+/// 许可集合（`agents.allowed_skill_keys`）必须与这里一致：留着运行时不会
+/// 注入的 key，只会让界面显示出实际上不生效的白名单。
+pub(crate) fn supported_auxiliary_skill_keys() -> &'static [&'static str] {
+    &[CRAFT_KEY]
+}
+
 const GENERAL_SERIALIZED_FALLBACK: &str = include_str!("../skills/genres/general_serialized.md");
 const URBAN_SUPERNATURAL_FALLBACK: &str = include_str!("../skills/genres/urban_supernatural.md");
 const MYSTERY_FALLBACK: &str = include_str!("../skills/genres/mystery.md");

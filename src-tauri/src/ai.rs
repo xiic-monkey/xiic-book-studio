@@ -130,6 +130,16 @@ const AI_PLAN_MAX_ATTEMPTS: usize = 3;
 const AI_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: u64 = 30;
 const AI_RETRY_DELAY_MILLIS: u64 = 1_000;
 
+/// 供应商不支持原生工具调用时的错误前缀。
+///
+/// 上层据此判断能否退回另一套协议重试，所以前缀本身属于对外契约。
+pub const UNSUPPORTED_TOOLS_PREFIX: &str = "供应商不支持原生工具调用";
+
+/// 判断错误是不是"供应商不支持原生工具调用"。
+pub fn is_unsupported_tools_error(error: &AppError) -> bool {
+    error.to_string().starts_with(UNSUPPORTED_TOOLS_PREFIX)
+}
+
 #[derive(Debug)]
 pub enum ToolPlanningError {
     Unsupported(String),
@@ -787,9 +797,16 @@ where
         if !response.status().is_success() {
             let status = response.status();
             let body = read_response_text_bounded(response).await.unwrap_or_default();
+            let compact = compact_error_body(&body);
+            // 带工具目录的请求被拒且原因是"不支持 tools"：这是确定性结论，
+            // 重试没有意义，交给上层决定是否退回另一套协议。
+            if request.tools.is_some() && native_tools_unsupported(status.as_u16(), &body) {
+                return Err(AppError::Validation(format!(
+                    "{UNSUPPORTED_TOOLS_PREFIX}：HTTP {status} {compact}"
+                )));
+            }
             last_error = Some(AppError::Validation(format!(
-                "AI 请求失败：HTTP {status} {}",
-                compact_error_body(&body)
+                "AI 请求失败：HTTP {status} {compact}"
             )));
             if should_retry(attempt, max_attempts) {
                 sleep(Duration::from_millis(AI_RETRY_DELAY_MILLIS)).await;

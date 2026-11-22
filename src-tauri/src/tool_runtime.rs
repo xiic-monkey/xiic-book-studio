@@ -832,11 +832,11 @@ pub(crate) async fn execute_call(
         }
         agent_tools::SUBMIT_REVIEW_ISSUES => {
             // 提交型工具：结构化数据走工具参数，不要求模型把 JSON 写进回复文本。
-            let raw = call
-                .arguments
-                .get("issues")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new()));
+            // 缺 issues 必须报错：空列表是合法的「没有问题」，但没有 issues
+            // 字段说明这次提交根本没按契约来，不能当成提交成功。
+            let raw = call.arguments.get("issues").cloned().ok_or_else(|| {
+                AppError::Validation("提交的问题缺少 issues 数组".to_string())
+            })?;
             let issues: Vec<crate::models::ReviewIssue> =
                 serde_json::from_value(raw).map_err(|error| {
                     AppError::Validation(format!("提交的问题列表格式不正确：{error}"))

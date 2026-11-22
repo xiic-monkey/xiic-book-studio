@@ -1507,6 +1507,14 @@ async fn prepare_context(
     state.purge_expired_prepared_contexts()?;
     let source = validate_request(state, request)?;
     let agent = state.get_execution_agent(request.stage.as_str())?;
+    // 试读阶段的两套输出协议由供应商工具能力决定，预览与实际发送必须是同一套。
+    let review_use_tool_protocol = matches!(request.stage, Stage::Review)
+        && workflow::review_uses_tool_protocol(state, &agent.ai_settings().base_url)?;
+    let agent = if matches!(request.stage, Stage::Review) {
+        crate::stage_agent::apply_review_protocol(agent, review_use_tool_protocol)
+    } else {
+        agent
+    };
     let project = state.get_project(request.project_id)?;
     let skills = genre_skill::load_stage_skills(state, &project, &request.stage, &agent.allowed_skill_keys)?;
     let fingerprint = context_fingerprint(state, request, &agent, source.as_ref(), &project, &skills)?;

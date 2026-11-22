@@ -5157,24 +5157,31 @@ fn normalize_skill_keys(keys: &[String]) -> Vec<String> {
 
 /// 过滤掉不能作为「辅助 Skill」的 key。
 ///
-/// 题材类（`category = 'genre'`）与历史遗留（`legacy`）的 Skill 不会被注入；
-/// 库里不存在的 key 同样不可注入。只保留这些之外的合法辅助 Skill。
+/// 许可集合必须与运行时真正会注入的辅助 Skill 一致：题材类（`category = 'genre'`）
+/// 与历史遗留（`legacy`）不会被注入，库里不存在或不是 craft 分类的 key 同样不会
+/// 注入。留着它们只会让界面显示出实际上不生效的白名单。
 fn filter_auxiliary_skill_keys(conn: &Connection, keys: &[String]) -> AppResult<Vec<String>> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT skill_key FROM writing_skills
-         WHERE category <> 'genre' AND category <> 'legacy'",
-    )?;
-    let allowed = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<HashSet<String>, _>>()?;
-    Ok(keys
-        .iter()
-        .filter(|key| allowed.contains(*key))
-        .cloned()
-        .collect())
+    let supported = genre_skill::supported_auxiliary_skill_keys();
+    let mut kept: Vec<String> = Vec::new();
+    for key in keys {
+        if !supported.contains(&key.as_str()) || kept.contains(key) {
+            continue;
+        }
+        let category = conn
+            .query_row(
+                "SELECT category FROM writing_skills WHERE skill_key = ?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if matches!(category.as_deref(), Some("craft")) {
+            kept.push(key.clone());
+        }
+    }
+    Ok(kept)
 }
 
 fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
