@@ -987,8 +987,9 @@ async fn read_response_text(response: reqwest::Response) -> AppResult<String> {
 
 /// 带上限地读取响应体。
 ///
-/// 客户端级超时只覆盖到响应头；上游若在正文中途停住（例如代理把连接挂死），
-/// 这里必须再兜一层，否则整轮 Agent 运行会无限等待。
+/// 项目锁定的 reqwest 0.12 里，客户端级 `timeout` 覆盖「开始连接到响应体读完」，
+/// 已包含响应体读取，并不只到响应头。这里的额外 deadline 是纵深防御：即便日后
+/// 换成只覆盖响应头的客户端，上游在正文中途挂死也不会让整轮 Agent 无限等待。
 async fn read_response_text_bounded(response: reqwest::Response) -> AppResult<String> {
     timeout(
         Duration::from_secs(AI_REQUEST_TIMEOUT_SECONDS),

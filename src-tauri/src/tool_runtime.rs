@@ -596,6 +596,17 @@ fn validate_arguments(schema: &Value, arguments: &Value) -> AppResult<()> {
     validate_schema_value(schema, arguments, "工具参数")
 }
 
+/// 用工具注册时声明的 schema 校验一组参数。落库前重新解析工具原始参数时必须
+/// 走这里，否则会绕过 maxItems / additionalProperties 等约束，把已被工具拒绝
+/// 的提交当成有效结果采用。
+pub(crate) fn validate_tool_arguments(tool_key: &str, arguments: &Value) -> AppResult<()> {
+    let definition = agent_tools::definitions()
+        .into_iter()
+        .find(|definition| definition.key == tool_key)
+        .ok_or_else(|| AppError::Validation(format!("未知工具：{tool_key}")))?;
+    validate_arguments(&definition.parameters_schema, arguments)
+}
+
 fn validate_schema_value(schema: &Value, value: &Value, path: &str) -> AppResult<()> {
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
         if !allowed.contains(value) {
@@ -676,6 +687,20 @@ fn validate_schema_value(schema: &Value, value: &Value, path: &str) -> AppResult
             let values = value
                 .as_array()
                 .ok_or_else(|| AppError::Validation(format!("{path} 必须是数组")))?;
+            if let Some(max) = schema.get("maxItems").and_then(Value::as_u64) {
+                if values.len() as u64 > max {
+                    return Err(AppError::Validation(format!(
+                        "{path} 条目数超过上限 {max}"
+                    )));
+                }
+            }
+            if let Some(min) = schema.get("minItems").and_then(Value::as_u64) {
+                if (values.len() as u64) < min {
+                    return Err(AppError::Validation(format!(
+                        "{path} 条目数不足下限 {min}"
+                    )));
+                }
+            }
             if let Some(item_schema) = schema.get("items") {
                 for (index, item) in values.iter().enumerate() {
                     validate_schema_value(item_schema, item, &format!("{path}[{index}]"))?;
@@ -1307,6 +1332,23 @@ mod tests {
             &json!({"stage": "draft", "title": "标题", "content": "内容"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn validates_schema_max_items_for_arrays() {
+        let definition = agent_tools::get(agent_tools::SUBMIT_REVIEW_ISSUES).unwrap();
+        let issue = json!({
+            "issue_type": "事实越界",
+            "severity": "major",
+            "location": "章末",
+            "reason": "无来源。",
+            "suggestion": "删去。",
+            "evidence_quote": "距离黑市明晚开市"
+        });
+        let within = json!({"issues": (0..8).map(|_| issue.clone()).collect::<Vec<_>>()});
+        let over = json!({"issues": (0..9).map(|_| issue.clone()).collect::<Vec<_>>()});
+        assert!(validate_arguments(&definition.parameters_schema, &within).is_ok());
+        assert!(validate_arguments(&definition.parameters_schema, &over).is_err());
     }
 
     #[test]

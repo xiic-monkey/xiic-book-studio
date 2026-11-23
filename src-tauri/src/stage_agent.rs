@@ -14,11 +14,15 @@ const SHARED_PROTOCOL: &str = r#"1. 事实优先级依次为：正文与带来�
 4. 只完成当前阶段职责。故事架构 Agent 不代写正文，写作 Agent 不修改 Canon，试读 Agent 不编造修法，修订 Agent 不引入来源中不存在的新事实。
 "#;
 
+/// 共享协议段的标题分隔串。`apply_stage_protocol` 用它追加，`review_protocol_prompt`
+/// 用它摘出再拼回，避免两处硬编码的标题不一致。
+const SHARED_PROTOCOL_HEADING: &str = "\n\n# 共享工作协议\n";
+
 pub(crate) fn apply_stage_protocol(mut agent: Agent) -> Agent {
     if PROTOCOL_AGENT_KEYS.contains(&agent.stage.as_str()) {
         agent.system_prompt = format!(
-            "{}\n\n# 共享工作协议\n{}",
-            agent.system_prompt, SHARED_PROTOCOL
+            "{}{}{}",
+            agent.system_prompt, SHARED_PROTOCOL_HEADING, SHARED_PROTOCOL
         );
     }
     agent
@@ -41,25 +45,43 @@ pub(crate) fn apply_review_protocol(mut agent: Agent, use_tool_protocol: bool) -
 }
 
 fn review_protocol_prompt(prompt: &str, use_tool_protocol: bool) -> String {
-    let Some(tool_start) = prompt.find(REVIEW_TOOL_PROTOCOL_MARKER) else {
+    // 共享协议由 apply_stage_protocol 追加在末尾，处在 json 段之后。切分时先摘出，
+    // 拼好选中的协议段后再拼回，否则工具分支会整段丢掉它；JSON 回退用的裸 Agent
+    // 也要在调用本函数前经过 apply_stage_protocol 才有这段协议。
+    let (body, shared) = match prompt.find(SHARED_PROTOCOL_HEADING) {
+        Some(index) => (
+            &prompt[..index],
+            Some(prompt[index + SHARED_PROTOCOL_HEADING.len()..].trim().to_string()),
+        ),
+        None => (prompt, None),
+    };
+    let Some(tool_start) = body.find(REVIEW_TOOL_PROTOCOL_MARKER) else {
         return prompt.to_string();
     };
-    let Some(json_start) = prompt.find(REVIEW_JSON_PROTOCOL_MARKER) else {
+    let Some(json_start) = body.find(REVIEW_JSON_PROTOCOL_MARKER) else {
         return prompt.to_string();
     };
     if json_start < tool_start {
         return prompt.to_string();
     }
-    let common = prompt[..tool_start].trim_end();
+    let common = body[..tool_start].trim_end();
     let section = if use_tool_protocol {
-        prompt[tool_start + REVIEW_TOOL_PROTOCOL_MARKER.len()..json_start].trim()
+        body[tool_start + REVIEW_TOOL_PROTOCOL_MARKER.len()..json_start].trim()
     } else {
-        prompt[json_start + REVIEW_JSON_PROTOCOL_MARKER.len()..].trim()
+        body[json_start + REVIEW_JSON_PROTOCOL_MARKER.len()..].trim()
     };
-    if section.is_empty() {
-        return common.to_string();
+    let mut result = if section.is_empty() {
+        common.to_string()
+    } else {
+        format!("{common}\n\n{section}")
+    };
+    if let Some(shared) = shared {
+        if !shared.is_empty() {
+            result.push_str(SHARED_PROTOCOL_HEADING);
+            result.push_str(&shared);
+        }
     }
-    format!("{common}\n\n{section}")
+    result
 }
 
 #[cfg(test)]
@@ -105,5 +127,29 @@ mod tests {
         assert!(json.contains("只输出 JSON 数组"));
         assert!(!json.contains("submit_review_issues"));
         assert!(json.contains("evidence_quote"));
+    }
+
+    /// 共享协议追加在末尾、位于 json 段之后。切分时必须把它摘出再拼回，
+    /// 不能因为落在 json 段之后就跟着工具版一起丢掉。用内置真实模板验证。
+    #[test]
+    fn review_protocol_keeps_shared_protocol_in_both_variants() {
+        let template = crate::prompt_templates::require_default_prompt("review").unwrap();
+        let prompt = format!("{template}{SHARED_PROTOCOL_HEADING}{SHARED_PROTOCOL}");
+
+        for use_tool in [true, false] {
+            let result = review_protocol_prompt(&prompt, use_tool);
+            assert!(
+                result.contains("# 共享工作协议"),
+                "use_tool={use_tool}: 共享协议标题丢失"
+            );
+            assert!(
+                result.contains("事实优先级依次为"),
+                "use_tool={use_tool}: 共享协议正文丢失"
+            );
+        }
+        let tool = review_protocol_prompt(&prompt, true);
+        assert!(!tool.contains("# 输出格式"));
+        let json = review_protocol_prompt(&prompt, false);
+        assert!(!json.contains("# 提交方式"));
     }
 }

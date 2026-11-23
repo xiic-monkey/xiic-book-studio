@@ -147,10 +147,11 @@ pub(crate) fn review_uses_tool_protocol(state: &AppState, base_url: &str) -> App
 /// 试读工具循环最多发几轮：提交、纠错、收尾。
 const MAX_REVIEW_TOOL_ROUNDS: usize = 3;
 
-/// 多轮循环累计发送的字符上限。
+/// 待发消息 transcripts 的字符上限，不是各轮实际传输量之和。
 ///
-/// 候选稿正文每一轮都会被重复发送，所以这里给总发送量封顶，避免长篇项目
-/// 在多轮里把模型上下文窗口撑爆。
+/// 候选稿正文每轮都随整段 messages 重发，但在 messages 里只存一份；这里检查的
+/// 是当前待发 transcript 的大小（它随每轮 assistant/tool 消息增长），因此能间接
+/// 约束上下文窗口，却不是按「累计已发送字符」封顶。
 const MAX_REVIEW_TOOL_MESSAGES_CHARS: usize = 3 * MAX_WORKFLOW_PROMPT_CHARS;
 
 /// 已准备发送的消息总字符数。
@@ -441,6 +442,13 @@ fn review_issues_from_outcome(
 fn parse_submitted_review_issues(arguments: &str) -> AppResult<Vec<ReviewIssue>> {
     let arguments: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|error| AppError::Validation(format!("提交的问题参数不是合法 JSON：{error}")))?;
+    // 落库前必须复跑工具执行时的同一套 schema 校验：maxItems、
+    // additionalProperties 等约束在这里不能被绕过，否则带未知字段或超限的
+    // 提交虽被工具拒绝，仍可能被这里当成有效结果采用。
+    crate::tool_runtime::validate_tool_arguments(
+        crate::agent_tools::SUBMIT_REVIEW_ISSUES,
+        &arguments,
+    )?;
     // 与工具执行保持同一条判据：没有 issues 字段就是没按契约提交，
     // 不能当成「没有问题」。
     let raw = arguments
@@ -1086,8 +1094,9 @@ async fn run_agent_step_impl(
                 None,
             )?;
             // 回退要用未切分的原文重新选协议段：此刻 agent 里已经是工具版，
-            // 直接再切一次不会生效。
-            let original_agent = state.get_agent(&agent.stage)?;
+            // 直接再切一次不会生效。用 get_execution_agent 而非 get_agent，
+            // 保证回退版也带上 apply_stage_protocol 追加的共享工作协议。
+            let original_agent = state.get_execution_agent(&agent.stage)?;
             let json_agent = crate::stage_agent::apply_review_protocol(original_agent, false);
             let mut fallback_last_chars = 0usize;
             let mut fallback_on_update = |partial: &str, _thinking: &str| -> AppResult<()> {
@@ -1209,6 +1218,7 @@ async fn run_agent_step_impl(
             )?;
         }
     }
+    state.link_run_artifact(run.id, artifact.id)?;
     run = state.update_workflow_run(
         run.id,
         &normalized_output,
@@ -1216,7 +1226,6 @@ async fn run_agent_step_impl(
         None,
         started.elapsed().as_millis() as i64,
     )?;
-    state.link_run_artifact(run.id, artifact.id)?;
     sync_story_threads_after_generation(state, &artifact)?;
     state.insert_message(
         input.project_id,
@@ -2659,7 +2668,8 @@ pub(crate) fn enforce_workflow_prompt_budget(prompt: String) -> BudgetedPrompt {
         .collect::<Vec<_>>();
 
     let mut dropped_sections = Vec::new();
-    // B1 级：先移除非 Skill 的低优先级段（历史检索、相关已批准上下文）。
+    // B1 级：先移除非 Skill 的 priority 0 段（相关已批准上下文）。
+    // 历史检索段是跨章事实比对的唯一来源，不能整段丢弃，已从 priority 0 提级。
     // B2 级：再移除次低优先级段（伏笔账本、已写正文进度）。
     for removable in ["non_skill_priority_0", "priority_1"] {
         while prompt_sections_len(&sections) > MAX_WORKFLOW_PROMPT_CHARS {
@@ -2848,14 +2858,12 @@ fn prompt_section_floor(priority: u8) -> usize {
 
 fn prompt_section_priority(section: &str) -> u8 {
     let heading = section.lines().next().unwrap_or_default();
-    if is_skill_section(section)
-        || heading.contains("历史检索")
-        || heading.contains("相关已批准上下文")
-    {
+    if is_skill_section(section) || heading.contains("相关已批准上下文") {
         0
     } else if heading.contains("伏笔账本") || heading.contains("已写正文进度") {
         1
-    } else if heading.contains("已批准")
+    } else if heading.contains("历史检索")
+        || heading.contains("已批准")
         || heading.contains("最近已通过")
         || heading.contains("章节状态账本")
         || heading.contains("连续性修复卡")
@@ -5203,7 +5211,7 @@ mod tests {
     #[test]
     fn budget_reports_dropped_sections() {
         let prompt = format!(
-            "# 项目\n{}\n\n# 题材 Skill\n{}\n\n# 历史检索\n{}\n\n# 任务\n最终任务协议：只输出正文。",
+            "# 项目\n{}\n\n# 题材 Skill\n{}\n\n# 相关已批准上下文\n{}\n\n# 任务\n最终任务协议：只输出正文。",
             "项目数据".repeat(100),
             "低优先级技能".repeat(4_000),
             "检索结果".repeat(4_000),
@@ -5215,7 +5223,35 @@ mod tests {
         assert!(budgeted
             .dropped_sections
             .iter()
-            .any(|heading| heading.contains("历史检索")));
+            .any(|heading| heading.contains("相关已批准上下文")));
+    }
+
+    /// 历史检索是跨章事实比对的唯一来源：预算紧张时允许压缩，但不许整段丢弃。
+    /// F7 实验里 7 次试读全部丢掉该段，导致 GT-01~GT-06 不可达。
+    #[test]
+    fn budget_keeps_history_retrieval_instead_of_dropping_it() {
+        let prompt = format!(
+            "# 项目\n{}\n\n# 历史检索上下文\n{}\n\n# 当前候选稿\n{}\n\n# 任务\n最终任务协议：只输出正文。",
+            "项目数据".repeat(100),
+            "历史片段".repeat(3_000),
+            "候选稿正文".repeat(3_000),
+        );
+        let budgeted = enforce_workflow_prompt_budget(prompt);
+
+        assert!(budgeted.prompt.chars().count() <= MAX_WORKFLOW_PROMPT_CHARS);
+        assert!(
+            budgeted.prompt.contains("# 历史检索上下文"),
+            "历史检索段被整段丢弃：{:?}",
+            budgeted.dropped_sections
+        );
+        assert!(
+            !budgeted
+                .dropped_sections
+                .iter()
+                .any(|heading| heading.contains("历史检索")),
+            "历史检索段被报告为丢弃：{:?}",
+            budgeted.dropped_sections
+        );
     }
 
     /// 未超预算时不裁剪、不报告。
@@ -5782,6 +5818,41 @@ mod tests {
         let (summary, issues) = review_issues_from_outcome(&outcome).unwrap();
         assert_eq!(summary, "总结");
         assert!(issues.is_empty());
+    }
+
+    /// 落库前必须复跑工具执行时的同一套 schema 校验：被工具以未知字段或超过
+    /// maxItems 拒绝的提交，不能在重新解析原始参数时被当成有效结果采用。
+    #[test]
+    fn review_submission_rejects_unknown_fields_and_over_limit_at_adoption() {
+        let issue = serde_json::json!({
+            "issue_type": "事实越界",
+            "severity": "major",
+            "location": "章末",
+            "reason": "无来源。",
+            "suggestion": "删去。",
+            "evidence_quote": "距离黑市明晚开市"
+        });
+        let mut with_unknown = issue.clone();
+        with_unknown["invented_field"] = serde_json::json!("x");
+
+        for arguments in [
+            serde_json::json!({"issues": [with_unknown]}).to_string(),
+            serde_json::json!({"issues": (0..9).map(|_| issue.clone()).collect::<Vec<_>>()})
+                .to_string(),
+        ] {
+            let outcome = ai::StreamingOutcome {
+                content: String::new(),
+                tool_calls: vec![ai::StreamToolCall {
+                    id: "call_1".to_string(),
+                    name: crate::agent_tools::SUBMIT_REVIEW_ISSUES.to_string(),
+                    arguments,
+                }],
+            };
+            assert!(
+                review_issues_from_outcome(&outcome).is_err(),
+                "被工具拒绝的提交仍被落库采用"
+            );
+        }
     }
 
     /// 试读阶段必须尊重供应商的工具协议设置：
