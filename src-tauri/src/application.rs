@@ -125,6 +125,7 @@ impl ApplicationGateway {
                 project_id,
             )?,
             settings: self.state.get_ai_settings()?,
+            chapter_memories: crate::chapter_memory::list_current_memories(&self.state, project_id)?,
         })
     }
 

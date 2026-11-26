@@ -364,6 +364,32 @@ pub struct ChapterMemoryRecord {
     pub updated_at: String,
 }
 
+/// 章节记忆里的一条事实交接记录（正文原文 + 出处引文）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ChapterMemoryEntry {
+    pub text: String,
+    pub evidence_quote: String,
+}
+
+/// 供界面展示的章节记忆视图：只包含与当前已采用正文一致的记忆。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ChapterMemoryView {
+    pub chapter_id: i64,
+    pub chapter_no: i64,
+    pub chapter_title: String,
+    pub source_artifact_id: i64,
+    pub updated_at: String,
+    pub summary: Option<ChapterMemoryEntry>,
+    pub final_scene: Option<ChapterMemoryEntry>,
+    pub last_action: Option<ChapterMemoryEntry>,
+    pub state_changes: Vec<ChapterMemoryEntry>,
+    pub knowledge_changes: Vec<ChapterMemoryEntry>,
+    pub commitments: Vec<ChapterMemoryEntry>,
+    pub open_loops: Vec<ChapterMemoryEntry>,
+    pub immediate_next_intent: Option<ChapterMemoryEntry>,
+    pub plan_reconciliation: Vec<ChapterMemoryEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct StoryThread {
     pub id: i64,
@@ -896,6 +922,7 @@ pub struct ProjectWorkspace {
     pub story_bible_review: Option<StoryBibleReview>,
     pub canonical_fingerprint: String,
     pub settings: AiSettings,
+    pub chapter_memories: Vec<ChapterMemoryView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

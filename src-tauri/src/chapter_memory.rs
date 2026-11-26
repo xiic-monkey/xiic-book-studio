@@ -7,7 +7,7 @@ use crate::{
     ai,
     db::AppState,
     error::{AppError, AppResult},
-    models::{AiSettings, ChapterMemoryRecord},
+    models::{AiSettings, Chapter, ChapterMemoryEntry, ChapterMemoryRecord, ChapterMemoryView},
 };
 
 pub const NORMALIZATION_VERSION: &str = "chapter-text-v8";
@@ -125,6 +125,62 @@ pub async fn ensure_predecessor_memory(
     )
     .await
     .map(Some)
+}
+
+/// 列出全书与当前已采用正文一致的章节记忆（按章节顺序）。
+/// 正文被替换后旧记忆自动不再展示，避免界面显示过期事实。
+pub fn list_current_memories(
+    state: &AppState,
+    project_id: i64,
+) -> AppResult<Vec<ChapterMemoryView>> {
+    let chapters = state.list_chapters(project_id)?;
+    let mut views = Vec::new();
+    for chapter in chapters {
+        let Some(record) = current_memory_for_chapter(state, project_id, chapter.id)? else {
+            continue;
+        };
+        views.push(build_memory_view(&chapter, &record));
+    }
+    Ok(views)
+}
+
+fn build_memory_view(chapter: &Chapter, record: &ChapterMemoryRecord) -> ChapterMemoryView {
+    let payload: ChapterMemoryPayload = serde_json::from_str(&record.content).unwrap_or_default();
+    ChapterMemoryView {
+        chapter_id: chapter.id,
+        chapter_no: chapter.chapter_no,
+        chapter_title: chapter.title.clone(),
+        source_artifact_id: record.source_artifact_id,
+        updated_at: record.updated_at.clone(),
+        summary: payload.summary.map(to_view_entry),
+        final_scene: payload.final_scene.map(to_view_entry),
+        last_action: payload.last_action.map(to_view_entry),
+        state_changes: payload
+            .state_changes
+            .into_iter()
+            .map(to_view_entry)
+            .collect(),
+        knowledge_changes: payload
+            .knowledge_changes
+            .into_iter()
+            .map(to_view_entry)
+            .collect(),
+        commitments: payload.commitments.into_iter().map(to_view_entry).collect(),
+        open_loops: payload.open_loops.into_iter().map(to_view_entry).collect(),
+        immediate_next_intent: payload.immediate_next_intent.map(to_view_entry),
+        plan_reconciliation: payload
+            .plan_reconciliation
+            .into_iter()
+            .map(to_view_entry)
+            .collect(),
+    }
+}
+
+fn to_view_entry(entry: MemoryEntry) -> ChapterMemoryEntry {
+    ChapterMemoryEntry {
+        text: entry.text,
+        evidence_quote: entry.evidence_quote,
+    }
 }
 
 pub async fn generate_for_approved_chapter(
@@ -547,5 +603,44 @@ mod tests {
 
         assert_eq!(memory.state_changes.len(), 1);
         assert_eq!(memory.state_changes[0].text, "陆烬发现布片上刻着周三的名字");
+    }
+
+    #[test]
+    fn builds_display_view_from_stored_memory_payload() {
+        let chapter = Chapter {
+            id: 14,
+            project_id: 8,
+            chapter_no: 4,
+            title: "夜雾入谷".to_string(),
+            status: "approved".to_string(),
+            current_artifact_id: Some(62),
+            created_at: "2026-07-17T00:00:00Z".to_string(),
+            updated_at: "2026-07-17T00:00:00Z".to_string(),
+        };
+        let record = ChapterMemoryRecord {
+            id: 3,
+            project_id: 8,
+            chapter_id: 14,
+            source_artifact_id: 62,
+            source_text_hash: "hash".to_string(),
+            normalization_version: NORMALIZATION_VERSION.to_string(),
+            content: r#"{
+              "summary":{"text":"陆烬走进夜雾","evidence_quote":"他走进雾里。"},
+              "state_changes":[{"text":"陆烬把铜炉装进布袋","evidence_quote":"塞进布袋。"}],
+              "open_loops":[{"text":"赵执事下令封炉","evidence_quote":"都闷死在里面。"}]
+            }"#
+            .to_string(),
+            created_at: "2026-07-17T16:45:15Z".to_string(),
+            updated_at: "2026-07-17T16:45:15Z".to_string(),
+        };
+
+        let view = build_memory_view(&chapter, &record);
+
+        assert_eq!(view.chapter_no, 4);
+        assert_eq!(view.chapter_title, "夜雾入谷");
+        assert_eq!(view.summary.unwrap().text, "陆烬走进夜雾");
+        assert_eq!(view.state_changes.len(), 1);
+        assert_eq!(view.open_loops[0].evidence_quote, "都闷死在里面。");
+        assert!(view.commitments.is_empty());
     }
 }

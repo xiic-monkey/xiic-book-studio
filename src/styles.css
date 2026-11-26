@@ -2061,6 +2061,66 @@ input:focus, textarea:focus, select:focus {
   font-size: 11px;
 }
 
+.chapter-memory-list {
+  display: grid;
+  gap: 10px;
+}
+
+.chapter-memory-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px 15px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-card);
+  overflow-wrap: anywhere;
+}
+
+.chapter-memory-sections {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+}
+
+.chapter-memory-section {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.chapter-memory-section dt {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.chapter-memory-section dd {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.chapter-memory-section p {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.chapter-memory-section blockquote {
+  margin: 0;
+  padding: 6px 9px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
 .timeline-participants {
   display: flex;
   flex-wrap: wrap;

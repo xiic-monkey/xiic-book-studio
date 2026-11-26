@@ -3,6 +3,8 @@ import { useMemo } from "react";
 import type { ReactNode } from "react";
 import type {
   Chapter,
+  ChapterMemoryEntry,
+  ChapterMemoryView,
   ProjectWorkspace,
   StoryEntity,
   StoryEvent,
@@ -24,13 +26,13 @@ export type EntityTimelineEntry =
   | { type: "event"; id: number; chapterId: number | null; event: StoryEvent }
   | { type: "fact"; id: number; chapterId: number | null; fact: StoryFact };
 
-const continuityViews = ["events", "character-timeline", "items"] as const;
+const continuityViews = ["chapter-memory", "events", "character-timeline", "items"] as const;
 export type ContinuityLibraryFocus = (typeof continuityViews)[number];
-type EntityFocus = Exclude<ContinuityLibraryFocus, "events">;
+type EntityFocus = Exclude<ContinuityLibraryFocus, "events" | "chapter-memory">;
 
 type ContinuityLibraryPanelProps = {
   focus: ContinuityLibraryFocus;
-  detail: Pick<ProjectWorkspace, "chapters" | "index_jobs" | "story_entities" | "story_events"> | null;
+  detail: Pick<ProjectWorkspace, "chapters" | "index_jobs" | "story_entities" | "story_events" | "chapter_memories"> | null;
   busy: boolean;
   status: StoryIndexStatus;
   participantsByEvent: Map<number, StoryEventParticipant[]>;
@@ -46,6 +48,11 @@ type ContinuityLibraryPanelProps = {
 };
 
 const continuityViewMeta = {
+  "chapter-memory": {
+    title: "章节交接记忆",
+    selectionLabel: "",
+    empty: "暂无章节记忆",
+  },
   "character-timeline": {
     title: "角色时间线",
     selectionLabel: "选择角色",
@@ -62,6 +69,43 @@ const continuityViewMeta = {
     empty: "暂无事件",
   },
 } as const;
+
+const memorySectionMeta: Array<{
+  key: keyof Pick<
+    ChapterMemoryView,
+    "summary" | "final_scene" | "last_action" | "state_changes" | "knowledge_changes" | "commitments" | "open_loops" | "immediate_next_intent" | "plan_reconciliation"
+  >;
+  label: string;
+  list?: boolean;
+}> = [
+  { key: "summary", label: "章节摘要" },
+  { key: "final_scene", label: "结尾画面" },
+  { key: "last_action", label: "最后行动" },
+  { key: "state_changes", label: "状态变化", list: true },
+  { key: "knowledge_changes", label: "认知变化", list: true },
+  { key: "commitments", label: "承诺与打算", list: true },
+  { key: "open_loops", label: "未闭合线索", list: true },
+  { key: "immediate_next_intent", label: "下一步意图" },
+  { key: "plan_reconciliation", label: "计划对齐", list: true },
+];
+
+function memoryEntries(
+  view: ChapterMemoryView,
+  key: (typeof memorySectionMeta)[number]["key"],
+  list: boolean,
+): ChapterMemoryEntry[] {
+  const value = view[key];
+  if (!value) return [];
+  if (list) return value as ChapterMemoryEntry[];
+  return [value as ChapterMemoryEntry];
+}
+
+function chapterMemoryTitle(memory: ChapterMemoryView): string {
+  const title = memory.chapter_title.trim();
+  const prefix = `第 ${memory.chapter_no} 章`;
+  if (!title || title.startsWith(prefix)) return title || prefix;
+  return `${prefix} · ${title}`;
+}
 
 function MemoryCard({ title, copy, quote, chapter, onOpenChapter, children }: {
   title: string;
@@ -112,7 +156,13 @@ export function ContinuityLibraryPanel({
     return (leftChapter - rightChapter) || left.id - right.id;
   }), [chaptersById, detail?.story_events]);
   const showingEvents = focus === "events";
-  const count = showingEvents ? events.length : timeline.length;
+  const showingMemories = focus === "chapter-memory";
+  const entityFocused = focus === "character-timeline" || focus === "items";
+  const memories = useMemo(
+    () => [...(detail?.chapter_memories ?? [])].sort((left, right) => left.chapter_no - right.chapter_no),
+    [detail?.chapter_memories],
+  );
+  const count = showingEvents ? events.length : showingMemories ? memories.length : timeline.length;
   const indexJobs = detail?.index_jobs ?? [];
   const pendingJobs = indexJobs.filter((job) => job.status === "pending");
   const runningJobs = indexJobs.filter((job) => job.status === "running");
@@ -158,6 +208,16 @@ export function ContinuityLibraryPanel({
       </span>
     ) : null;
 
+  const memoryChip = status.approved > 0 ? (
+    <span className="library-status-chip">
+      <span className="library-status-chip-key">章节记忆</span>
+      <span className="library-status-chip-value">已生成 {memories.length}/{status.approved} 章</span>
+      {memories.length < status.approved && (
+        <span className="library-status-chip-warn">{status.approved - memories.length} 章待生成</span>
+      )}
+    </span>
+  ) : null;
+
   return (
     <section className="library-workspace continuity-workspace" aria-labelledby="chapter-memory-title">
       <header className="library-header continuity-header">
@@ -169,6 +229,7 @@ export function ContinuityLibraryPanel({
         <div className="continuity-header-side">
           <div className="library-status-chips">
             {indexChip}
+            {memoryChip}
             {jobChip}
           </div>
           <button type="button" onClick={onRebuild} disabled={!detail || busy}>
@@ -194,7 +255,7 @@ export function ContinuityLibraryPanel({
         <div className="memory-content" key={focus}>
           <div className="memory-section-heading">
             <h3>{viewMeta.title}</h3>
-            {!showingEvents && entities.length > 0 && (
+            {entityFocused && entities.length > 0 && (
               <Select
                 className="memory-entity-select"
                 aria-label={viewMeta.selectionLabel}
@@ -206,9 +267,9 @@ export function ContinuityLibraryPanel({
                 onChange={(value) => onSelectEntity(Number(value))}
               />
             )}
-            <small>{count} 条记录</small>
+            <small>{showingMemories ? `${count} 章记忆` : `${count} 条记录`}</small>
           </div>
-          {!showingEvents && currentFacts.length > 0 && (
+          {entityFocused && currentFacts.length > 0 && (
             <dl className="entity-current-state" aria-label="当前状态">
               {currentFacts.map((fact) => (
                 <div key={fact.dimension}>
@@ -219,7 +280,47 @@ export function ContinuityLibraryPanel({
             </dl>
           )}
           {count === 0 ? (
-            <div className="empty-state compact">{selectedEntity ? "暂无状态变化记录" : viewMeta.empty}</div>
+            <div className="empty-state compact">
+              {showingMemories ? "暂无章节记忆，开始写下一章时会自动补全上一章的交接记忆" : selectedEntity ? "暂无状态变化记录" : viewMeta.empty}
+            </div>
+          ) : showingMemories ? (
+            <div className="chapter-memory-list">
+              {memories.map((memory) => {
+                const chapter = chaptersById.get(memory.chapter_id);
+                return (
+                  <article className="chapter-memory-card" key={memory.chapter_id}>
+                    <header className="memory-card-heading">
+                      <h4>{chapterMemoryTitle(memory)}</h4>
+                      <span className="library-status">已采用正文</span>
+                    </header>
+                    <dl className="chapter-memory-sections">
+                      {memorySectionMeta.map((section) => {
+                        const entries = memoryEntries(memory, section.key, Boolean(section.list));
+                        if (entries.length === 0) return null;
+                        return (
+                          <div className="chapter-memory-section" key={section.key}>
+                            <dt>{section.label}</dt>
+                            <dd>
+                              {entries.map((entry, index) => (
+                                <p key={`${section.key}-${index}`}>
+                                  <span>{entry.text}</span>
+                                  {entry.evidence_quote && entry.evidence_quote !== entry.text && (
+                                    <blockquote>{entry.evidence_quote}</blockquote>
+                                  )}
+                                </p>
+                              ))}
+                            </dd>
+                          </div>
+                        );
+                      })}
+                    </dl>
+                    {chapter?.current_artifact_id != null && (
+                      <button type="button" className="timeline-source" onClick={() => onOpenChapter(chapter.id)}>查看正文</button>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
           ) : (
             <div className="memory-card-grid">
               {showingEvents ? events.map((event) => {

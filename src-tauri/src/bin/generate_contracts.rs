@@ -64,6 +64,8 @@ fn render() -> String {
     output.push_str(&declaration::<RunEvent>());
     output.push_str(&declaration::<ActiveAgentRun>());
     output.push_str(&declaration::<ArtifactSummary>());
+    output.push_str(&declaration::<ChapterMemoryEntry>());
+    output.push_str(&declaration::<ChapterMemoryView>());
     output.push_str(&declaration::<ProjectWorkspace>());
     output.push_str("export const V2_COMMANDS = {\n");
     for (key, command) in V2_COMMANDS {

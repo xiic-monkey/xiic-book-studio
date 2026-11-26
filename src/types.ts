@@ -7,6 +7,8 @@ export type {
   AgentToolDefinition,
   ArtifactSummary,
   ChapterPlan,
+  ChapterMemoryEntry,
+  ChapterMemoryView,
   ContextSegment,
   CurrentPlanConfirmationResult,
   CurrentPlanConfirmationStatus,
