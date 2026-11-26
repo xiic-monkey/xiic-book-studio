@@ -37,7 +37,7 @@ export function Select({
   const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
-  const [position, setPosition] = useState({ top: 0, left: 0, width: 0 });
+  const [position, setPosition] = useState({ top: 0, bottom: 0, left: 0, width: 0, maxHeight: 280, openUp: false });
   const selectedIndex = options.findIndex((option) => option.value === value);
   const selected = options[selectedIndex];
 
@@ -46,10 +46,19 @@ export function Select({
     if (!rect) return;
     const viewportPadding = 8;
     const maxWidth = window.innerWidth - viewportPadding * 2;
+    const width = Math.min(rect.width, maxWidth);
+    const left = Math.max(viewportPadding, Math.min(rect.left, window.innerWidth - width - viewportPadding));
+    const spaceBelow = window.innerHeight - rect.bottom - viewportPadding;
+    const spaceAbove = rect.top - viewportPadding;
+    // 下方空间不够就向上展开，并按可用空间限制高度，保证最后一项能被看到。
+    const openUp = spaceBelow < 200 && spaceAbove > spaceBelow;
     setPosition({
-      top: Math.min(rect.bottom + 4, window.innerHeight - viewportPadding),
-      left: Math.max(viewportPadding, Math.min(rect.left, window.innerWidth - Math.min(rect.width, maxWidth) - viewportPadding)),
-      width: Math.min(rect.width, maxWidth),
+      openUp,
+      top: rect.bottom + 4,
+      bottom: window.innerHeight - rect.top + 4,
+      left,
+      width,
+      maxHeight: Math.max(120, Math.min(280, openUp ? spaceAbove : spaceBelow)),
     });
   };
 
@@ -60,7 +69,16 @@ export function Select({
       if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) return;
       setOpen(false);
     };
-    const closeOnScroll = () => setOpen(false);
+    // 滚动时不能让菜单消失：菜单自身要能滚动（长列表），页面滚动时菜单要跟着触发器走。
+    // 触发器彻底滚出视口后菜单才失去意义，此时关闭。
+    const followOnScroll = () => {
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (!rect || rect.bottom < 0 || rect.top > window.innerHeight) {
+        setOpen(false);
+        return;
+      }
+      updatePosition();
+    };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -70,12 +88,12 @@ export function Select({
     };
     window.addEventListener("pointerdown", closeOnOutsidePointer);
     window.addEventListener("resize", updatePosition);
-    window.addEventListener("scroll", closeOnScroll, true);
+    window.addEventListener("scroll", followOnScroll, true);
     window.addEventListener("keydown", closeOnEscape);
     return () => {
       window.removeEventListener("pointerdown", closeOnOutsidePointer);
       window.removeEventListener("resize", updatePosition);
-      window.removeEventListener("scroll", closeOnScroll, true);
+      window.removeEventListener("scroll", followOnScroll, true);
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [open]);
@@ -146,7 +164,9 @@ export function Select({
           className="select-menu"
           role="listbox"
           aria-label={ariaLabel}
-          style={{ top: position.top, left: position.left, width: position.width }}
+          style={position.openUp
+            ? { bottom: position.bottom, left: position.left, width: position.width, maxHeight: position.maxHeight }
+            : { top: position.top, left: position.left, width: position.width, maxHeight: position.maxHeight }}
         >
           {options.map((option, index) => (
             <button

@@ -931,18 +931,98 @@ async fn run_orchestrator_turn(
     Ok(())
 }
 
+/// 从模型输出里取出决策 JSON。
+///
+/// 模型偶尔会在 JSON 前后加说明文字或 Markdown 围栏。先按整体解析，
+/// 解析不了再退回「第一个 `{` 到最后一个 `}`」，两种都失败时返回原样，
+/// 交给调用方报出真实原因。
+fn extract_decision_json(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(str::trim)
+        .and_then(|inner| inner.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    if serde_json::from_str::<serde_json::Value>(unfenced).is_ok() {
+        return unfenced;
+    }
+    if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}')) {
+        if start < end {
+            let candidate = &unfenced[start..=end];
+            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                return candidate;
+            }
+        }
+    }
+    unfenced
+}
+
+/// 把决策里的数字字符串归一化成数字。
+///
+/// 模型经常把 ID 写成字符串（实测 MiMo 稳定返回 `"chapter_id": "16"`）。
+/// 协议语义没变，只是数字的载体不同；这里在反序列化前统一转换，
+/// 避免整轮编排因为单个字段的类型差异被判成协议错误。
+fn normalize_decision_numbers(value: &mut serde_json::Value) {
+    let Some(tasks) = value.get_mut("tasks").and_then(serde_json::Value::as_array_mut) else {
+        return;
+    };
+    for task in tasks.iter_mut() {
+        for key in ["chapter_id", "source_artifact_id"] {
+            let Some(slot) = task.get_mut(key) else {
+                continue;
+            };
+            if let Some(text) = slot.as_str() {
+                if let Ok(number) = text.trim().parse::<i64>() {
+                    *slot = serde_json::Value::from(number);
+                }
+            }
+        }
+        let Some(slot) = task.get_mut("depends_on") else {
+            continue;
+        };
+        let Some(items) = slot.as_array_mut() else {
+            continue;
+        };
+        for item in items.iter_mut() {
+            if let Some(text) = item.as_str() {
+                if let Ok(number) = text.trim().parse::<u64>() {
+                    *item = serde_json::Value::from(number);
+                }
+            }
+        }
+    }
+}
+
+/// 错误提示里的原文片段。截断到可读长度，避免把整段模型输出塞进运行记录。
+fn decision_error_snippet(raw: &str) -> String {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snippet = compact.chars().take(200).collect::<String>();
+    if compact.chars().count() > 200 {
+        snippet.push_str("...");
+    }
+    snippet
+}
+
 fn parse_orchestrator_decision(
     raw: &str,
     default_chapter_id: Option<i64>,
 ) -> AppResult<OrchestratorDecision> {
-    let trimmed = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let mut decision: OrchestratorDecision = serde_json::from_str(trimmed)
-        .map_err(|_| AppError::Validation("主 Agent 返回的任务决策不是有效 JSON".to_string()))?;
+    let trimmed = extract_decision_json(raw);
+    let mut value: serde_json::Value = serde_json::from_str(trimmed).map_err(|error| {
+        AppError::Validation(format!(
+            "主 Agent 返回的任务决策不是有效 JSON：{error}；原始内容：{}",
+            decision_error_snippet(raw)
+        ))
+    })?;
+    normalize_decision_numbers(&mut value);
+    let mut decision: OrchestratorDecision = serde_json::from_value(value).map_err(|error| {
+        AppError::Validation(format!(
+            "主 Agent 返回的任务决策字段不符合协议：{error}；原始内容：{}",
+            decision_error_snippet(raw)
+        ))
+    })?;
     if !matches!(decision.kind.as_str(), "answer" | "delegate") {
         return Err(AppError::Validation(
             "主 Agent 返回了未知的决策类型".to_string(),
@@ -1846,7 +1926,11 @@ fn tool_invocations_for_run(
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, time::Duration};
+    use std::{
+        convert::Infallible,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use axum::{
         extract::State,
@@ -1869,6 +1953,8 @@ mod tests {
     struct MockAiState {
         chunk_delay: Duration,
         requests: Option<mpsc::UnboundedSender<Value>>,
+        /// 非流式请求的固定回复。测试需要在拿到章节 ID 后再填内容，所以用共享槽位。
+        json_response: Option<Arc<Mutex<Option<String>>>>,
     }
 
     async fn mock_chat_completions(
@@ -1879,8 +1965,13 @@ mod tests {
             requests.send(request.clone()).unwrap();
         }
         if request.get("stream").and_then(Value::as_bool) != Some(true) {
+            let content = state
+                .json_response
+                .as_ref()
+                .and_then(|slot| slot.lock().ok().and_then(|slot| slot.clone()))
+                .unwrap_or_else(|| "Mock completion".to_string());
             return Json(json!({
-                "choices": [{"message": {"role": "assistant", "content": "Mock completion"}}]
+                "choices": [{"message": {"role": "assistant", "content": content}}]
             }))
             .into_response();
         }
@@ -1914,6 +2005,19 @@ mod tests {
     async fn start_mock_ai_server_with_requests(
         requests: Option<mpsc::UnboundedSender<Value>>,
     ) -> String {
+        start_mock_ai_server_with_options(requests, None).await
+    }
+
+    /// 带固定非流式回复的 mock 服务。回复放在共享槽位里，测试可以在拿到
+    /// 章节 ID 之后再填入带章节号的内容。
+    async fn start_mock_ai_server_with_json(slot: Arc<Mutex<Option<String>>>) -> String {
+        start_mock_ai_server_with_options(None, Some(slot)).await
+    }
+
+    async fn start_mock_ai_server_with_options(
+        requests: Option<mpsc::UnboundedSender<Value>>,
+        json_response: Option<Arc<Mutex<Option<String>>>>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
@@ -1921,6 +2025,7 @@ mod tests {
             .with_state(MockAiState {
                 chunk_delay: Duration::from_millis(120),
                 requests,
+                json_response,
             });
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -2384,6 +2489,50 @@ mod tests {
         assert!(decision.is_err());
     }
 
+    /// 模型常把 ID 写成字符串（`"chapter_id": "16"`）。这属于类型差异，
+    /// 不能判成「决策不是有效 JSON」，否则整轮编排直接失败。
+    #[test]
+    fn orchestrator_decision_accepts_string_ids() {
+        let decision = parse_orchestrator_decision(
+            r#"{"kind":"delegate","answer":"已委托","tasks":[{"task_type":"draft","title":"写第六章","instruction":"生成候选稿","chapter_id":"16"},{"task_type":"review","title":"试读第六章","instruction":"检查候选稿","depends_on":["0"],"source_artifact_id":"69","chapter_id":"16"}]}"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(decision.tasks[0].chapter_id, Some(16));
+        assert_eq!(decision.tasks[1].source_artifact_id, Some(69));
+        assert_eq!(decision.tasks[1].depends_on, vec![0]);
+    }
+
+    /// JSON 前后带说明文字或 Markdown 围栏时也要能取到决策。
+    #[test]
+    fn orchestrator_decision_extracts_json_from_wrapped_text() {
+        let wrapped = "好的，我来委托：\n```json\n{\"kind\":\"delegate\",\"tasks\":[{\"task_type\":\"draft\",\"title\":\"x\",\"instruction\":\"y\"}]}\n```";
+        let decision = parse_orchestrator_decision(wrapped, None).unwrap();
+        assert_eq!(decision.kind, "delegate");
+        assert_eq!(decision.tasks.len(), 1);
+    }
+
+    /// 解析失败时要把真实原因带出来，否则现场只剩一句「不是有效 JSON」。
+    #[test]
+    fn orchestrator_decision_error_mentions_reason_and_raw_content() {
+        let error = parse_orchestrator_decision("这是一段普通回答", None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("原始内容"), "错误信息应带上原始内容：{message}");
+        assert!(message.contains("这是一段普通回答"), "错误信息应带上原始片段：{message}");
+    }
+
+    /// JSON 合法但字段结构不对时，要和「JSON 本身坏了」区分开。
+    #[test]
+    fn orchestrator_decision_error_distinguishes_schema_mismatch() {
+        let error =
+            parse_orchestrator_decision(r#"{"kind":"delegate","tasks":"不是数组"}"#, None).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("字段不符合协议"),
+            "字段结构错误应单独提示：{message}"
+        );
+    }
+
     #[test]
     fn orchestrator_decision_rejects_unknown_task_and_forward_dependency() {
         let unknown = parse_orchestrator_decision(
@@ -2412,6 +2561,61 @@ mod tests {
         let segments = split_segments("# 项目\nA\n# Agent 工具执行结果\nB");
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[1].kind, "tool_result");
+    }
+
+    /// 主 Agent 把 chapter_id 写成字符串时（MiMo 实测稳定这样返回），整轮编排
+    /// 仍要能接受决策并真的派生子任务，而不是直接失败在「不是有效 JSON」。
+    #[tokio::test]
+    async fn orchestrator_delegates_when_model_returns_string_chapter_id() {
+        let slot = Arc::new(Mutex::new(None::<String>));
+        let base_url = start_mock_ai_server_with_json(slot.clone()).await;
+        let (_temp_dir, state, project) = test_state(&base_url);
+        let chapter_id = state.list_chapters(project.id).unwrap().remove(0).id;
+        let decision = json!({
+            "kind": "delegate",
+            "answer": "已委托写作 Agent",
+            "tasks": [{
+                "task_type": "draft",
+                "title": "生成新候选稿",
+                "instruction": "生成一版新的章节候选版本",
+                "depends_on": [],
+                "source_artifact_id": null,
+                "chapter_id": chapter_id.to_string(),
+                "story_architect_mode": null
+            }]
+        });
+        *slot.lock().unwrap() = Some(decision.to_string());
+
+        let started = start_orchestrator_turn(
+            &state,
+            OrchestratorTurnRequest {
+                project_id: project.id,
+                chapter_id: Some(chapter_id),
+                message: "生成新版本".to_string(),
+                stage: Some("draft".to_string()),
+                source_artifact_id: None,
+                story_architect_mode: None,
+                reference_selection: None,
+            },
+        )
+        .await
+        .unwrap();
+        let parent_id = started.parent_run.expect("编排运行应返回父运行").id;
+
+        let completed = wait_for_terminal_run(&state, parent_id).await;
+        let error = completed.run.error.clone().unwrap_or_default();
+        assert!(
+            !error.contains("任务决策"),
+            "字符串 chapter_id 不该被判成决策无效：{error}"
+        );
+
+        let children = state
+            .list_workflow_runs(project.id)
+            .unwrap()
+            .into_iter()
+            .filter(|run| run.parent_run_id == Some(parent_id))
+            .collect::<Vec<_>>();
+        assert!(!children.is_empty(), "字符串 chapter_id 也应真的派生子任务");
     }
 
     #[tokio::test]

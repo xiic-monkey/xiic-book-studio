@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildChapterAgentPrompt,
   compactAssistantModelName,
+  currentPlanPrimaryAction,
   currentPlanStatus,
+  chapterProgressLabel,
   formatReviewInstructions,
   foundationStageReadiness,
   isFeedScrolledToBottom,
@@ -131,6 +133,7 @@ describe("foundationStageReadiness", () => {
     });
 
     expect(stages.find((stage) => stage.stage === "outline")?.ready).toBe(true);
+    expect(stages.find((stage) => stage.stage === "outline")?.pendingCount).toBe(1);
   });
 
   it("ignores chapter-derived cards and archived material", () => {
@@ -143,6 +146,84 @@ describe("foundationStageReadiness", () => {
     });
 
     expect(stages.every((stage) => !stage.ready)).toBe(true);
+  });
+});
+
+describe("currentPlanPrimaryAction", () => {
+  it("routes a blocking review to repair instead of attempting confirmation", () => {
+    expect(currentPlanPrimaryAction(workspace({
+      story_bible: { status: "needs_review" },
+      story_bible_review: {
+        canon_fingerprint: "current",
+        status: "pending_human_confirmation",
+        issues: [{ severity: "major" }],
+      },
+    }))).toEqual({ kind: "repair", label: "在 Agent 中准备修复" });
+  });
+
+  it("labels a pending review as the action it performs", () => {
+    expect(currentPlanPrimaryAction(workspace({
+      story_bible: { status: "needs_review" },
+      story_bible_review: {
+        canon_fingerprint: "current",
+        status: "pending_human_confirmation",
+        issues: [],
+      },
+    }))).toEqual({ kind: "confirm_review", label: "确认审校并采用基准" });
+  });
+
+  it("routes incomplete foundations to the first missing stage", () => {
+    expect(currentPlanPrimaryAction(workspace())).toEqual({
+      kind: "fill_stage",
+      stage: "setting",
+      label: "补充世界观资料",
+    });
+  });
+
+  it("routes an existing but stale baseline to consistency review", () => {
+    expect(currentPlanPrimaryAction(workspace({
+      story_bible: { status: "needs_review" },
+      canon_entries: [
+        { category: "world", status: "approved", source_chapter_id: null, content: "世界规则" },
+        { category: "outline", status: "approved", source_chapter_id: null, content: "故事大纲" },
+        { category: "character", status: "approved", source_chapter_id: null, content: "主角" },
+      ],
+    }))).toEqual({ kind: "run_review", label: "运行一致性审校" });
+  });
+
+  it("adopts approved foundation artifacts as stage coverage", () => {
+    const stages = foundationStageReadiness({
+      canon_entries: [],
+      artifacts: [{ id: 14, stage: "characters", chapter_id: null }],
+      approvals: [{ artifact_id: 14 }],
+    });
+    expect(stages.find((stage) => stage.stage === "characters")?.ready).toBe(true);
+  });
+
+  it("does not offer another confirmation once the current baseline is adopted", () => {
+    expect(currentPlanPrimaryAction(workspace({
+      story_bible: { status: "confirmed" },
+      story_bible_review: {
+        canon_fingerprint: "current",
+        status: "confirmed",
+        issues: [],
+      },
+    }))).toEqual({ kind: "none", label: "创作基准已确认" });
+  });
+});
+
+describe("chapterProgressLabel", () => {
+  it("distinguishes a saved candidate from a chapter with no draft", () => {
+    expect(chapterProgressLabel({ id: 3, current_artifact_id: null }, [])).toBe("待创作");
+    expect(chapterProgressLabel({ id: 3, current_artifact_id: null }, [
+      { chapter_id: 3, stage: "draft" },
+    ])).toBe("有候选稿");
+  });
+
+  it("shows the adopted body before any remaining candidates", () => {
+    expect(chapterProgressLabel({ id: 3, current_artifact_id: 19 }, [
+      { chapter_id: 3, stage: "revision" },
+    ])).toBe("已采用");
   });
 });
 

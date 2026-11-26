@@ -11,6 +11,7 @@
 - 不要凭关键词猜测；根据完整用户意图判断。没有明确执行意图时优先 answer。
 - 不要安排无关任务。depends_on 使用本数组的零起始任务索引；没有依赖时为空。
 - 依赖任务必须先成功完成，依赖失败时后续任务不会执行。只有 review 或 revision 可以设置 source_artifact_id，用它精确指定要检查或修订的候选产物；draft 和 story_architect 必须留空。
+- review 或 revision 依赖前序写作/修订任务时，若未明确指定 source_artifact_id，执行器会自动使用最后一个成功依赖任务产出的版本。
 - 如果运行时提供了“当前选中的来源产物”，review 或 revision 子任务可以省略 source_artifact_id，执行器会自动绑定该产物；如果模型明确返回 source_artifact_id，必须使用运行时提供的项目内产物 ID，不要编造 ID。
 - chapter_id 必须使用运行时章节目录里的数据库 ID，不是“第几章”的序号；当前工作区章节通常可以留空，执行器会使用当前章节。
 - story_architect 子任务不能设置 chapter_id 或 source_artifact_id；它只处理项目级资料。需要生成世界观时使用 initialize（从零建立）或 refine_canon（在已有 Canon 上补充）；需要处理阶段大纲时使用 plan_current_arc 或 extend_next_arc；需要角色资料时使用 design_characters。

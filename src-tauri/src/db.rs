@@ -3603,15 +3603,43 @@ impl AppState {
             crate::story_search::ensure_sqlite_vec_loaded_if_present_on_connection(self, conn)?;
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| {
-                if let Some(existing) = conn
+                let existing = conn
                     .query_row(
                         "SELECT id, project_id, chapter_id, stage, artifact_id, note, created_at
                          FROM approvals WHERE artifact_id = ?1 ORDER BY id DESC LIMIT 1",
                         params![artifact_id],
                         map_approval,
                     )
-                    .optional()?
-                {
+                    .optional()?;
+                let body_changed = if matches!(stage, "draft" | "revision") {
+                    let chapter_id = artifact.chapter_id.ok_or_else(|| {
+                        AppError::Validation("正文产物必须属于章节".to_string())
+                    })?;
+                    let changed = conn.execute(
+                        "UPDATE chapters
+                         SET status = 'approved', current_artifact_id = ?1, updated_at = ?2
+                         WHERE id = ?3 AND project_id = ?4 AND current_artifact_id IS NOT ?1",
+                        params![artifact_id, &now, chapter_id, project_id],
+                    )?;
+                    if changed > 0 {
+                        crate::story_search::invalidate_chapters_from_tx(conn, project_id, chapter_id)?;
+                        invalidate_continuity_ledger_from_chapter_tx(conn, project_id, chapter_id)?;
+                        invalidate_story_index_from_chapter_tx(conn, project_id, chapter_id)?;
+                        crate::index_jobs::enqueue_chapter_index_jobs_tx(
+                            conn, project_id, chapter_id, artifact_id, &now,
+                        )?;
+                    }
+                    changed > 0
+                } else {
+                    false
+                };
+                if existing.is_none() || body_changed {
+                    conn.execute(
+                        "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                        params![&now, project_id],
+                    )?;
+                }
+                if let Some(existing) = existing {
                     return Ok(existing);
                 }
                 conn.execute(
@@ -3624,43 +3652,10 @@ impl AppState {
                     "UPDATE artifacts SET status = 'approved' WHERE id = ?1",
                     params![artifact_id],
                 )?;
-                if matches!(stage, "draft" | "revision") {
-                    let chapter_id = artifact.chapter_id.ok_or_else(|| {
-                        AppError::Validation("正文产物必须属于章节".to_string())
-                    })?;
-                    conn.execute(
-                        "UPDATE chapters
-                         SET status = 'approved', current_artifact_id = ?1, updated_at = ?2
-                         WHERE id = ?3 AND project_id = ?4",
-                        params![artifact_id, &now, chapter_id, project_id],
-                    )?;
-                    crate::story_search::invalidate_chapters_from_tx(
-                        conn,
-                        project_id,
-                        chapter_id,
-                    )?;
-                    invalidate_continuity_ledger_from_chapter_tx(
-                        conn,
-                        project_id,
-                        chapter_id,
-                    )?;
-                    invalidate_story_index_from_chapter_tx(conn, project_id, chapter_id)?;
-                    crate::index_jobs::enqueue_chapter_index_jobs_tx(
-                        conn,
-                        project_id,
-                        chapter_id,
-                        artifact_id,
-                        &now,
-                    )?;
-                }
                 if matches!(stage, "setting" | "outline" | "characters") {
                     crate::index_jobs::enqueue_project_search_job_tx(conn, project_id, &now)?;
                     mark_story_bible_changed_tx(conn, project_id, &now)?;
                 }
-                conn.execute(
-                    "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
-                    params![&now, project_id],
-                )?;
                 let approval = conn.query_row(
                     "SELECT id, project_id, chapter_id, stage, artifact_id, note, created_at
                      FROM approvals WHERE id = ?1",
@@ -7021,6 +7016,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!(updated.current_artifact_id, Some(second.id));
+
+        state
+            .approve_stage(project.id, "draft", first.id, "恢复第一版")
+            .unwrap();
+        let restored = state
+            .ensure_chapter(project.id, Some(chapter.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.current_artifact_id, Some(first.id));
+        assert_eq!(state.list_approvals(project.id).unwrap().len(), 2);
+        let jobs = state.list_derived_index_jobs(project.id).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.source_artifact_id == Some(first.id)));
+        let markdown = workflow::export_markdown(&state, project.id).unwrap();
+        let (body, _) = markdown.split_once("## 章节工作记录").unwrap();
+        assert!(body.contains("第一版正文"));
+        assert!(!body.contains("第二版正文"));
     }
 
     #[test]
